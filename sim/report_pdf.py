@@ -113,7 +113,7 @@ def build_round_report_pdf(
             ],
             [44 * mm, 44 * mm, 44 * mm, 45 * mm],
         ),
-        paragraph("Net Profit = Sales Revenue - All Costs. Net Assets = Cash - Debt.", small),
+        paragraph("Net Profit = Sales Revenue - All Costs. Net Assets = Total Assets - Debt.", small),
         section("Finance"),
     ]
     finance_rows = [

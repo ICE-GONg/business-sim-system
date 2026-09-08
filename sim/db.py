@@ -347,6 +347,34 @@ def reset_competition(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO rounds(round_no,status) VALUES(1,'waiting')")
 
 
+def delete_company(conn: sqlite3.Connection, company_id: int) -> None:
+    """Delete one team and all of its dependent competition data."""
+    company = one(conn, "SELECT id FROM companies WHERE id=?", (company_id,))
+    if company is None:
+        raise ValueError("玩家不存在或已经被删除。")
+    total = one(conn, "SELECT COUNT(*) AS n FROM companies")
+    if total and int(total["n"]) <= 1:
+        raise ValueError("至少需要保留一个玩家。")
+    conn.execute("DELETE FROM companies WHERE id=?", (company_id,))
+
+
+def delete_city(conn: sqlite3.Connection, city: str) -> None:
+    """Delete one city and detach any team that used it as its home market."""
+    market = one(conn, "SELECT city FROM market_config WHERE city=?", (city,))
+    if market is None:
+        raise ValueError("城市不存在或已经被删除。")
+    total = one(conn, "SELECT COUNT(*) AS n FROM market_config")
+    if total and int(total["n"]) <= 1:
+        raise ValueError("至少需要保留一个城市。")
+    conn.execute(
+        "UPDATE companies SET home_city=NULL,setup_submitted_at=NULL WHERE home_city=?",
+        (city,),
+    )
+    # Older databases created city_results without a city foreign key.
+    conn.execute("DELETE FROM city_results WHERE city=?", (city,))
+    conn.execute("DELETE FROM market_config WHERE city=?", (city,))
+
+
 def database_bytes() -> bytes:
     if not DB_PATH.exists():
         return b""

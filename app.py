@@ -29,6 +29,8 @@ from sim.db import (
     connect,
     current_round,
     database_bytes,
+    delete_city,
+    delete_company,
     employee_count,
     get_setting,
     hash_password,
@@ -43,7 +45,7 @@ from sim.db import (
     verify_password,
 )
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
-from sim.engine import available_loan_limit, market_size, settle_round, weighted_market_average
+from sim.engine import available_loan_limit, current_company_net_assets, market_size, settle_round, weighted_market_average
 from sim.report_pdf import build_round_report_pdf
 
 
@@ -322,7 +324,7 @@ def player_setup_header(company: sqlite3.Row) -> None:
 
 
 def render_player_overview(company: sqlite3.Row) -> None:
-    hero(f"你好，{company['name']}", "以 Net Cash（现金减负债）为核心，平衡生产、价格、投资和库存风险。")
+    hero(f"你好，{company['name']}", "以 Net Assets（总资产减负债）为核心，平衡生产、价格、投资和库存风险。")
     with connect() as conn:
         round_row = current_round(conn)
         latest = one(conn, "SELECT * FROM results WHERE company_id=? ORDER BY round_no DESC LIMIT 1", (company["id"],))
@@ -355,16 +357,16 @@ def render_player_overview(company: sqlite3.Row) -> None:
                 "售出": int(latest["sold"]),
                 "库存": int(latest["inventory"]),
                 "净利润": money(latest["net_profit"]),
-                "净现金": money(latest["net_assets"]),
+                "净资产": money(latest["net_assets"]),
             }]
         )
         st.dataframe(summary, hide_index=True, use_container_width=True)
     if wealth_rows:
         with st.expander("查看财富趋势", expanded=False):
             wealth_frame = pd.DataFrame([dict(row) for row in wealth_rows]).rename(
-                columns={"round_no": "轮次", "net_assets": "净现金"}
+                columns={"round_no": "轮次", "net_assets": "净资产"}
             )
-            st.line_chart(wealth_frame.set_index("轮次"), y="净现金", y_label="净现金")
+            st.line_chart(wealth_frame.set_index("轮次"), y="净资产", y_label="净资产")
 
 
 def decision_helper(conn: sqlite3.Connection, company: sqlite3.Row, round_no: int) -> dict[str, Any]:
@@ -403,20 +405,65 @@ def salary_bounds(settings: dict[str, Any], previous: float) -> tuple[float, flo
     return max(minimum, reference - limit), min(maximum, reference + limit)
 
 
+def render_submitted_decision(
+    decision: dict[str, Any],
+    city_values: dict[str, dict[str, Any]],
+    loan_base_net_assets: float,
+    loan_limit: float,
+) -> None:
+    """Show the player's locked submission without rendering editable widgets."""
+    st.success(f"本轮决策已提交并锁定；提交时间：{str(decision['submitted_at'])[:19].replace('T', ' ')} UTC")
+    loan_cols = st.columns(3)
+    loan_cols[0].metric("贷款计算净资产", money(loan_base_net_assets))
+    loan_cols[1].metric("本轮最高新增贷款", money(loan_limit))
+    loan_cols[2].metric("本轮贷款变化", money(decision["loan_change"]))
+    st.markdown("#### 人力与生产")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {"岗位": "工人", "增减": int(decision["worker_delta"]), "月薪": float(decision["worker_salary"])},
+                {"岗位": "工程师", "增减": int(decision["engineer_delta"]), "月薪": float(decision["engineer_salary"])},
+            ]
+        ),
+        hide_index=True,
+        use_container_width=True,
+        column_config={"月薪": st.column_config.NumberColumn(format="¥ %.0f")},
+    )
+    investment_cols = st.columns(4)
+    investment_cols[0].metric("计划生产", number(decision["production_volume"]))
+    investment_cols[1].metric("MA", money(decision["management_investment"]))
+    investment_cols[2].metric("QI", money(decision["quality_investment"]))
+    investment_cols[3].metric("专利投入", money(decision["research_investment"]))
+    st.markdown("#### 城市销售决策")
+    city_rows = [
+        {
+            "城市": city,
+            "Agent 增减": int(values.get("agent_delta", 0)),
+            "营销投入": float(values.get("marketing_investment", 0.0)),
+            "售价": float(values.get("price", 0.0)),
+            "购买市场报告": bool(values.get("order_report", 0)),
+        }
+        for city, values in city_values.items()
+    ]
+    st.dataframe(
+        pd.DataFrame(city_rows),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "营销投入": st.column_config.NumberColumn(format="¥ %.0f"),
+            "售价": st.column_config.NumberColumn(format="¥ %.0f"),
+        },
+    )
+
+
 def render_player_decision(company: sqlite3.Row) -> None:
-    hero("本轮决策", "决策可以在截止前重复提交；系统只保留最后一次提交。")
+    hero("本轮决策", "提交前请仔细确认；提交后系统会锁定决策，管理员仍可在后台代为修正。")
     with connect() as conn:
         round_row = current_round(conn)
         if not round_row:
             st.info("暂无回合。")
             return
-        if round_row["status"] != "open":
-            st.warning("当前回合未开放决策。")
-            return
         end = parse_time(round_row["ends_at"])
-        if end and datetime.now(timezone.utc) > end:
-            st.error("本轮提交时间已结束，请等待管理员结算。")
-            return
         round_no = int(round_row["round_no"])
         markets = all_rows(conn, "SELECT * FROM market_config ORDER BY city")
         home = one(conn, "SELECT * FROM market_config WHERE city=?", (company["home_city"],))
@@ -453,12 +500,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
         settings = settings_dict(conn)
         worker_salary_low, worker_salary_high = salary_bounds(settings, previous_worker_salary)
         engineer_salary_low, engineer_salary_high = salary_bounds(settings, previous_engineer_salary)
+        loan_base_net_assets = current_company_net_assets(conn, company)
         loan_limit = available_loan_limit(
-            float(company["cash"]) - float(company["debt"]),
+            loan_base_net_assets,
             float(settings["loan_asset_threshold"]),
             float(home["min_loan"]),
             float(home["max_loan"]),
         )
+        minimum_new_loan = float(home["min_loan"])
 
     st.markdown(
         f'<div class="hint">工资建议：工人约 <b>{money(helper["worker_wage"])}</b>，工程师约 '
@@ -466,13 +515,24 @@ def render_player_decision(company: sqlite3.Row) -> None:
         unsafe_allow_html=True,
     )
     if decision.get("submitted_at"):
-        st.success(f"已提交；最后保存时间：{str(decision['submitted_at'])[:19].replace('T', ' ')} UTC")
+        render_submitted_decision(decision, city_values, loan_base_net_assets, loan_limit)
+        return
+    if round_row["status"] != "open":
+        st.warning("当前回合未开放决策。")
+        return
+    if end and datetime.now(timezone.utc) > end:
+        st.error("本轮提交时间已结束，请等待管理员结算。")
+        return
 
     with st.form(f"decision_{round_no}"):
         loan_min = -float(company["debt"])
-        loan_max = max(0.0, loan_limit - float(company["debt"]))
+        loan_max = max(0.0, loan_limit)
         with st.expander("💰 银行贷款", expanded=False):
-            st.markdown(f'<div class="section-note">本轮总贷款额度 {money(loan_limit)}。正数为新增贷款，负数为本轮还款。</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="section-note">计算净资产 {money(loan_base_net_assets)} ÷ 阈值 {money(settings["loan_asset_threshold"])} '
+                f'× 最高贷款 {money(home["max_loan"])}；本轮可新增至多 {money(loan_limit)}，新增贷款最少 {money(minimum_new_loan)}。负数为还款。</div>',
+                unsafe_allow_html=True,
+            )
             loan_change = st.number_input(
                 "贷款变化",
                 min_value=loan_min,
@@ -588,6 +648,8 @@ def render_player_decision(company: sqlite3.Row) -> None:
 
     if submitted:
         errors: list[str] = []
+        if 0 < float(loan_change) < minimum_new_loan:
+            errors.append(f"新增贷款不得低于主场最低贷款 {money(minimum_new_loan)}；不贷款请填写 0。")
         for city, values in city_inputs.items():
             if values["agent_delta"] > int(settings["max_agent_add_per_city_round"]):
                 errors.append(f"{city} 每轮最多新增 {int(settings['max_agent_add_per_city_round'])} 个 Agent。")
@@ -602,6 +664,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
             latest_end = parse_time(latest_round["ends_at"]) if latest_round else None
             if not latest_round or latest_round["status"] != "open" or int(latest_round["round_no"]) != round_no or (latest_end and datetime.now(timezone.utc) > latest_end):
                 st.error("回合状态已经变化，本次提交未保存。")
+                return
+            already_submitted = one(
+                conn,
+                "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=? AND submitted_at IS NOT NULL",
+                (company["id"], round_no),
+            )
+            if already_submitted:
+                st.warning("本轮决策已经提交并锁定，本次修改未保存。")
                 return
             conn.execute(
                 "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,engineer_salary,"
@@ -622,7 +692,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                     "marketing_investment=excluded.marketing_investment,price=excluded.price,order_report=excluded.order_report",
                     (company["id"], round_no, city, values["agent_delta"], values["marketing_investment"], values["price"], values["order_report"]),
                 )
-        flash("success", "本轮决策已保存。")
+        flash("success", "本轮决策已提交并锁定。")
         st.rerun()
 
 
@@ -634,7 +704,7 @@ def ranking_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "队伍": row["code"],
                 "公司": row["name"],
                 "主场": row["home_city"],
-                "净现金": row["net_assets"],
+                "净资产": row["net_assets"],
                 "现金": row["cash"],
                 "本轮利润": row["net_profit"],
                 "售出": row["sold"],
@@ -646,7 +716,7 @@ def ranking_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def render_ranking(admin: bool = False) -> None:
-    hero("财富排行榜", "按 Net Cash 排序；Net Cash = 期末现金 − 负债，未售库存不计入排名。")
+    hero("财富排行榜", "按当轮结束后的 Net Assets 排序；Net Assets = 总资产（含期末库存价值）− 负债，所有费用均已计入。")
     with connect() as conn:
         latest = one(conn, "SELECT MAX(round_no) AS n FROM results")
         latest_round = int(latest["n"] or 0) if latest else 0
@@ -662,7 +732,7 @@ def render_ranking(admin: bool = False) -> None:
         hide_index=True,
         use_container_width=True,
         column_config={
-            "净现金": st.column_config.NumberColumn(format="¥ %.0f"),
+            "净资产": st.column_config.NumberColumn(format="¥ %.0f"),
             "现金": st.column_config.NumberColumn(format="¥ %.0f"),
             "本轮利润": st.column_config.NumberColumn(format="¥ %.0f"),
         },
@@ -690,7 +760,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     cols[0].metric("销售收入", money(metrics["sales_revenue"]))
     cols[1].metric("总成本", money(metrics["cost"]))
     cols[2].metric("净利润", money(metrics["net_profit"]))
-    st.markdown('<div class="report-note">净利润 = 销售收入 − 全部成本；排名依据 Net Assets（现金 − 负债）。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="report-note">净利润 = 销售收入 − 全部成本；排名依据 Net Assets（总资产 − 负债），专利、市场报告、税费和贷款利息均已计入。</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="report-title">财务 Finance</div>', unsafe_allow_html=True)
     finance = report["finance"]
@@ -769,7 +839,12 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
             visible_cities = {str(item["city"]) for item in all_rows(conn, "SELECT city FROM city_decisions WHERE company_id=? AND round_no=? AND order_report=1", (company_id, round_no))}
     pdf_market_sections: list[dict[str, Any]] = []
     for city in sorted(visible_cities):
-        market_rows = all_rows(conn, "SELECT c.code,c.name,cr.*,r.ma_index,r.qi_index,a.count AS current_agents FROM city_results cr JOIN companies c ON c.id=cr.company_id JOIN results r ON r.company_id=cr.company_id AND r.round_no=cr.round_no LEFT JOIN agents a ON a.company_id=cr.company_id AND a.city=cr.city WHERE cr.round_no=? AND cr.city=? ORDER BY cr.market_share DESC", (round_no, city))
+        all_market_rows = all_rows(conn, "SELECT c.code,c.name,cr.*,r.ma_index,r.qi_index,a.count AS current_agents FROM city_results cr JOIN companies c ON c.id=cr.company_id JOIN results r ON r.company_id=cr.company_id AND r.round_no=cr.round_no LEFT JOIN agents a ON a.company_id=cr.company_id AND a.city=cr.city WHERE cr.round_no=? AND cr.city=? ORDER BY cr.market_share DESC", (round_no, city))
+        market_rows = []
+        for market_row in all_market_rows:
+            stored_breakdown = json.loads(market_row["breakdown_json"]) if market_row["breakdown_json"] else {}
+            if int(stored_breakdown.get("agents", 0)) > 0:
+                market_rows.append(market_row)
         stats = one(conn, "SELECT * FROM market_round_stats WHERE round_no=? AND city=?", (round_no, city))
         market_config = one(conn, "SELECT * FROM market_config WHERE city=?", (city,))
         city_sale = next((item for item in report["sales"] if item["city"] == city), {})
@@ -827,7 +902,7 @@ def render_reports(company: sqlite3.Row | None, admin: bool = False) -> None:
 
 
 def render_wealth(company: sqlite3.Row | None, admin: bool = False) -> None:
-    hero("财富曲线", "按照官方样式对比全部队伍每轮 Net Assets（期末现金 − 负债）。")
+    hero("财富曲线", "按照官方样式对比全部队伍每轮 Net Assets（总资产 − 负债）。")
     with connect() as conn:
         rows = all_rows(
             conn,
@@ -873,7 +948,7 @@ def render_player_kds(company: sqlite3.Row) -> None:
         - 贷款总额度：`净资产 ÷ 贷款阈值 × 主场最高贷款`，并受最低/最高贷款约束；利息计入负债。
         - MA 指数：`MA 投资 ÷ (工人 + 工程师)`
         - QI 指数：`QI 投资 ÷ (旧产品 × 1.2 + 新产品)`
-        - QI 大量 CPI 门槛：`城市最高价 ÷ 50`
+        - QI 大量 CPI 门槛：`城市最高价 ÷ 50`；超过门槛后进入第二层分配，QI 完整分配池合计 `20 CPI`。
         - CPI：按城市独立执行赠品、第一层、第二层、福利 1/2；价格差使用 `{int(settings['cpi_price_power'])}` 次方。
         - 现金不会低于 0；投资按 `MI → QI → MA` 扣除，不足时只投入剩余现金。
         - 专利在中奖后的下一轮开始降低材料成本；市场报告与专利投入都在销售收入到账后扣除。
@@ -901,7 +976,7 @@ def render_admin_overview() -> None:
     cols[3].metric("已结算轮次", max((int(row["round_no"]) for row in ranking), default=0))
     if ranking:
         st.subheader("最新排名")
-        st.dataframe(ranking_table(ranking), hide_index=True, use_container_width=True, column_config={"净现金": st.column_config.NumberColumn(format="¥ %.0f"), "现金": st.column_config.NumberColumn(format="¥ %.0f"), "本轮利润": st.column_config.NumberColumn(format="¥ %.0f")})
+        st.dataframe(ranking_table(ranking), hide_index=True, use_container_width=True, column_config={"净资产": st.column_config.NumberColumn(format="¥ %.0f"), "现金": st.column_config.NumberColumn(format="¥ %.0f"), "本轮利润": st.column_config.NumberColumn(format="¥ %.0f")})
 
 
 def render_admin_companies() -> None:
@@ -1017,6 +1092,24 @@ def render_admin_companies() -> None:
                     flash("success", f"{company['code']} 密码已重置。")
                     st.rerun()
             st.caption(f"现金 {money(company['cash'])} · 负债 {money(company['debt'])} · 专利 {company['patents']} · 库存 {company['product_inventory']}")
+            st.markdown("##### 删除玩家")
+            delete_phrase = f"DELETE {company['code']}"
+            delete_confirm = st.text_input(
+                f"输入 {delete_phrase} 确认删除",
+                key=f"delete_company_confirm_{company['id']}",
+            )
+            if st.button(
+                "永久删除该玩家及全部比赛数据",
+                key=f"delete_company_{company['id']}",
+                disabled=delete_confirm != delete_phrase,
+            ):
+                try:
+                    with connect() as conn:
+                        delete_company(conn, int(company["id"]))
+                    flash("success", f"玩家 {company['code']} 已删除。")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
 
 
 def render_admin_decisions() -> None:
@@ -1065,11 +1158,16 @@ def render_admin_decisions() -> None:
     mark_submitted = st.checkbox("本轮已提交", value=bool(decision.get("submitted_at")), disabled=not editable, help="未勾选时保存会把本轮所有新增、生产和投资决策归零。")
     worker_low, worker_high = salary_bounds(settings, previous_worker_salary)
     engineer_low, engineer_high = salary_bounds(settings, previous_engineer_salary)
-    loan_limit = available_loan_limit(float(company["cash"]) - float(company["debt"]), float(settings["loan_asset_threshold"]), float(home["min_loan"]), float(home["max_loan"]))
+    with connect() as conn:
+        loan_base_net_assets = current_company_net_assets(conn, company)
+    loan_limit = available_loan_limit(loan_base_net_assets, float(settings["loan_asset_threshold"]), float(home["min_loan"]), float(home["max_loan"]))
     with st.form(f"admin_decision_{round_no}_{company['id']}"):
         with st.expander("💰 银行贷款", expanded=False):
-            st.caption(f"本轮总贷款额度：{money(loan_limit)}")
-            loan_change = st.number_input("贷款变化", min_value=-float(company["debt"]), max_value=max(0.0, loan_limit - float(company["debt"])), value=min(max(float(decision["loan_change"]), -float(company["debt"])), max(0.0, loan_limit - float(company["debt"]))), step=10_000.0, disabled=not editable)
+            st.caption(
+                f"计算净资产 {money(loan_base_net_assets)}；本轮最高新增 {money(loan_limit)}；"
+                f"新增贷款最少 {money(home['min_loan'])}。"
+            )
+            loan_change = st.number_input("贷款变化", min_value=-float(company["debt"]), max_value=max(0.0, loan_limit), value=min(max(float(decision["loan_change"]), -float(company["debt"])), max(0.0, loan_limit)), step=10_000.0, disabled=not editable)
         with st.expander("👥 人力资源", expanded=True):
             cols = st.columns(2)
             worker_delta = cols[0].number_input("工人增减", min_value=-current_workers, value=int(decision["worker_delta"]), step=1, disabled=not editable)
@@ -1102,6 +1200,9 @@ def render_admin_decisions() -> None:
                 }
         save = st.form_submit_button("保存玩家决策", type="primary", disabled=not editable, use_container_width=True)
     if save:
+        if mark_submitted and 0 < float(loan_change) < float(home["min_loan"]):
+            st.error(f"新增贷款不得低于主场最低贷款 {money(home['min_loan'])}；不贷款请填写 0。")
+            return
         submitted_at = now_iso() if mark_submitted else None
         if not mark_submitted:
             loan_change = worker_delta = engineer_delta = management = production_volume = quality = research = 0
@@ -1160,6 +1261,10 @@ def render_admin_kds() -> None:
     if save:
         if values["salary_min"] > values["salary_max"] or values["price_min"] > values["price_max"]:
             st.error("最低值不能高于最高值。")
+        elif int(values["total_rounds"]) < 1:
+            st.error("比赛总轮数必须至少为 1。")
+        elif float(values["loan_asset_threshold"]) <= 0:
+            st.error("贷款净资产阈值必须大于 0，贷款公式才能生效。")
         else:
             with connect() as conn:
                 for key, value in values.items():
@@ -1185,15 +1290,21 @@ def render_admin_kds() -> None:
     if st.button("保存全部城市参数", type="primary", disabled=not unlocked):
         numeric_columns = [column for column in frame.columns if column not in ("city", "home_enabled")]
         try:
+            records = edited.to_dict("records")
+            for record in records:
+                minimum_loan = float(record["min_loan"])
+                maximum_loan = float(record["max_loan"])
+                if minimum_loan < 0 or maximum_loan < 0 or minimum_loan > maximum_loan:
+                    raise ValueError(f"{record['city']} 的最低贷款必须大于等于 0，且不能高于最高贷款。")
             with connect() as conn:
-                for record in edited.to_dict("records"):
+                for record in records:
                     values_sql = [int(bool(record["home_enabled"]))] + [float(record[column]) for column in numeric_columns]
                     assignments = ["home_enabled=?"] + [f"{column}=?" for column in numeric_columns]
                     conn.execute(f"UPDATE market_config SET {','.join(assignments)} WHERE city=?", (*values_sql, record["city"]))
             flash("success", "城市 KDS 已保存。")
             st.rerun()
-        except (TypeError, ValueError):
-            st.error("城市参数必须是有效数字。")
+        except (TypeError, ValueError) as exc:
+            st.error(str(exc) or "城市参数必须是有效数字。")
 
     with st.form("add_city", clear_on_submit=True):
         city = st.text_input("新增城市名称", disabled=not unlocked)
@@ -1212,11 +1323,35 @@ def render_admin_kds() -> None:
         except sqlite3.IntegrityError:
             st.error("城市名称重复。")
 
+    st.markdown("#### 删除城市")
+    st.caption("删除城市会同步移除该城市的 Agent、决策和市场数据；以该城市为主场的玩家需要重新选择主场。")
+    city_names = [str(row["city"]) for row in markets]
+    selected_city_for_delete = st.selectbox("选择要删除的城市", city_names, disabled=not unlocked or len(city_names) <= 1)
+    city_delete_phrase = f"DELETE {selected_city_for_delete}" if selected_city_for_delete else ""
+    city_delete_confirm = st.text_input(
+        f"输入 {city_delete_phrase or 'DELETE 城市名'} 确认",
+        key="delete_city_confirm",
+        disabled=not unlocked or len(city_names) <= 1,
+    )
+    if st.button(
+        "永久删除该城市",
+        disabled=not unlocked or len(city_names) <= 1 or city_delete_confirm != city_delete_phrase,
+    ):
+        try:
+            with connect() as conn:
+                delete_city(conn, selected_city_for_delete)
+            flash("success", f"城市 {selected_city_for_delete} 已删除。")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
 
 def render_admin_rounds() -> None:
-    hero("回合控制", "第一轮需全部队伍完成赛前设置；每轮需全部队伍提交后才能结算。")
+    hero("回合控制", "设置比赛总轮数、控制计时与结算；必要时可随时中断并从第一轮重开。")
     with connect() as conn:
         round_row = current_round(conn)
+        total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
+        default_minutes = max(1, get_setting(conn, "round_duration_minutes", 30, int))
         setup = setup_status(conn)
         submission = submission_status(conn, int(round_row["round_no"])) if round_row and round_row["status"] in ("open", "paused") else None
         decisions = all_rows(
@@ -1227,12 +1362,26 @@ def render_admin_rounds() -> None:
         ) if round_row else []
         history = all_rows(conn, "SELECT * FROM rounds ORDER BY round_no DESC")
     round_banner(round_row)
+    current_round_no = int(round_row["round_no"]) if round_row else 1
+    settings_cols = st.columns([2, 1, 2])
+    selected_total_rounds = settings_cols[0].number_input(
+        "比赛总轮数",
+        min_value=max(1, current_round_no),
+        value=max(total_rounds, current_round_no),
+        step=1,
+    )
+    settings_cols[1].metric("比赛进度", f"{current_round_no}/{total_rounds}")
+    if settings_cols[2].button("保存总轮数", use_container_width=True):
+        with connect() as conn:
+            set_setting(conn, "total_rounds", int(selected_total_rounds))
+        flash("success", f"比赛总轮数已设置为 {int(selected_total_rounds)} 轮。")
+        st.rerun()
     st.write(f"赛前就绪：{setup['ready']}/{setup['total']}")
     if submission:
         st.write(f"本轮提交：{submission['submitted']}/{submission['total']}")
 
     if round_row and round_row["status"] == "waiting":
-        minutes = st.number_input("第一轮时长（分钟）", min_value=1, value=30, step=1)
+        minutes = st.number_input("第一轮时长（分钟）", min_value=1, value=default_minutes, step=1)
         if st.button("开始第一轮", type="primary", disabled=not bool(setup["all_ready"])):
             start = datetime.now(timezone.utc)
             with connect() as conn:
@@ -1268,14 +1417,17 @@ def render_admin_rounds() -> None:
                 LOGGER.exception("Round settlement failed")
                 st.error("结算失败，请在部署后台日志中查看详细原因。")
     elif round_row and round_row["status"] == "settled":
-        minutes = st.number_input("下一轮时长（分钟）", min_value=1, value=30, step=1)
-        if st.button("开启下一轮", type="primary"):
-            start = datetime.now(timezone.utc)
-            next_round = int(round_row["round_no"]) + 1
-            with connect() as conn:
-                conn.execute("INSERT INTO rounds(round_no,status,starts_at,ends_at) VALUES(?,'open',?,?)", (next_round, start.isoformat(), (start + timedelta(minutes=int(minutes))).isoformat()))
-            flash("success", f"第 {next_round} 轮已开始。")
-            st.rerun()
+        if int(round_row["round_no"]) >= total_rounds:
+            st.success(f"全部 {total_rounds} 轮已经结束。")
+        else:
+            minutes = st.number_input("下一轮时长（分钟）", min_value=1, value=default_minutes, step=1)
+            if st.button("开启下一轮", type="primary"):
+                start = datetime.now(timezone.utc)
+                next_round = int(round_row["round_no"]) + 1
+                with connect() as conn:
+                    conn.execute("INSERT INTO rounds(round_no,status,starts_at,ends_at) VALUES(?,'open',?,?)", (next_round, start.isoformat(), (start + timedelta(minutes=int(minutes))).isoformat()))
+                flash("success", f"第 {next_round} 轮已开始。")
+                st.rerun()
 
     if decisions:
         st.subheader("队伍状态")
@@ -1285,6 +1437,16 @@ def render_admin_rounds() -> None:
         st.dataframe(status_frame, hide_index=True, use_container_width=True)
     st.subheader("回合历史")
     st.dataframe(pd.DataFrame([dict(row) for row in history]), hide_index=True, use_container_width=True)
+    st.divider()
+    st.subheader("中断并重开比赛")
+    st.markdown('<div class="danger">重开会清空所有回合、提交、结算报表、员工和 Agent，并让所有玩家重新选择主场与公司名称；玩家账号和 KDS 保留。</div>', unsafe_allow_html=True)
+    restart_confirm = st.text_input("输入 RESTART 确认从第一轮重开", key="round_restart_confirm")
+    if st.button("中断当前比赛并重开", disabled=restart_confirm != "RESTART", key="round_restart_button"):
+        with connect() as conn:
+            reset_competition(conn)
+        st.session_state.pop("admin_kds_unlocked", None)
+        flash("success", "比赛已中断并重开，现在回到第一轮赛前设置。")
+        st.rerun()
 
 
 def render_backup_reset() -> None:

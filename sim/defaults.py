@@ -3,6 +3,7 @@ from __future__ import annotations
 
 DEFAULT_SETTINGS: dict[str, float | int | str] = {
     "initial_cash": 15_000_000,
+    "total_rounds": 5,
     "round_duration_minutes": 30,
     "component_workers": 3,
     "component_hours": 7,
@@ -52,6 +53,7 @@ DEFAULT_MARKETS = [
 
 GLOBAL_SETTING_LABELS = {
     "initial_cash": "初始现金",
+    "total_rounds": "比赛总轮数",
     "round_duration_minutes": "每轮时长（分钟）",
     "component_workers": "每份零件所需工人数 A",
     "component_hours": "每份零件所需工时 B",

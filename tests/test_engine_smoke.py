@@ -53,6 +53,13 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertAlmostEqual(report["human_resources"]["average_engineer_salary"], 6400)
                 self.assertAlmostEqual(results[0]["debt"], 1_030_000)
                 self.assertEqual(report["finance"]["interest"], 30_000)
+                self.assertGreater(report["finance"]["research"], 0)
+                self.assertGreater(report["finance"]["market_reports"], 0)
+                self.assertAlmostEqual(results[0]["net_assets"], results[0]["total_assets"] - results[0]["debt"])
+                self.assertAlmostEqual(
+                    results[0]["net_assets"],
+                    report["finance"]["round_ends"] + report["key_metrics"]["inventory_book_value"] - results[0]["debt"],
+                )
                 self.assertNotIn("market_average_price", report["sales"][0])
                 self.assertNotIn('market_average_price', json.dumps(report["sales"]))
                 self.assertTrue(next(item for item in report["sales"] if item["city"] == "广州")["report_purchased"])
@@ -77,6 +84,8 @@ class SettlementSmokeTest(unittest.TestCase):
                 city_results = db.all_rows(conn, "SELECT price,sold FROM city_results WHERE city='广州' AND round_no=1")
                 expected_average = weighted_market_average(9800, 80_000, [(row["price"], row["sold"]) for row in city_results])
                 self.assertAlmostEqual(stats["average_price"], expected_average)
+                hidden_rows = db.one(conn, "SELECT COUNT(*) AS n FROM city_results WHERE city='成都' AND round_no=1")
+                self.assertEqual(hidden_rows["n"], 0)
 
     def test_weighted_market_average_blends_unserved_demand(self) -> None:
         from sim.engine import weighted_market_average
@@ -93,6 +102,33 @@ class SettlementSmokeTest(unittest.TestCase):
         self.assertEqual(available_loan_limit(50_000_000, 15_000_000, 0, 6_000_000), 6_000_000)
         self.assertEqual(weighted_salary_average([(10, 3900, 3300), (20, 3000, 3300)], 3300), 3300)
         self.assertEqual(spend(400_000, 600_000), (0, 400_000))
+
+    def test_loan_limit_is_a_per_round_new_loan_amount(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "loan.db")
+            from sim import db
+            from sim.engine import settle_round
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+                for index, company in enumerate(companies):
+                    conn.execute(
+                        "UPDATE companies SET home_city='广州',setup_submitted_at=?,debt=? WHERE id=?",
+                        (db.now_iso(), 2_000_000 if index == 0 else 0, company["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,loan_change,worker_salary,engineer_salary,submitted_at) VALUES(?,1,?,?,?,?)",
+                        (company["id"], 5_000_000 if index == 0 else 0, 3300, 6400, db.now_iso()),
+                    )
+                settle_round(conn, 1)
+                first = json.loads(db.one(conn, "SELECT report_json FROM results WHERE company_id=? AND round_no=1", (companies[0]["id"],))["report_json"])
+                self.assertAlmostEqual(first["finance"]["loan_base_net_assets"], 13_000_000)
+                self.assertAlmostEqual(first["finance"]["loan_limit"], 5_200_000)
+                self.assertAlmostEqual(first["finance"]["loan_change"], 5_000_000)
+                self.assertAlmostEqual(first["key_metrics"]["debt"], 7_210_000)
 
     def test_patent_reduces_material_cost_starting_next_round(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -130,6 +166,34 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(second["research"]["active_patents_this_round"], 1)
                 self.assertAlmostEqual(first["finance"]["materials"], 2750)
                 self.assertAlmostEqual(second["finance"]["materials"], 1925)
+
+    def test_admin_can_delete_players_and_cities_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "delete.db")
+            from sim import db
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                company = db.one(conn, "SELECT * FROM companies ORDER BY id LIMIT 1")
+                conn.execute("UPDATE companies SET home_city='广州',setup_submitted_at=? WHERE id=?", (db.now_iso(), company["id"]))
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company["id"],))
+                conn.execute(
+                    "INSERT INTO city_results(company_id,round_no,city,cpi,cpi_units,sold,revenue,price,marketing,market_share,breakdown_json) "
+                    "VALUES(?,1,'广州',1,1,1,1,1,1,1,'{}')",
+                    (company["id"],),
+                )
+                db.delete_city(conn, "广州")
+                refreshed = db.one(conn, "SELECT home_city,setup_submitted_at FROM companies WHERE id=?", (company["id"],))
+                self.assertIsNone(refreshed["home_city"])
+                self.assertIsNone(refreshed["setup_submitted_at"])
+                self.assertIsNone(db.one(conn, "SELECT city FROM market_config WHERE city='广州'"))
+                self.assertEqual(db.one(conn, "SELECT COUNT(*) AS n FROM city_results WHERE city='广州'")["n"], 0)
+                self.assertEqual(db.one(conn, "SELECT COUNT(*) AS n FROM agents WHERE city='广州'")["n"], 0)
+
+                db.delete_company(conn, int(company["id"]))
+                self.assertIsNone(db.one(conn, "SELECT id FROM companies WHERE id=?", (company["id"],)))
+                self.assertEqual(db.get_setting(conn, "total_rounds", 0, int), 5)
 
 
 if __name__ == "__main__":

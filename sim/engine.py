@@ -50,13 +50,35 @@ def research_probability(investment: float, amount_25: float, amount_75: float) 
 
 
 def available_loan_limit(net_assets: float, threshold: float, minimum: float, maximum: float) -> float:
-    """Return the permitted total debt for the round."""
+    """Return this round's permitted new loan using the configured KDS range."""
     ceiling = max(0.0, float(maximum))
     floor = min(ceiling, max(0.0, float(minimum)))
     if threshold <= 0:
         return ceiling
     calculated = max(0.0, float(net_assets)) / float(threshold) * ceiling
     return min(ceiling, max(floor, calculated))
+
+
+def current_company_net_assets(conn: sqlite3.Connection, company: sqlite3.Row | dict[str, Any]) -> float:
+    """Return the latest settled net assets, including unsold inventory value."""
+    latest = one(
+        conn,
+        "SELECT net_assets FROM results WHERE company_id=? ORDER BY round_no DESC LIMIT 1",
+        (int(company["id"]),),
+    )
+    if latest is not None:
+        return float(latest["net_assets"])
+    inventory_value = 0.0
+    if company["home_city"] and int(company["product_inventory"] or 0) > 0:
+        home = one(conn, "SELECT product_material FROM market_config WHERE city=?", (company["home_city"],))
+        if home is not None:
+            patent_factor = get_setting(conn, "patent_factor", 0.70)
+            inventory_value = (
+                int(company["product_inventory"])
+                * float(home["product_material"])
+                * (float(patent_factor) ** int(company["patents"] or 0))
+            )
+    return float(company["cash"]) + inventory_value - float(company["debt"])
 
 
 def weighted_salary_average(rows: list[tuple[int, float, float]], fallback: float) -> float:
@@ -210,10 +232,12 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
 
         debt = float(company["debt"])
         cash = max(0.0, float(company["cash"]))
-        loan_limit = available_loan_limit(cash - debt, loan_threshold, float(home.get("min_loan", 0.0)), float(home["max_loan"]))
+        loan_base_net_assets = current_company_net_assets(conn, company)
+        loan_limit = available_loan_limit(loan_base_net_assets, loan_threshold, float(home.get("min_loan", 0.0)), float(home["max_loan"]))
         requested_loan_change = float(decision["loan_change"])
         if requested_loan_change >= 0:
-            actual_loan_change = min(requested_loan_change, max(0.0, loan_limit - debt))
+            requested_new_loan = requested_loan_change if requested_loan_change + 1e-9 >= float(home.get("min_loan", 0.0)) else 0.0
+            actual_loan_change = min(requested_new_loan, loan_limit)
             debt += actual_loan_change
             cash += actual_loan_change
         else:
@@ -313,7 +337,8 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "worker_multiplier": worker_multiplier, "engineer_multiplier": engineer_multiplier,
             "average_worker_wage": average_worker_wage, "average_engineer_wage": average_engineer_wage,
             "produced": produced, "components": components, "available": old_products + produced, "old_products": old_products,
-            "cash_pre_sales": cash, "debt_before_interest": debt, "loan_limit": loan_limit, "loan_change": actual_loan_change,
+            "cash_pre_sales": cash, "debt_before_interest": debt, "loan_base_net_assets": loan_base_net_assets,
+            "loan_limit": loan_limit, "loan_change": actual_loan_change,
             "worker_wage_cost": worker_wage_cost, "engineer_wage_cost": engineer_wage_cost, "wage_cost": worker_wage_cost + engineer_wage_cost,
             "layoff_cost": layoff_cost, "training_cost": training_cost,
             "component_material_cost": component_material_cost, "product_material_cost": product_material_cost,
@@ -421,10 +446,11 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             secondary_units = float(state["city_secondary"][city])
             breakdown = dict(allocation) if allocation else {}
             breakdown.update({"market_size": size, "cpi_units": allocated_before_secondary, "secondary_units": secondary_units, "agents": int(city_decision["agents_after"])})
-            conn.execute(
-                "INSERT INTO city_results(company_id,round_no,city,cpi,cpi_units,sold,revenue,price,marketing,market_share,breakdown_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (company_id, round_no, city, float(state["city_cpi"][city]), allocated_before_secondary, units, net_city_revenue, float(city_decision["price"]), float(city_decision["marketing_investment"]), share, json.dumps(breakdown, ensure_ascii=False)),
-            )
+            if int(city_decision["agents_after"]) > 0:
+                conn.execute(
+                    "INSERT INTO city_results(company_id,round_no,city,cpi,cpi_units,sold,revenue,price,marketing,market_share,breakdown_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (company_id, round_no, city, float(state["city_cpi"][city]), allocated_before_secondary, units, net_city_revenue, float(city_decision["price"]), float(city_decision["marketing_investment"]), share, json.dumps(breakdown, ensure_ascii=False)),
+                )
             public_allocation = {key: value for key, value in allocation.items() if key not in {"average_price", "market_average_price"}} if allocation else {}
             city_report_rows.append({
                 "city": city, "agents": int(city_decision["agents_after"]), "marketing": float(city_decision["marketing_investment"]),
@@ -458,11 +484,12 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         patents_after = int(state["active_patents"]) + research_success
         inventory_book_value = inventory * float(home["product_material"]) * (patent_factor ** state["active_patents"])
         total_assets = cash + inventory_book_value
-        net_assets = cash - debt
+        net_assets = total_assets - debt
         report = {
             "key_metrics": {"total_assets": total_assets, "debt": debt, "net_assets": net_assets, "sales_revenue": revenue, "cost": total_cost, "net_profit": net_profit, "inventory_book_value": inventory_book_value},
             "finance": {
-                "round_begins": company["cash"], "starting_debt": company["debt"], "loan_limit": state["loan_limit"], "loan_change": state["loan_change"],
+                "round_begins": company["cash"], "starting_debt": company["debt"], "loan_base_net_assets": state["loan_base_net_assets"],
+                "loan_limit": state["loan_limit"], "loan_change": state["loan_change"],
                 "worker_wages": state["worker_wage_cost"], "engineer_wages": state["engineer_wage_cost"], "wages": state["wage_cost"],
                 "layoff": state["layoff_cost"], "training": state["training_cost"],
                 "component_material": state["component_material_cost"], "product_material": state["product_material_cost"],

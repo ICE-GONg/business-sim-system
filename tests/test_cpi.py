@@ -31,9 +31,10 @@ class CPIGeneratorPortTests(unittest.TestCase):
         )
         self.assertAlmostEqual(results[0]["price_cpi"], 40.0)
         self.assertAlmostEqual(results[1]["price_cpi"], 0.0)
+        self.assertEqual(results[0]["thresholds"]["qi_large"], 500.0)
         self.assertEqual(results[0]["thresholds"]["mi_large"], 8_000_000)
+        self.assertAlmostEqual(sum(item["qi_cpi"] for item in results), 20.0)
 
 
 if __name__ == "__main__":
     unittest.main()
-
