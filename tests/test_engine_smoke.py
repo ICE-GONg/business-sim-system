@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +40,10 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(len(results), 4)
                 self.assertTrue(all(0 <= row["sold"] <= row["produced"] for row in results))
                 self.assertTrue(all(row["sold"] == 10 for row in results))
+                report = json.loads(results[0]["report_json"])
+                self.assertIn("previous_workers", report["human_resources"])
+                self.assertIn("component_storage_before", report["production"])
+                self.assertIn("components", report["production"])
                 stats = db.one(conn, "SELECT * FROM market_round_stats WHERE city='广州' AND round_no=1")
                 self.assertIsNotNone(stats)
                 expected_average = weighted_market_average(9800, 80_000, [(9800, 10)] * 4)
