@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import importlib
 import json
 import logging
 import os
@@ -24,6 +25,18 @@ import altair as alt
 import streamlit as st
 
 from sim import APP_NAME
+from sim import db as _db_module
+from sim import engine as _engine_module
+
+# Streamlit Community Cloud can rerun a freshly downloaded app.py inside a
+# process that still has the previous internal modules cached. Refresh only
+# when a newly introduced API is missing, so both hot updates and cold starts
+# import one consistent version of the application.
+if not hasattr(_db_module, "delete_city") or not hasattr(_engine_module, "current_company_net_assets"):
+    importlib.invalidate_caches()
+    importlib.reload(_db_module)
+    importlib.reload(_engine_module)
+
 from sim.db import (
     all_rows,
     connect,
