@@ -26,27 +26,56 @@ class SettlementSmokeTest(unittest.TestCase):
                     )
                     conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company["id"],))
                     conn.execute(
-                        "INSERT INTO decisions(company_id,round_no,worker_delta,worker_salary,engineer_delta,engineer_salary,"
+                        "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,engineer_salary,"
                         "management_investment,production_volume,quality_investment,research_investment,submitted_at) "
-                        "VALUES(?,1,3,3300,4,6400,9100,10,5000,0,?)",
-                        (company["id"], db.now_iso()),
+                        "VALUES(?,1,1000000,3,3300,4,6400,9100,10,5000,?,?)",
+                        (company["id"], 1_500_000 if company["id"] == companies[0]["id"] else 0, db.now_iso()),
                     )
                     conn.execute(
-                        "INSERT INTO city_decisions(company_id,round_no,city,marketing_investment,price) VALUES(?,1,'广州',8000000,9800)",
+                        "INSERT INTO city_decisions(company_id,round_no,city,agent_delta,marketing_investment,price,order_report) VALUES(?,1,'广州',3,8000000,9800,1)",
+                        (company["id"],),
+                    )
+                    conn.execute(
+                        "INSERT INTO city_decisions(company_id,round_no,city,agent_delta,marketing_investment,price) VALUES(?,1,'深圳',3,0,9800)",
                         (company["id"],),
                     )
                 settle_round(conn, 1)
                 results = db.all_rows(conn, "SELECT * FROM results ORDER BY company_id")
                 self.assertEqual(len(results), 4)
                 self.assertTrue(all(0 <= row["sold"] <= row["produced"] for row in results))
-                self.assertTrue(all(row["sold"] == 10 for row in results))
+                self.assertTrue(all(0 < row["sold"] <= 10 for row in results))
+                self.assertTrue(all(row["cash"] >= 0 for row in results))
                 report = json.loads(results[0]["report_json"])
                 self.assertIn("previous_workers", report["human_resources"])
                 self.assertIn("component_storage_before", report["production"])
                 self.assertIn("components", report["production"])
+                self.assertAlmostEqual(report["human_resources"]["average_worker_salary"], 3300)
+                self.assertAlmostEqual(report["human_resources"]["average_engineer_salary"], 6400)
+                self.assertAlmostEqual(results[0]["debt"], 1_030_000)
+                self.assertEqual(report["finance"]["interest"], 30_000)
+                self.assertNotIn("market_average_price", report["sales"][0])
+                self.assertNotIn('market_average_price', json.dumps(report["sales"]))
+                self.assertTrue(next(item for item in report["sales"] if item["city"] == "广州")["report_purchased"])
+                self.assertEqual(report["research"]["active_patents_this_round"], 0)
+                self.assertEqual(report["research"]["effective_from_round"], 2)
+                self.assertEqual(report["research"]["patents_after"], 1)
+                finance = report["finance"]
+                expected_cash = (
+                    finance["round_begins"] + finance["loan_change"]
+                    - finance["wages"] - finance["layoff"] - finance["training"]
+                    - finance["materials"] - finance["storage"] - finance["agents"]
+                    - finance["marketing"] - finance["quality"] - finance["management"]
+                    + finance["sales_revenue"] - finance["research"] - finance["market_reports"] - finance["tax"]
+                )
+                self.assertAlmostEqual(finance["round_ends"], expected_cash)
+                taxable_profit = report["key_metrics"]["sales_revenue"] - (report["key_metrics"]["cost"] - finance["tax"])
+                self.assertAlmostEqual(finance["tax"], max(0, taxable_profit * 0.20))
+                agents = db.all_rows(conn, "SELECT city,count FROM agents WHERE company_id=? AND city IN ('广州','深圳') ORDER BY city", (companies[0]["id"],))
+                self.assertEqual({row["city"]: row["count"] for row in agents}, {"广州": 4, "深圳": 3})
                 stats = db.one(conn, "SELECT * FROM market_round_stats WHERE city='广州' AND round_no=1")
                 self.assertIsNotNone(stats)
-                expected_average = weighted_market_average(9800, 80_000, [(9800, 10)] * 4)
+                city_results = db.all_rows(conn, "SELECT price,sold FROM city_results WHERE city='广州' AND round_no=1")
+                expected_average = weighted_market_average(9800, 80_000, [(row["price"], row["sold"]) for row in city_results])
                 self.assertAlmostEqual(stats["average_price"], expected_average)
 
     def test_weighted_market_average_blends_unserved_demand(self) -> None:
@@ -55,6 +84,52 @@ class SettlementSmokeTest(unittest.TestCase):
         average = weighted_market_average(100, 1_000, [(80, 100), (120, 200)])
         self.assertAlmostEqual(average, 102.0)
         self.assertEqual(weighted_market_average(100, 1_000, []), 100)
+
+    def test_finance_helpers_follow_kds_rules(self) -> None:
+        from sim.engine import available_loan_limit, spend, weighted_salary_average
+
+        self.assertEqual(available_loan_limit(7_500_000, 15_000_000, 1_000_000, 6_000_000), 3_000_000)
+        self.assertEqual(available_loan_limit(-1, 15_000_000, 1_000_000, 6_000_000), 1_000_000)
+        self.assertEqual(available_loan_limit(50_000_000, 15_000_000, 0, 6_000_000), 6_000_000)
+        self.assertEqual(weighted_salary_average([(10, 3900, 3300), (20, 3000, 3300)], 3300), 3300)
+        self.assertEqual(spend(400_000, 600_000), (0, 400_000))
+
+    def test_patent_reduces_material_cost_starting_next_round(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "patent.db")
+            from sim import db
+            from sim.engine import settle_round
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+                for company in companies:
+                    conn.execute("UPDATE companies SET home_city='广州',setup_submitted_at=? WHERE id=?", (db.now_iso(), company["id"]))
+                    conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company["id"],))
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,worker_delta,worker_salary,engineer_delta,engineer_salary,production_volume,research_investment,submitted_at) VALUES(?,1,3,3300,4,6400,1,?,?)",
+                        (company["id"], 1_500_000 if company["id"] == companies[0]["id"] else 0, db.now_iso()),
+                    )
+                    conn.execute("INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,1,'广州',9800)", (company["id"],))
+                settle_round(conn, 1)
+                first = json.loads(db.one(conn, "SELECT report_json FROM results WHERE company_id=? AND round_no=1", (companies[0]["id"],))["report_json"])
+                self.assertTrue(first["research"]["success"])
+                self.assertEqual(first["research"]["active_patents_this_round"], 0)
+
+                conn.execute("INSERT INTO rounds(round_no,status) VALUES(2,'open')")
+                for company in companies:
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,production_volume,submitted_at) VALUES(?,2,3300,6400,1,?)",
+                        (company["id"], db.now_iso()),
+                    )
+                    conn.execute("INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,2,'广州',9800)", (company["id"],))
+                settle_round(conn, 2)
+                second = json.loads(db.one(conn, "SELECT report_json FROM results WHERE company_id=? AND round_no=2", (companies[0]["id"],))["report_json"])
+                self.assertEqual(second["research"]["active_patents_this_round"], 1)
+                self.assertAlmostEqual(first["finance"]["materials"], 2750)
+                self.assertAlmostEqual(second["finance"]["materials"], 1925)
 
 
 if __name__ == "__main__":

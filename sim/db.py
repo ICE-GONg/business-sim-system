@@ -131,6 +131,7 @@ def init_db() -> None:
                 city TEXT PRIMARY KEY,
                 home_enabled INTEGER NOT NULL DEFAULT 1,
                 max_loan REAL NOT NULL,
+                min_loan REAL NOT NULL DEFAULT 0,
                 interest_rate REAL NOT NULL,
                 worker_initial_salary REAL NOT NULL,
                 engineer_initial_salary REAL NOT NULL,
@@ -236,12 +237,18 @@ def init_db() -> None:
             );
             """
         )
+        market_columns = {row["name"] for row in all_rows(conn, "PRAGMA table_info(market_config)")}
+        if "min_loan" not in market_columns:
+            conn.execute("ALTER TABLE market_config ADD COLUMN min_loan REAL NOT NULL DEFAULT 0")
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
         count = one(conn, "SELECT COUNT(*) AS n FROM market_config")
         if count and int(count["n"]) == 0:
             conn.executemany(
-                "INSERT INTO market_config VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO market_config(city,home_enabled,max_loan,min_loan,interest_rate,worker_initial_salary,"
+                "engineer_initial_salary,component_material,product_material,component_storage,product_storage,"
+                "population,penetration,initial_avg_price,max_price,transport_cost,worker_training_cost,engineer_training_cost) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 DEFAULT_MARKETS,
             )
         count = one(conn, "SELECT COUNT(*) AS n FROM companies")

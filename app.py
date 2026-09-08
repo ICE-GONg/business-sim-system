@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import csv
 import html
-import io
 import json
 import os
 import sqlite3
@@ -44,7 +42,8 @@ from sim.db import (
     verify_password,
 )
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
-from sim.engine import market_size, settle_round, weighted_market_average
+from sim.engine import available_loan_limit, market_size, settle_round, weighted_market_average
+from sim.report_pdf import build_round_report_pdf
 
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
@@ -210,7 +209,7 @@ def render_setup(company: sqlite3.Row) -> None:
         if not markets:
             st.error("管理员尚未配置可选主场。")
             return
-        labels = [f"{m['city']}｜最高贷款 {money(m['max_loan'])}｜材料 {money(m['component_material'])}/{money(m['product_material'])}" for m in markets]
+        labels = [f"{m['city']}｜贷款 {money(m['min_loan'])}–{money(m['max_loan'])}｜材料 {money(m['component_material'])}/{money(m['product_material'])}" for m in markets]
         with st.form("home_setup"):
             selected = st.selectbox("主场城市（确认后锁定）", labels)
             confirmed = st.form_submit_button("确认主场", type="primary")
@@ -331,10 +330,11 @@ def render_player_overview(company: sqlite3.Row) -> None:
             "SELECT round_no,net_assets FROM results WHERE company_id=? ORDER BY round_no",
             (company["id"],),
         )
-    cols = st.columns(3)
+    cols = st.columns(4)
     cols[0].metric("现金", money(company["cash"]))
     cols[1].metric("负债", money(company["debt"]))
     cols[2].metric("库存", number(company["product_inventory"]))
+    cols[3].metric("主场", company["home_city"] or "—")
     secondary_cols = st.columns(2)
     secondary_cols[0].metric("员工", f"{workers + engineers:,}")
     secondary_cols[1].metric("最新排名", f"#{my_rank}" if my_rank else "—")
@@ -362,18 +362,12 @@ def render_player_overview(company: sqlite3.Row) -> None:
 
 
 def decision_helper(conn: sqlite3.Connection, company: sqlite3.Row, round_no: int) -> dict[str, Any]:
-    previous = all_rows(
-        conn,
-        "SELECT worker_salary,engineer_salary FROM decisions WHERE round_no=? AND submitted_at IS NOT NULL",
-        (round_no - 1,),
-    ) if round_no > 1 else []
     home = one(conn, "SELECT * FROM market_config WHERE city=?", (company["home_city"],))
-    if previous:
-        avg_worker = sum(float(row["worker_salary"]) for row in previous) / len(previous)
-        avg_engineer = sum(float(row["engineer_salary"]) for row in previous) / len(previous)
-    else:
-        avg_worker = float(home["worker_initial_salary"])
-        avg_engineer = float(home["engineer_initial_salary"])
+    previous_result = one(conn, "SELECT report_json FROM results WHERE company_id=? AND round_no<? ORDER BY round_no DESC LIMIT 1", (company["id"], round_no))
+    previous_report = json.loads(previous_result["report_json"]) if previous_result else {}
+    previous_hr = previous_report.get("human_resources", {})
+    avg_worker = float(previous_hr.get("average_worker_salary", home["worker_initial_salary"]))
+    avg_engineer = float(previous_hr.get("average_engineer_salary", home["engineer_initial_salary"]))
     salary_max = get_setting(conn, "salary_max", 10_000.0)
     research = get_setting(conn, "research_75", 6_000_000.0) / 0.75 * 1.10 + get_setting(conn, "research_buffer", 150_000.0)
     return {
@@ -381,6 +375,26 @@ def decision_helper(conn: sqlite3.Connection, company: sqlite3.Row, round_no: in
         "engineer_wage": min(salary_max, (avg_engineer + 100) * 1.10),
         "research": research,
     }
+
+
+def previous_salary(conn: sqlite3.Connection, company: sqlite3.Row, round_no: int, field: str, fallback: float) -> float:
+    if field not in {"worker_salary", "engineer_salary"}:
+        raise ValueError("工资字段无效。")
+    row = one(
+        conn,
+        f"SELECT d.{field} AS salary FROM decisions d JOIN results r ON r.company_id=d.company_id AND r.round_no=d.round_no "
+        "WHERE d.company_id=? AND d.round_no<? ORDER BY d.round_no DESC LIMIT 1",
+        (company["id"], round_no),
+    )
+    return float(row["salary"]) if row else float(fallback)
+
+
+def salary_bounds(settings: dict[str, Any], previous: float) -> tuple[float, float]:
+    minimum = float(settings["salary_min"])
+    maximum = float(settings["salary_max"])
+    limit = max(0.0, float(settings["salary_change_limit"]))
+    reference = min(max(float(previous), minimum), maximum)
+    return max(minimum, reference - limit), min(maximum, reference + limit)
 
 
 def render_player_decision(company: sqlite3.Row) -> None:
@@ -402,13 +416,15 @@ def render_player_decision(company: sqlite3.Row) -> None:
         home = one(conn, "SELECT * FROM market_config WHERE city=?", (company["home_city"],))
         current_workers = employee_count(conn, company["id"], "worker")
         current_engineers = employee_count(conn, company["id"], "engineer")
+        previous_worker_salary = previous_salary(conn, company, round_no, "worker_salary", float(home["worker_initial_salary"]))
+        previous_engineer_salary = previous_salary(conn, company, round_no, "engineer_salary", float(home["engineer_initial_salary"]))
         decision_row = one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=?", (company["id"], round_no))
         decision = dict(decision_row) if decision_row else {
             "loan_change": 0.0,
             "worker_delta": 0,
-            "worker_salary": float(home["worker_initial_salary"]),
+            "worker_salary": previous_worker_salary,
             "engineer_delta": 0,
-            "engineer_salary": float(home["engineer_initial_salary"]),
+            "engineer_salary": previous_engineer_salary,
             "management_investment": 0.0,
             "production_volume": 0,
             "quality_investment": 0.0,
@@ -429,6 +445,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
             city_values[city]["current_agents"] = int(agent["count"]) if agent else 0
         helper = decision_helper(conn, company, round_no)
         settings = settings_dict(conn)
+        worker_salary_low, worker_salary_high = salary_bounds(settings, previous_worker_salary)
+        engineer_salary_low, engineer_salary_high = salary_bounds(settings, previous_engineer_salary)
+        loan_limit = available_loan_limit(
+            float(company["cash"]) - float(company["debt"]),
+            float(settings["loan_asset_threshold"]),
+            float(home["min_loan"]),
+            float(home["max_loan"]),
+        )
 
     st.markdown(
         f'<div class="hint">工资建议：工人约 <b>{money(helper["worker_wage"])}</b>，工程师约 '
@@ -440,14 +464,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
 
     with st.form(f"decision_{round_no}"):
         loan_min = -float(company["debt"])
-        loan_max = max(0.0, float(home["max_loan"]) - float(company["debt"]))
+        loan_max = max(0.0, loan_limit - float(company["debt"]))
         with st.expander("💰 银行贷款", expanded=False):
-            st.markdown('<div class="section-note">正数为新增贷款，负数为本轮还款。</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="section-note">本轮总贷款额度 {money(loan_limit)}。正数为新增贷款，负数为本轮还款。</div>', unsafe_allow_html=True)
             loan_change = st.number_input(
                 "贷款变化",
                 min_value=loan_min,
                 max_value=loan_max,
-                value=float(decision["loan_change"]),
+                value=min(max(float(decision["loan_change"]), loan_min), loan_max),
                 step=10_000.0,
             )
 
@@ -461,9 +485,9 @@ def render_player_decision(company: sqlite3.Row) -> None:
             )
             worker_salary = worker_right.number_input(
                 "工人月薪",
-                min_value=float(settings["salary_min"]),
-                max_value=float(settings["salary_max"]),
-                value=float(decision["worker_salary"]),
+                min_value=worker_salary_low,
+                max_value=worker_salary_high,
+                value=min(max(float(decision["worker_salary"]), worker_salary_low), worker_salary_high),
                 step=50.0,
             )
             engineer_left, engineer_right = st.columns(2)
@@ -475,9 +499,9 @@ def render_player_decision(company: sqlite3.Row) -> None:
             )
             engineer_salary = engineer_right.number_input(
                 "工程师月薪",
-                min_value=float(settings["salary_min"]),
-                max_value=float(settings["salary_max"]),
-                value=float(decision["engineer_salary"]),
+                min_value=engineer_salary_low,
+                max_value=engineer_salary_high,
+                value=min(max(float(decision["engineer_salary"]), engineer_salary_low), engineer_salary_high),
                 step=50.0,
             )
             st.caption(
@@ -524,7 +548,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 agent_delta = c1.number_input(
                     "Agent 增减",
                     min_value=-int(values["current_agents"]),
-                    max_value=int(settings["max_agent_add_per_round"]),
+                    max_value=int(settings["max_agent_add_per_city_round"]),
                     value=int(values["agent_delta"]),
                     step=1,
                     key=f"agent_{round_no}_{city}",
@@ -557,11 +581,10 @@ def render_player_decision(company: sqlite3.Row) -> None:
         submitted = st.form_submit_button("保存并提交本轮决策", type="primary", use_container_width=True)
 
     if submitted:
-        total_agent_add = sum(max(0, row["agent_delta"]) for row in city_inputs.values())
         errors: list[str] = []
-        if total_agent_add > int(settings["max_agent_add_per_round"]):
-            errors.append(f"本轮最多新增 {int(settings['max_agent_add_per_round'])} 个 Agent，当前填写 {total_agent_add} 个。")
         for city, values in city_inputs.items():
+            if values["agent_delta"] > int(settings["max_agent_add_per_city_round"]):
+                errors.append(f"{city} 每轮最多新增 {int(settings['max_agent_add_per_city_round'])} 个 Agent。")
             if values["current_agents"] + values["agent_delta"] < 0:
                 errors.append(f"{city} 的 Agent 数量不能为负数。")
         if errors:
@@ -640,17 +663,6 @@ def render_ranking(admin: bool = False) -> None:
     )
 
 
-def report_csv(report: dict[str, Any]) -> bytes:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Section", "Item", "Value"])
-    for section, value in report.items():
-        if isinstance(value, dict):
-            for key, item in value.items():
-                writer.writerow([section, key, json.dumps(item, ensure_ascii=False) if isinstance(item, (dict, list)) else item])
-    return output.getvalue().encode("utf-8-sig")
-
-
 def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: int, admin: bool) -> None:
     company = one(conn, "SELECT * FROM companies WHERE id=?", (company_id,))
     row = one(conn, "SELECT * FROM results WHERE company_id=? AND round_no=?", (company_id, round_no))
@@ -676,25 +688,28 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
 
     st.markdown('<div class="report-title">财务 Finance</div>', unsafe_allow_html=True)
     finance = report["finance"]
-    start_debt = float(metrics["debt"]) - float(finance.get("loan_change", 0.0))
+    start_debt = float(finance.get("starting_debt", float(metrics["debt"]) - float(finance.get("loan_change", 0.0)) - float(finance.get("interest", 0.0))))
     cash_running = float(finance["round_begins"])
     debt_running = start_debt
     finance_items = [
         ("期初 / Round begins", 0.0, 0.0),
         ("银行贷款 / Bank loan", float(finance.get("loan_change", 0.0)), float(finance.get("loan_change", 0.0))),
-        ("员工工资 / Salary cost", -float(finance.get("wages", 0.0)), 0.0),
+        ("工人工资 / Workers salary", -float(finance.get("worker_wages", finance.get("wages", 0.0))), 0.0),
+        ("工程师工资 / Engineers salary", -float(finance.get("engineer_wages", 0.0)), 0.0),
         ("裁员费用 / Layoff", -float(finance.get("layoff", 0.0)), 0.0),
         ("培训费用 / Training", -float(finance.get("training", 0.0)), 0.0),
-        ("材料成本 / Materials", -float(finance.get("materials", 0.0)), 0.0),
-        ("仓储扩容 / Storage", -float(finance.get("storage", 0.0)), 0.0),
+        ("零件材料 / Components material", -float(finance.get("component_material", finance.get("materials", 0.0))), 0.0),
+        ("零件仓储 / Components storage", -float(finance.get("component_storage", finance.get("storage", 0.0))), 0.0),
+        ("产品材料 / Products material", -float(finance.get("product_material", 0.0)), 0.0),
+        ("产品仓储 / Products storage", -float(finance.get("product_storage", 0.0)), 0.0),
         ("Agent 变更", -float(finance.get("agents", 0.0)), 0.0),
         ("营销投入 / Marketing", -float(finance.get("marketing", 0.0)), 0.0),
         ("品质投入 / Quality", -float(finance.get("quality", 0.0)), 0.0),
         ("管理投入 / Management", -float(finance.get("management", 0.0)), 0.0),
-        ("市场报告 / Market report", -float(finance.get("market_reports", 0.0)), 0.0),
-        ("研发投入 / Research", -float(finance.get("research", 0.0)), 0.0),
         ("销售收入 / Sales revenue", float(metrics["sales_revenue"]), 0.0),
-        ("贷款利息 / Debt interest", -float(finance.get("interest", 0.0)), 0.0),
+        ("研发投入 / Research", -float(finance.get("research", 0.0)), 0.0),
+        ("市场报告 / Market report", -float(finance.get("market_reports", 0.0)), 0.0),
+        ("贷款利息 / Debt interest", 0.0, float(finance.get("interest", 0.0))),
         ("税费 / Tax", -float(finance.get("tax", 0.0)), 0.0),
     ]
     finance_rows = []
@@ -707,10 +722,10 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     hr = report["human_resources"]
     st.markdown('<div class="report-title">人力资源 Human Resources</div>', unsafe_allow_html=True)
     hr_frame = pd.DataFrame([
-        {"岗位": "工人 Workers", "期初": hr.get("previous_workers", max(0, int(hr["workers"]) - int(hr.get("worker_delta", 0)))), "增减": hr.get("worker_delta", 0), "当前": hr["workers"], "有效人数": hr["effective_workers"], "月薪": hr["worker_salary"], "工资倍率": hr["worker_wage_multiplier"]},
-        {"岗位": "工程师 Engineers", "期初": hr.get("previous_engineers", max(0, int(hr["engineers"]) - int(hr.get("engineer_delta", 0)))), "增减": hr.get("engineer_delta", 0), "当前": hr["engineers"], "有效人数": hr["effective_engineers"], "月薪": hr["engineer_salary"], "工资倍率": hr["engineer_wage_multiplier"]},
+        {"岗位": "工人 Workers", "期初": hr.get("previous_workers", max(0, int(hr["workers"]) - int(hr.get("worker_delta", 0)))), "增减": hr.get("worker_delta", 0), "当前": hr["workers"], "有效人数": hr["effective_workers"], "月薪": hr["worker_salary"], "平均工资": hr.get("average_worker_salary", 0), "工资倍率": hr["worker_wage_multiplier"]},
+        {"岗位": "工程师 Engineers", "期初": hr.get("previous_engineers", max(0, int(hr["engineers"]) - int(hr.get("engineer_delta", 0)))), "增减": hr.get("engineer_delta", 0), "当前": hr["engineers"], "有效人数": hr["effective_engineers"], "月薪": hr["engineer_salary"], "平均工资": hr.get("average_engineer_salary", 0), "工资倍率": hr["engineer_wage_multiplier"]},
     ])
-    st.dataframe(hr_frame, hide_index=True, use_container_width=True, column_config={"月薪": st.column_config.NumberColumn(format="¥ %.0f"), "工资倍率": st.column_config.NumberColumn(format="%.2f")})
+    st.dataframe(hr_frame, hide_index=True, use_container_width=True, column_config={"月薪": st.column_config.NumberColumn(format="¥ %.0f"), "平均工资": st.column_config.NumberColumn(format="¥ %.0f"), "工资倍率": st.column_config.NumberColumn(format="%.2f")})
     st.markdown('<div class="report-note">低工资会降低有效人数；新员工收取培训费，裁员按一个月工资支付补偿。</div>', unsafe_allow_html=True)
 
     production = report["production"]
@@ -733,14 +748,22 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     st.markdown('<div class="report-title">研发 Research Investment</div>', unsafe_allow_html=True)
     research_frame = pd.DataFrame([{"本轮投入": research["investment"], "成功概率": research["probability"] * 100, "本轮结果": "获得专利" if research["success"] else "未获得专利", "累计专利": research["patents_after"]}])
     st.dataframe(research_frame, hide_index=True, use_container_width=True, column_config={"本轮投入": st.column_config.NumberColumn(format="¥ %.0f"), "成功概率": st.column_config.NumberColumn(format="%.1f%%")})
+    if research.get("success"):
+        st.caption(f"本轮获得的专利从第 {research.get('effective_from_round', round_no + 1)} 轮开始降低材料成本，本轮生产成本不受影响。")
 
     st.markdown('<div class="report-title">销售 Sales</div>', unsafe_allow_html=True)
-    sales_frame = pd.DataFrame([{"市场": item["city"], "Agent": item["agents"], "竞争力 CPI%": item["cpi"], "销售量": item["sold"], "市场份额%": item["market_share"] * 100, "售价": item["price"], "销售收入": item["sold"] * item["price"], "营销投入": item["marketing"], "市场均价": item.get("market_average_price")} for item in report["sales"]])
-    st.dataframe(sales_frame, hide_index=True, use_container_width=True, column_config={"市场份额%": st.column_config.NumberColumn(format="%.2f%%"), "售价": st.column_config.NumberColumn(format="¥ %.0f"), "销售收入": st.column_config.NumberColumn(format="¥ %.0f"), "营销投入": st.column_config.NumberColumn(format="¥ %.0f"), "市场均价": st.column_config.NumberColumn(format="¥ %.0f")})
+    sales_frame = pd.DataFrame([{"市场": item["city"], "Agent": item["agents"], "竞争力 CPI%": item["cpi"], "销售量": item["sold"], "市场份额%": item["market_share"] * 100, "售价": item["price"], "销售收入": item["sold"] * item["price"], "营销投入": item["marketing"]} for item in report["sales"]])
+    st.dataframe(sales_frame, hide_index=True, use_container_width=True, column_config={"竞争力 CPI%": st.column_config.NumberColumn(format="%.2f%%"), "市场份额%": st.column_config.NumberColumn(format="%.2f%%"), "售价": st.column_config.NumberColumn(format="¥ %.0f"), "销售收入": st.column_config.NumberColumn(format="¥ %.0f"), "营销投入": st.column_config.NumberColumn(format="¥ %.0f")})
 
-    visible_cities = {str(item["city"]) for item in all_rows(conn, "SELECT city FROM market_config")} if admin else {str(item["city"]) for item in all_rows(conn, "SELECT city FROM city_decisions WHERE company_id=? AND round_no=? AND order_report=1", (company_id, round_no))}
+    if admin:
+        visible_cities = {str(item["city"]) for item in all_rows(conn, "SELECT city FROM market_config")}
+    else:
+        visible_cities = {str(item["city"]) for item in report["sales"] if item.get("report_purchased")}
+        if not any("report_purchased" in item for item in report["sales"]):
+            visible_cities = {str(item["city"]) for item in all_rows(conn, "SELECT city FROM city_decisions WHERE company_id=? AND round_no=? AND order_report=1", (company_id, round_no))}
+    pdf_market_sections: list[dict[str, Any]] = []
     for city in sorted(visible_cities):
-        market_rows = all_rows(conn, "SELECT c.code,c.name,cr.*,r.ma_index,r.qi_index,a.count AS agents FROM city_results cr JOIN companies c ON c.id=cr.company_id JOIN results r ON r.company_id=cr.company_id AND r.round_no=cr.round_no LEFT JOIN agents a ON a.company_id=cr.company_id AND a.city=cr.city WHERE cr.round_no=? AND cr.city=? ORDER BY cr.market_share DESC", (round_no, city))
+        market_rows = all_rows(conn, "SELECT c.code,c.name,cr.*,r.ma_index,r.qi_index,a.count AS current_agents FROM city_results cr JOIN companies c ON c.id=cr.company_id JOIN results r ON r.company_id=cr.company_id AND r.round_no=cr.round_no LEFT JOIN agents a ON a.company_id=cr.company_id AND a.city=cr.city WHERE cr.round_no=? AND cr.city=? ORDER BY cr.market_share DESC", (round_no, city))
         stats = one(conn, "SELECT * FROM market_round_stats WHERE round_no=? AND city=?", (round_no, city))
         market_config = one(conn, "SELECT * FROM market_config WHERE city=?", (city,))
         city_sale = next((item for item in report["sales"] if item["city"] == city), {})
@@ -755,10 +778,24 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         stat_cols[2].metric("市场大小", number(report_market_size))
         stat_cols[3].metric("总销售量", number(total_volume))
         stat_cols[4].metric("市场均价", money(average_price))
-        market_frame = pd.DataFrame([{"队伍": item["code"], "公司": item["name"], "管理指数": item["ma_index"], "Agent": item["agents"] or 0, "营销投入": item["marketing"], "品质指数": item["qi_index"], "售价": item["price"], "销售量": item["sold"], "市场份额%": item["market_share"] * 100} for item in market_rows])
-        st.dataframe(market_frame, hide_index=True, use_container_width=True, column_config={"营销投入": st.column_config.NumberColumn(format="¥ %.0f"), "售价": st.column_config.NumberColumn(format="¥ %.0f"), "市场份额%": st.column_config.NumberColumn(format="%.2f%%")})
+        market_records = []
+        for item in market_rows:
+            breakdown = json.loads(item["breakdown_json"]) if item["breakdown_json"] else {}
+            market_records.append({"队伍": item["code"], "公司": item["name"], "管理指数": item["ma_index"], "Agent": breakdown.get("agents", item["current_agents"] or 0), "营销投入": item["marketing"], "品质指数": item["qi_index"], "CPI%": item["cpi"], "售价": item["price"], "销售量": item["sold"], "市场份额%": item["market_share"] * 100})
+        market_frame = pd.DataFrame(market_records)
+        st.dataframe(market_frame, hide_index=True, use_container_width=True, column_config={"营销投入": st.column_config.NumberColumn(format="¥ %.0f"), "CPI%": st.column_config.NumberColumn(format="%.2f%%"), "售价": st.column_config.NumberColumn(format="¥ %.0f"), "市场份额%": st.column_config.NumberColumn(format="%.2f%%")})
+        pdf_market_sections.append({
+            "city": city, "population": market_config["population"] if market_config else 0,
+            "penetration": market_config["penetration"] if market_config else 0, "market_size": report_market_size,
+            "total_volume": total_volume, "average_price": average_price,
+            "rows": [{"code": item["队伍"], "ma_index": item["管理指数"], "agents": item["Agent"], "marketing": item["营销投入"], "qi_index": item["品质指数"], "cpi": item["CPI%"], "price": item["售价"], "sold": item["销售量"], "market_share": item["市场份额%"] / 100} for item in market_records],
+        })
         st.caption("均价 = [Σ(玩家价格 × 对应售货量) + 基准均价 × (市场大小 − 玩家总售货量)] ÷ 市场大小")
-    st.download_button("下载本轮 CSV", report_csv(report), file_name=f"round_{round_no}_{company['code']}.csv", mime="text/csv")
+    try:
+        pdf_bytes = build_round_report_pdf(dict(company), round_no, report, my_rank, pdf_market_sections)
+        st.download_button("下载官方格式 PDF 报表", pdf_bytes, file_name=f"Round_{round_no}_{company['code']}_Report.pdf", mime="application/pdf", use_container_width=True)
+    except Exception as exc:
+        st.error(f"PDF 报表生成失败：{exc}")
 
 
 def render_reports(company: sqlite3.Row | None, admin: bool = False) -> None:
@@ -798,17 +835,17 @@ def render_wealth(company: sqlite3.Row | None, admin: bool = False) -> None:
     present_ids = {int(row["id"]) for row in rows}
     records.extend({"队伍": f"{item['code']} · {item['name']}", "轮次": 0, "净资产": initial_cash} for item in companies if int(item["id"]) in present_ids)
     frame = pd.DataFrame(records)
+    max_round = int(frame["轮次"].max())
     chart = (
         alt.Chart(frame)
         .mark_line(point=alt.OverlayMarkDef(size=58), strokeWidth=2.2)
         .encode(
-            x=alt.X("轮次:Q", title="Round", axis=alt.Axis(tickMinStep=1)),
+            x=alt.X("轮次:Q", title="Round", scale=alt.Scale(domain=[0, max_round], nice=False), axis=alt.Axis(values=list(range(0, max_round + 1)), tickMinStep=1)),
             y=alt.Y("净资产:Q", title="Net Assets (RMB)", scale=alt.Scale(zero=False), axis=alt.Axis(format=",")),
             color=alt.Color("队伍:N", title=None, legend=alt.Legend(orient="right")),
             tooltip=[alt.Tooltip("队伍:N"), alt.Tooltip("轮次:Q", format=".0f"), alt.Tooltip("净资产:Q", format=",.0f")],
         )
         .properties(height=520, title="Chart for Simulation")
-        .interactive()
     )
     st.altair_chart(chart, use_container_width=True)
     latest = frame.sort_values("轮次").groupby("队伍", as_index=False).tail(1).sort_values("净资产", ascending=False)
@@ -824,11 +861,15 @@ def render_player_kds(company: sqlite3.Row) -> None:
         f"""
         - 每轮工时：`504`
         - 工人 : 工程师 = `A × B × E : C × D`
-        - 工资产能倍率：`min(本队工资 ÷ 本轮平均工资, 1.1)`
+        - 平均工资：`[Σ(对应岗位人数 × 玩家工资) + Σ(对应岗位人数 × 主场 KDS 初始工资 × 2)] ÷ (岗位总人数 × 3)`
+        - 工资产能倍率：`min(本队工资 ÷ 本轮平均工资, 1.1)`；每轮工资涨跌不超过 KDS 限额。
+        - 贷款总额度：`净资产 ÷ 贷款阈值 × 主场最高贷款`，并受最低/最高贷款约束；利息计入负债。
         - MA 指数：`MA 投资 ÷ (工人 + 工程师)`
         - QI 指数：`QI 投资 ÷ (旧产品 × 1.2 + 新产品)`
         - QI 大量 CPI 门槛：`城市最高价 ÷ 50`
         - CPI：按城市独立执行赠品、第一层、第二层、福利 1/2；价格差使用 `{int(settings['cpi_price_power'])}` 次方。
+        - 现金不会低于 0；投资按 `MI → QI → MA` 扣除，不足时只投入剩余现金。
+        - 专利在中奖后的下一轮开始降低材料成本；市场报告与专利投入都在销售收入到账后扣除。
         """
     )
     setting_frame = pd.DataFrame([{"参数": GLOBAL_SETTING_LABELS.get(key, key), "值": value} for key, value in settings.items() if key in GLOBAL_SETTING_LABELS])
@@ -998,27 +1039,37 @@ def render_admin_decisions() -> None:
         current_workers = employee_count(conn, company["id"], "worker")
         current_engineers = employee_count(conn, company["id"], "engineer")
         home = one(conn, "SELECT * FROM market_config WHERE city=?", (company["home_city"],))
+        previous_worker_salary = previous_salary(conn, company, round_no, "worker_salary", float(home["worker_initial_salary"]))
+        previous_engineer_salary = previous_salary(conn, company, round_no, "engineer_salary", float(home["engineer_initial_salary"]))
     decision = dict(decision_row) if decision_row else {
-        "loan_change": 0.0, "worker_delta": 0, "worker_salary": float(home["worker_initial_salary"]),
-        "engineer_delta": 0, "engineer_salary": float(home["engineer_initial_salary"]),
+        "loan_change": 0.0, "worker_delta": 0, "worker_salary": previous_worker_salary,
+        "engineer_delta": 0, "engineer_salary": previous_engineer_salary,
         "management_investment": 0.0, "production_volume": 0, "quality_investment": 0.0,
         "research_investment": 0.0, "submitted_at": None,
     }
+    if not decision.get("submitted_at"):
+        decision.update({"loan_change": 0.0, "worker_delta": 0, "engineer_delta": 0, "management_investment": 0.0, "production_volume": 0, "quality_investment": 0.0, "research_investment": 0.0})
+        city_rows = {}
     status_text = "已提交" if decision.get("submitted_at") else "未提交"
     st.info(f"第 {round_no} 轮 · {STATUS_LABELS.get(round_row['status'], round_row['status'])} · 玩家状态：{status_text}")
     if not editable:
         st.warning("本轮已经结算，决策仅可查看，不能再修改。")
 
+    mark_submitted = st.checkbox("本轮已提交", value=bool(decision.get("submitted_at")), disabled=not editable, help="未勾选时保存会把本轮所有新增、生产和投资决策归零。")
+    worker_low, worker_high = salary_bounds(settings, previous_worker_salary)
+    engineer_low, engineer_high = salary_bounds(settings, previous_engineer_salary)
+    loan_limit = available_loan_limit(float(company["cash"]) - float(company["debt"]), float(settings["loan_asset_threshold"]), float(home["min_loan"]), float(home["max_loan"]))
     with st.form(f"admin_decision_{round_no}_{company['id']}"):
         with st.expander("💰 银行贷款", expanded=False):
-            loan_change = st.number_input("贷款变化", value=float(decision["loan_change"]), step=10_000.0, disabled=not editable)
+            st.caption(f"本轮总贷款额度：{money(loan_limit)}")
+            loan_change = st.number_input("贷款变化", min_value=-float(company["debt"]), max_value=max(0.0, loan_limit - float(company["debt"])), value=min(max(float(decision["loan_change"]), -float(company["debt"])), max(0.0, loan_limit - float(company["debt"]))), step=10_000.0, disabled=not editable)
         with st.expander("👥 人力资源", expanded=True):
             cols = st.columns(2)
             worker_delta = cols[0].number_input("工人增减", min_value=-current_workers, value=int(decision["worker_delta"]), step=1, disabled=not editable)
-            worker_salary = cols[1].number_input("工人月薪", min_value=float(settings["salary_min"]), max_value=float(settings["salary_max"]), value=float(decision["worker_salary"]), step=50.0, disabled=not editable)
+            worker_salary = cols[1].number_input("工人月薪", min_value=worker_low, max_value=worker_high, value=min(max(float(decision["worker_salary"]), worker_low), worker_high), step=50.0, disabled=not editable)
             cols = st.columns(2)
             engineer_delta = cols[0].number_input("工程师增减", min_value=-current_engineers, value=int(decision["engineer_delta"]), step=1, disabled=not editable)
-            engineer_salary = cols[1].number_input("工程师月薪", min_value=float(settings["salary_min"]), max_value=float(settings["salary_max"]), value=float(decision["engineer_salary"]), step=50.0, disabled=not editable)
+            engineer_salary = cols[1].number_input("工程师月薪", min_value=engineer_low, max_value=engineer_high, value=min(max(float(decision["engineer_salary"]), engineer_low), engineer_high), step=50.0, disabled=not editable)
         with st.expander("🏭 生产与研发", expanded=True):
             cols = st.columns(2)
             production_volume = cols[0].number_input("计划生产量", min_value=0, value=int(decision["production_volume"]), step=1, disabled=not editable)
@@ -1037,15 +1088,20 @@ def render_admin_decisions() -> None:
                 current_agents = int(agent_row["count"]) if agent_row else 0
                 cols = st.columns(4)
                 city_inputs[city] = {
-                    "agent_delta": cols[0].number_input("Agent 增减", min_value=-current_agents, max_value=int(settings["max_agent_add_per_round"]), value=int(saved.get("agent_delta", 0)), step=1, key=f"admin_agent_{company['id']}_{round_no}_{city}", disabled=not editable),
+                    "agent_delta": cols[0].number_input("Agent 增减", min_value=-current_agents, max_value=int(settings["max_agent_add_per_city_round"]), value=min(int(saved.get("agent_delta", 0)), int(settings["max_agent_add_per_city_round"])), step=1, key=f"admin_agent_{company['id']}_{round_no}_{city}", disabled=not editable),
                     "marketing_investment": cols[1].number_input("营销投入（MI）", min_value=0.0, value=float(saved.get("marketing_investment", 0.0)), step=10_000.0, key=f"admin_mi_{company['id']}_{round_no}_{city}", disabled=not editable),
                     "price": cols[2].number_input("售价", min_value=float(settings["price_min"]), max_value=min(float(settings["price_max"]), float(market["max_price"])), value=float(saved.get("price", market["initial_avg_price"])), step=100.0, key=f"admin_price_{company['id']}_{round_no}_{city}", disabled=not editable),
                     "order_report": cols[3].checkbox("购买市场报告", value=bool(saved.get("order_report", 0)), key=f"admin_report_{company['id']}_{round_no}_{city}", disabled=not editable),
                 }
-        mark_submitted = st.checkbox("保存后标记为已提交", value=bool(decision.get("submitted_at")), disabled=not editable)
         save = st.form_submit_button("保存玩家决策", type="primary", disabled=not editable, use_container_width=True)
     if save:
         submitted_at = now_iso() if mark_submitted else None
+        if not mark_submitted:
+            loan_change = worker_delta = engineer_delta = management = production_volume = quality = research = 0
+            for values in city_inputs.values():
+                values["agent_delta"] = 0
+                values["marketing_investment"] = 0.0
+                values["order_report"] = False
         with connect() as conn:
             conn.execute(
                 "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,engineer_salary,management_investment,production_volume,quality_investment,research_investment,submitted_at) "
@@ -1106,6 +1162,8 @@ def render_admin_kds() -> None:
 
     st.subheader("城市参数")
     frame = pd.DataFrame([dict(row) for row in markets])
+    ordered_columns = [column for column in MARKET_COLUMNS if column in frame.columns]
+    frame = frame[ordered_columns + [column for column in frame.columns if column not in ordered_columns]]
     edited = st.data_editor(
         frame,
         hide_index=True,
@@ -1137,9 +1195,9 @@ def render_admin_kds() -> None:
         try:
             with connect() as conn:
                 conn.execute(
-                    "INSERT INTO market_config(city,home_enabled,max_loan,interest_rate,worker_initial_salary,engineer_initial_salary,"
+                    "INSERT INTO market_config(city,home_enabled,max_loan,min_loan,interest_rate,worker_initial_salary,engineer_initial_salary,"
                     "component_material,product_material,component_storage,product_storage,population,penetration,initial_avg_price,max_price,"
-                    "transport_cost,worker_training_cost,engineer_training_cost) VALUES(?,1,0,0,0,0,0,0,0,0,1,0.01,0,?,0,0,0)",
+                    "transport_cost,worker_training_cost,engineer_training_cost) VALUES(?,1,0,0,0,0,0,0,0,0,0,1,0.01,0,?,0,0,0)",
                     (city.strip(), get_setting(conn, "price_max", 25_000.0)),
                 )
             flash("success", f"已新增城市 {city.strip()}，请补充参数。")
@@ -1214,7 +1272,7 @@ def render_admin_rounds() -> None:
     if decisions:
         st.subheader("队伍状态")
         status_frame = pd.DataFrame(
-            [{"队伍": row["code"], "公司": row["name"], "主场": row["home_city"] or "—", "赛前就绪": bool(row["setup_submitted_at"]), "本轮提交": bool(row["submitted_at"]), "计划产量": row["production_volume"] or 0, "MA": row["management_investment"] or 0, "QI": row["quality_investment"] or 0, "专利": row["research_investment"] or 0} for row in decisions]
+            [{"队伍": row["code"], "公司": row["name"], "主场": row["home_city"] or "—", "赛前就绪": bool(row["setup_submitted_at"]), "本轮提交": bool(row["submitted_at"]), "计划产量": (row["production_volume"] or 0) if row["submitted_at"] else 0, "MA": (row["management_investment"] or 0) if row["submitted_at"] else 0, "QI": (row["quality_investment"] or 0) if row["submitted_at"] else 0, "专利": (row["research_investment"] or 0) if row["submitted_at"] else 0} for row in decisions]
         )
         st.dataframe(status_frame, hide_index=True, use_container_width=True)
     st.subheader("回合历史")
