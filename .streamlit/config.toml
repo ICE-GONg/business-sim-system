@@ -2,6 +2,10 @@
 headless = true
 runOnSave = true
 
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
 [browser]
 gatherUsageStats = false
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -45,6 +46,8 @@ from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, market_size, settle_round, weighted_market_average
 from sim.report_pdf import build_round_report_pdf
 
+
+LOGGER = logging.getLogger(__name__)
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -113,13 +116,13 @@ def parse_time(value: str | None) -> datetime | None:
         return None
 
 
-def secret_value(name: str, fallback: str) -> str:
+def secret_value(name: str) -> str:
     if os.environ.get(name):
         return str(os.environ[name])
     try:
-        return str(st.secrets.get(name, fallback))
+        return str(st.secrets.get(name, ""))
     except Exception:
-        return fallback
+        return ""
 
 
 def flash(level: str, message: str) -> None:
@@ -168,8 +171,11 @@ def render_login() -> None:
             submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
         if submitted:
             if role_label == "管理员":
-                expected_user = secret_value("SIM_ADMIN_USER", "admin")
-                expected_password = secret_value("SIM_ADMIN_PASSWORD", "admin123")
+                expected_user = secret_value("SIM_ADMIN_USER")
+                expected_password = secret_value("SIM_ADMIN_PASSWORD")
+                if not expected_user or not expected_password:
+                    st.error("管理员登录尚未安全配置，请在部署后台设置管理员账号和密码。")
+                    return
                 if account == expected_user and password == expected_password:
                     st.session_state["auth"] = {"role": "admin"}
                     st.rerun()
@@ -794,8 +800,9 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     try:
         pdf_bytes = build_round_report_pdf(dict(company), round_no, report, my_rank, pdf_market_sections)
         st.download_button("下载官方格式 PDF 报表", pdf_bytes, file_name=f"Round_{round_no}_{company['code']}_Report.pdf", mime="application/pdf", use_container_width=True)
-    except Exception as exc:
-        st.error(f"PDF 报表生成失败：{exc}")
+    except Exception:
+        LOGGER.exception("PDF report generation failed")
+        st.error("PDF 报表生成失败，请联系管理员查看后台日志。")
 
 
 def render_reports(company: sqlite3.Row | None, admin: bool = False) -> None:
@@ -1257,8 +1264,9 @@ def render_admin_rounds() -> None:
                     settle_round(conn, int(round_row["round_no"]))
                 flash("success", f"第 {round_row['round_no']} 轮结算完成。")
                 st.rerun()
-            except Exception as exc:
-                st.error(f"结算失败：{exc}")
+            except Exception:
+                LOGGER.exception("Round settlement failed")
+                st.error("结算失败，请在部署后台日志中查看详细原因。")
     elif round_row and round_row["status"] == "settled":
         minutes = st.number_input("下一轮时长（分钟）", min_value=1, value=30, step=1)
         if st.button("开启下一轮", type="primary"):
@@ -1292,8 +1300,9 @@ def render_backup_reset() -> None:
             st.session_state.clear()
             st.success("恢复完成，请重新登录。")
             st.rerun()
-        except Exception as exc:
-            st.error(f"恢复失败：{exc}")
+        except Exception:
+            LOGGER.exception("Database restore failed")
+            st.error("恢复失败，请确认备份文件来自本系统；详细原因仅记录在后台日志。")
     st.divider()
     st.subheader("重置整场比赛")
     st.markdown('<div class="danger">这会清除全部回合、决策、报表、员工和 Agent 数据，但保留队伍账号与 KDS。</div>', unsafe_allow_html=True)

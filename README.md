@@ -66,11 +66,12 @@ streamlit run app.py
 
 打开 `http://localhost:8501`。
 
-初始账号：
+初始玩家账号：
 
 - 玩家：`C01`、`C02`、`C03`、`C04`
 - 玩家初始密码：`1234`
-- 管理员：`admin / admin123`（仅本地回退值，部署前必须修改）
+
+管理员账号没有默认值。无论本地运行还是云端部署，都必须通过环境变量或 Streamlit Secrets 设置 `SIM_ADMIN_USER` 和 `SIM_ADMIN_PASSWORD`；缺少任一项时管理员登录会被禁用。
 
 ## 部署到 Streamlit Community Cloud
 
