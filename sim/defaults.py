@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+
+DEFAULT_SETTINGS: dict[str, float | int | str] = {
+    "initial_cash": 15_000_000,
+    "round_duration_minutes": 30,
+    "component_workers": 3,
+    "component_hours": 7,
+    "product_engineers": 4,
+    "product_hours": 14,
+    "components_per_product": 7,
+    "salary_min": 1_000,
+    "salary_max": 10_000,
+    "price_min": 3_500,
+    "price_max": 25_000,
+    "agent_add_cost": 300_000,
+    "agent_remove_cost": 100_000,
+    "max_agent_add_per_round": 1,
+    "report_cost": 200_000,
+    "research_25": 1_500_000,
+    "research_75": 6_000_000,
+    "research_buffer": 150_000,
+    "patent_factor": 0.70,
+    "market_growth": 1.10,
+    "tax_rate": 0.20,
+    "qi_safe_multiplier": 1.10,
+    "cpi_ma_large_threshold": 1_300,
+    "cpi_price_power": 8,
+    "cpi_algorithm_version": "cpi-generator-admin-v1",
+}
+
+
+# city, home enabled, max loan, interest, worker salary, engineer salary,
+# component material, product material, component storage, product storage,
+# population, penetration, initial average price, max price, transport,
+# worker training, engineer training
+DEFAULT_MARKETS = [
+    ("广州", 1, 6_000_000, 0.030, 3_300, 6_400, 300, 650, 28, 110, 4_000_000, 0.020, 9_800, 25_000, 0, 0, 0),
+    ("深圳", 1, 5_000_000, 0.031, 3_300, 6_400, 300, 650, 28, 110, 4_000_000, 0.020, 9_800, 25_000, 0, 0, 0),
+    ("成都", 1, 3_500_000, 0.036, 2_900, 5_600, 258, 630, 24, 100, 4_000_000, 0.016, 8_800, 25_000, 0, 0, 0),
+    ("苏州", 1, 3_500_000, 0.036, 2_900, 5_600, 215, 600, 22, 88, 2_500_000, 0.016, 8_800, 25_000, 0, 0, 0),
+    ("武汉", 1, 4_200_000, 0.033, 2_600, 5_000, 215, 600, 22, 88, 2_500_000, 0.013, 8_800, 25_000, 0, 0, 0),
+    ("大连", 1, 3_500_000, 0.033, 2_300, 4_400, 200, 560, 20, 82, 1_000_000, 0.011, 7_600, 25_000, 0, 0, 0),
+    ("杭州", 1, 3_500_000, 0.036, 2_600, 5_000, 215, 600, 22, 88, 2_500_000, 0.013, 8_800, 25_000, 0, 0, 0),
+    ("无锡", 1, 5_000_000, 0.031, 2_400, 4_600, 188, 540, 18, 78, 1_500_000, 0.011, 7_600, 25_000, 0, 0, 0),
+    ("南京", 1, 3_500_000, 0.036, 2_900, 5_600, 215, 600, 22, 88, 2_500_000, 0.016, 8_800, 25_000, 0, 0, 0),
+    ("宁波", 1, 5_000_000, 0.031, 2_400, 4_600, 188, 540, 18, 78, 1_500_000, 0.011, 7_600, 25_000, 0, 0, 0),
+]
+
+
+GLOBAL_SETTING_LABELS = {
+    "initial_cash": "初始现金",
+    "round_duration_minutes": "每轮时长（分钟）",
+    "component_workers": "每份零件所需工人数 A",
+    "component_hours": "每份零件所需工时 B",
+    "product_engineers": "每件产品所需工程师数 C",
+    "product_hours": "每件产品所需工时 D",
+    "components_per_product": "每件产品所需零件 E",
+    "salary_min": "最低月薪",
+    "salary_max": "最高月薪",
+    "price_min": "最低售价",
+    "price_max": "全局最高售价",
+    "agent_add_cost": "新增 Agent 成本",
+    "agent_remove_cost": "移除 Agent 成本",
+    "max_agent_add_per_round": "每轮最多新增 Agent",
+    "report_cost": "单城市市场报告成本",
+    "research_25": "专利 25% 概率金额",
+    "research_75": "专利 75% 概率金额",
+    "research_buffer": "专利建议 Buffer",
+    "patent_factor": "每项专利材料成本倍率",
+    "market_growth": "每轮市场增长倍率",
+    "tax_rate": "所得税率",
+    "qi_safe_multiplier": "QI 安全倍率",
+    "cpi_ma_large_threshold": "MA 大量 CPI 门槛",
+    "cpi_price_power": "价格差幂次",
+}
+
+
+MARKET_COLUMNS = {
+    "city": "城市",
+    "home_enabled": "可选主场",
+    "max_loan": "最高贷款",
+    "interest_rate": "利率",
+    "worker_initial_salary": "工人初始月薪",
+    "engineer_initial_salary": "工程师初始月薪",
+    "component_material": "零件材料单价",
+    "product_material": "产品材料单价",
+    "component_storage": "零件仓储单价",
+    "product_storage": "产品仓储单价",
+    "population": "人口",
+    "penetration": "渗透率",
+    "initial_avg_price": "初始市场均价",
+    "max_price": "城市最高价",
+    "transport_cost": "跨城运输单价",
+    "worker_training_cost": "新工人培训费",
+    "engineer_training_cost": "新工程师培训费",
+}
