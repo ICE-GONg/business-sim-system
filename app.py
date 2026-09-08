@@ -6,10 +6,21 @@ import io
 import json
 import os
 import sqlite3
+import sys
+import typing
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
+
+# Altair 5 uses the PEP 728 ``closed`` keyword before Python's built-in
+# TypedDict supports it. Streamlit Cloud currently runs this app on Python 3.14,
+# so use typing_extensions' compatible implementation on that runtime.
+if sys.version_info[:2] == (3, 14):
+    from typing_extensions import TypedDict as _TypedDict
+
+    typing.TypedDict = _TypedDict
+
 import altair as alt
 import streamlit as st
 
