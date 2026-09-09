@@ -10,6 +10,9 @@ from .cpi import allocate_city_cpi
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one, remove_employees
 
 
+ENGINE_API_VERSION = 2
+
+
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
     return float(market["population"]) * float(market["penetration"]) * (growth ** max(0, round_no - 1))
 

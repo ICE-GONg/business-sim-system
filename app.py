@@ -32,7 +32,11 @@ from sim import engine as _engine_module
 # process that still has the previous internal modules cached. Refresh only
 # when a newly introduced API is missing, so both hot updates and cold starts
 # import one consistent version of the application.
-if not hasattr(_db_module, "delete_city") or not hasattr(_engine_module, "current_company_net_assets"):
+if (
+    not hasattr(_db_module, "delete_city")
+    or not hasattr(_engine_module, "current_company_net_assets")
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 2
+):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
     importlib.reload(_engine_module)
