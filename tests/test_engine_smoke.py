@@ -13,6 +13,7 @@ class SettlementSmokeTest(unittest.TestCase):
             os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "smoke.db")
             from sim import db
             from sim.engine import settle_round, weighted_market_average
+            from sim.report_pdf import build_round_report_pdf
 
             db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
             db.init_db()
@@ -66,6 +67,9 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(report["research"]["active_patents_this_round"], 0)
                 self.assertEqual(report["research"]["effective_from_round"], 2)
                 self.assertEqual(report["research"]["patents_after"], 1)
+                pdf_bytes = build_round_report_pdf(dict(companies[0]), 1, report, 1, [])
+                self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
+                self.assertGreater(len(pdf_bytes), 8_000)
                 finance = report["finance"]
                 expected_cash = (
                     finance["round_begins"] + finance["loan_change"]
@@ -266,6 +270,74 @@ class SettlementSmokeTest(unittest.TestCase):
                 db.delete_company(conn, int(company["id"]))
                 self.assertIsNone(db.one(conn, "SELECT id FROM companies WHERE id=?", (company["id"],)))
                 self.assertEqual(db.get_setting(conn, "total_rounds", 0, int), 5)
+
+    def test_admin_can_rollback_latest_settlement_and_restore_exact_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "rollback.db")
+            from sim import db
+            from sim.engine import settle_round
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+                for company in companies:
+                    conn.execute(
+                        "UPDATE companies SET home_city='广州',setup_submitted_at=? WHERE id=?",
+                        (db.now_iso(), company["id"]),
+                    )
+                    conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company["id"],))
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,engineer_salary,"
+                        "management_investment,production_volume,quality_investment,research_investment,submitted_at) "
+                        "VALUES(?,1,1000000,3,3300,4,6400,5000,2,4000,0,?)",
+                        (company["id"], db.now_iso()),
+                    )
+                    conn.execute(
+                        "INSERT INTO city_decisions(company_id,round_no,city,agent_delta,marketing_investment,price) "
+                        "VALUES(?,1,'广州',2,1000,9800)",
+                        (company["id"],),
+                    )
+
+                first_company_id = int(companies[0]["id"])
+                before = dict(db.one(conn, "SELECT * FROM companies WHERE id=?", (first_company_id,)))
+                before_agents = [dict(row) for row in db.all_rows(conn, "SELECT city,count FROM agents WHERE company_id=? ORDER BY city", (first_company_id,))]
+                settle_round(conn, 1)
+                self.assertGreater(db.employee_count(conn, first_company_id, "worker"), 0)
+                self.assertEqual(db.one(conn, "SELECT count FROM agents WHERE company_id=? AND city='广州'", (first_company_id,))["count"], 3)
+                conn.execute("INSERT INTO rounds(round_no,status) VALUES(2,'open')")
+                conn.execute(
+                    "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,submitted_at) VALUES(?,2,3300,6400,?)",
+                    (first_company_id, db.now_iso()),
+                )
+
+                reopened = db.rollback_latest_settled_round(conn, 17)
+
+                self.assertEqual(reopened, 1)
+                restored = db.one(conn, "SELECT * FROM companies WHERE id=?", (first_company_id,))
+                for field in ("cash", "debt", "patents", "product_inventory", "component_storage_capacity", "product_storage_capacity"):
+                    self.assertEqual(restored[field], before[field])
+                self.assertEqual(db.employee_count(conn, first_company_id, "worker"), 0)
+                self.assertEqual(
+                    [dict(row) for row in db.all_rows(conn, "SELECT city,count FROM agents WHERE company_id=? ORDER BY city", (first_company_id,))],
+                    before_agents,
+                )
+                self.assertEqual(db.one(conn, "SELECT status FROM rounds WHERE round_no=1")["status"], "open")
+                self.assertIsNone(db.one(conn, "SELECT round_no FROM rounds WHERE round_no=2"))
+                self.assertEqual(db.one(conn, "SELECT COUNT(*) AS n FROM results")["n"], 0)
+                self.assertIsNone(db.one(conn, "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=1", (first_company_id,))["submitted_at"])
+                self.assertIsNone(db.one(conn, "SELECT round_no FROM decisions WHERE company_id=? AND round_no=2", (first_company_id,)))
+
+                # Existing cloud databases may contain settled rounds created
+                # before snapshot support. They still have a safe migration
+                # path reconstructed from the previous reports and decisions.
+                conn.execute("UPDATE decisions SET submitted_at=? WHERE round_no=1", (db.now_iso(),))
+                settle_round(conn, 1)
+                conn.execute("DELETE FROM round_snapshots WHERE round_no=1")
+                self.assertEqual(db.rollback_latest_settled_round(conn, 9), 1)
+                self.assertEqual(db.employee_count(conn, first_company_id, "worker"), 0)
+                self.assertEqual(db.one(conn, "SELECT count FROM agents WHERE company_id=? AND city='广州'", (first_company_id,))["count"], 1)
 
 
 if __name__ == "__main__":

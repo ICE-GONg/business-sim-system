@@ -7,10 +7,19 @@ import sqlite3
 from typing import Any
 
 from .cpi import allocate_city_cpi
-from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one, remove_employees
+from .db import (
+    all_rows,
+    capture_round_snapshot,
+    effective_employee_count,
+    employee_count,
+    get_setting,
+    now_iso,
+    one,
+    remove_employees,
+)
 
 
-ENGINE_API_VERSION = 3
+ENGINE_API_VERSION = 4
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -152,6 +161,23 @@ def _previous_salary(conn: sqlite3.Connection, company_id: int, round_no: int, f
     return float(row["salary"]) if row else float(fallback)
 
 
+def _employee_breakdown(
+    conn: sqlite3.Connection, company_id: int, role: str, round_no: int
+) -> tuple[int, int]:
+    inexperienced = 0
+    experienced = 0
+    for row in all_rows(
+        conn,
+        "SELECT count,hire_round FROM employee_cohorts WHERE company_id=? AND role=?",
+        (company_id, role),
+    ):
+        if round_no - int(row["hire_round"]) >= 2:
+            experienced += int(row["count"])
+        else:
+            inexperienced += int(row["count"])
+    return inexperienced, experienced
+
+
 def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
     round_row = one(conn, "SELECT * FROM rounds WHERE round_no=?", (round_no,))
     if round_row is None:
@@ -170,6 +196,11 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
     ]
     if missing:
         raise ValueError("仍有队伍未提交：" + "、".join(missing))
+
+    # Rollback must restore the exact pre-settlement state, including cohorts
+    # and per-city agents. The surrounding transaction also rolls this back if
+    # settlement itself fails.
+    capture_round_snapshot(conn, round_no)
 
     a = get_setting(conn, "component_workers", 3.0)
     b = get_setting(conn, "component_hours", 7.0)
@@ -247,6 +278,12 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         home = decision["home"]
         previous_workers = employee_count(conn, company_id, "worker")
         previous_engineers = employee_count(conn, company_id, "engineer")
+        previous_inexperienced_workers, previous_experienced_workers = _employee_breakdown(
+            conn, company_id, "worker", round_no
+        )
+        previous_inexperienced_engineers, previous_experienced_engineers = _employee_breakdown(
+            conn, company_id, "engineer", round_no
+        )
         actual_worker_delta = int(decision["worker_delta"])
         actual_engineer_delta = int(decision["engineer_delta"])
 
@@ -261,6 +298,40 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
 
         workers = employee_count(conn, company_id, "worker")
         engineers = employee_count(conn, company_id, "engineer")
+        inexperienced_workers, experienced_workers = _employee_breakdown(conn, company_id, "worker", round_no)
+        inexperienced_engineers, experienced_engineers = _employee_breakdown(conn, company_id, "engineer", round_no)
+        promoted_workers = sum(
+            int(row["count"])
+            for row in all_rows(
+                conn,
+                "SELECT count FROM employee_cohorts WHERE company_id=? AND role='worker' AND hire_round=?",
+                (company_id, round_no - 2),
+            )
+        )
+        promoted_engineers = sum(
+            int(row["count"])
+            for row in all_rows(
+                conn,
+                "SELECT count FROM employee_cohorts WHERE company_id=? AND role='engineer' AND hire_round=?",
+                (company_id, round_no - 2),
+            )
+        )
+        added_workers = max(0, actual_worker_delta)
+        added_engineers = max(0, actual_engineer_delta)
+        laid_inexperienced_workers = max(
+            0,
+            previous_inexperienced_workers - promoted_workers + added_workers - inexperienced_workers,
+        )
+        laid_experienced_workers = max(
+            0, previous_experienced_workers + promoted_workers - experienced_workers
+        )
+        laid_inexperienced_engineers = max(
+            0,
+            previous_inexperienced_engineers - promoted_engineers + added_engineers - inexperienced_engineers,
+        )
+        laid_experienced_engineers = max(
+            0, previous_experienced_engineers + promoted_engineers - experienced_engineers
+        )
         worker_multiplier = min(float(decision["worker_salary"]) / max(average_worker_wage, 1.0), 1.10)
         engineer_multiplier = min(float(decision["engineer_salary"]) / max(average_engineer_wage, 1.0), 1.10)
         effective_workers = effective_employee_count(conn, company_id, "worker", round_no) * worker_multiplier
@@ -352,7 +423,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             new_agents = old_agents + actual_agent_delta
             conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,?) ON CONFLICT(company_id,city) DO UPDATE SET count=excluded.count", (company_id, city, new_agents))
             city_decision["agents_after"] = new_agents
+            city_decision["agents_previous"] = old_agents
             city_decision["agent_delta_actual"] = actual_agent_delta
+            city_decision["agent_change_cost"] = agent_cost
             city_decision["price"] = min(max(float(city_decision["price"] or market["initial_avg_price"]), price_min), min(global_price_max, float(market["max_price"])))
             city_decision["marketing_requested"] = max(0.0, float(city_decision["marketing_investment"]))
             city_decision["report_requested"] = bool(city_decision["order_report"])
@@ -373,8 +446,20 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "company": company, "decision": decision, "home": home,
             "workers": workers, "engineers": engineers,
             "previous_workers": previous_workers, "previous_engineers": previous_engineers,
+            "previous_inexperienced_workers": previous_inexperienced_workers,
+            "previous_experienced_workers": previous_experienced_workers,
+            "previous_inexperienced_engineers": previous_inexperienced_engineers,
+            "previous_experienced_engineers": previous_experienced_engineers,
+            "inexperienced_workers": inexperienced_workers, "experienced_workers": experienced_workers,
+            "inexperienced_engineers": inexperienced_engineers, "experienced_engineers": experienced_engineers,
+            "promoted_workers": promoted_workers, "promoted_engineers": promoted_engineers,
+            "laid_inexperienced_workers": laid_inexperienced_workers,
+            "laid_experienced_workers": laid_experienced_workers,
+            "laid_inexperienced_engineers": laid_inexperienced_engineers,
+            "laid_experienced_engineers": laid_experienced_engineers,
             "worker_delta": actual_worker_delta, "engineer_delta": actual_engineer_delta,
             "effective_workers": effective_workers, "effective_engineers": effective_engineers,
+            "component_capacity": component_capacity, "engineer_product_capacity": engineer_product_capacity,
             "worker_multiplier": worker_multiplier, "engineer_multiplier": engineer_multiplier,
             "average_worker_wage": average_worker_wage, "average_engineer_wage": average_engineer_wage,
             "produced": produced, "components": components, "available": old_products + produced, "old_products": old_products,
@@ -549,7 +634,11 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 )
             public_allocation = {key: value for key, value in allocation.items() if key not in {"average_price", "market_average_price"}} if allocation else {}
             city_report_rows.append({
-                "city": city, "agents": int(city_decision["agents_after"]), "marketing": float(city_decision["marketing_investment"]),
+                "city": city, "agents": int(city_decision["agents_after"]),
+                "agents_previous": int(city_decision.get("agents_previous", 0)),
+                "agent_change": int(city_decision.get("agent_delta_actual", 0)),
+                "agent_change_cost": float(city_decision.get("agent_change_cost", 0.0)),
+                "marketing": float(city_decision["marketing_investment"]),
                 "price": float(city_decision["price"]), "cpi": float(state["city_cpi"][city]), "cpi_units": allocated_before_secondary,
                 "secondary_units": secondary_units, "sold": units, "market_share": share, "market_size": size, "transport": transport_total,
                 "report_requested": bool(city_decision["report_requested"]), "report_purchased": False, "breakdown": public_allocation,
@@ -600,12 +689,25 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "worker_salary": state["decision"]["worker_salary"], "engineer_salary": state["decision"]["engineer_salary"],
                 "average_worker_salary": state["average_worker_wage"], "average_engineer_salary": state["average_engineer_wage"],
                 "worker_wage_multiplier": state["worker_multiplier"], "engineer_wage_multiplier": state["engineer_multiplier"],
+                "rows": [
+                    {"employee": "Inexperienced Workers", "previous": state["previous_inexperienced_workers"], "laid": state["laid_inexperienced_workers"], "quitted": 0, "added": max(0, state["worker_delta"]), "promoted": 0, "working": state["inexperienced_workers"], "salary": state["decision"]["worker_salary"], "average": state["average_worker_wage"]},
+                    {"employee": "Experienced Workers", "previous": state["previous_experienced_workers"], "laid": state["laid_experienced_workers"], "quitted": 0, "added": 0, "promoted": state["promoted_workers"], "working": state["experienced_workers"], "salary": state["decision"]["worker_salary"], "average": state["average_worker_wage"]},
+                    {"employee": "Inexperienced Engineers", "previous": state["previous_inexperienced_engineers"], "laid": state["laid_inexperienced_engineers"], "quitted": 0, "added": max(0, state["engineer_delta"]), "promoted": 0, "working": state["inexperienced_engineers"], "salary": state["decision"]["engineer_salary"], "average": state["average_engineer_wage"]},
+                    {"employee": "Experienced Engineers", "previous": state["previous_experienced_engineers"], "laid": state["laid_experienced_engineers"], "quitted": 0, "added": 0, "promoted": state["promoted_engineers"], "working": state["experienced_engineers"], "salary": state["decision"]["engineer_salary"], "average": state["average_engineer_wage"]},
+                ],
             },
             "production": {
                 "planned": state["decision"]["production_volume"], "produced": state["produced"], "components": state["components"], "old_products": state["old_products"],
                 "sold": sold, "surplus": inventory, "ma_index": state["ma_index"], "qi_index": state["qi_index"],
                 "component_storage_before": state["component_storage_before"], "component_storage_after": state["component_storage_before"] + state["component_storage_increase"], "component_storage_increase": state["component_storage_increase"],
                 "product_storage_before": state["product_storage_before"], "product_storage_after": state["product_storage_before"] + state["product_storage_increase"], "product_storage_increase": state["product_storage_increase"],
+                "component_productivity": state["component_capacity"] / max(state["workers"], 1),
+                "product_productivity": state["engineer_product_capacity"] / max(state["engineers"], 1),
+                "component_material_unit_price": float(home["component_material"]) * (patent_factor ** state["active_patents"]),
+                "product_material_unit_price": float(home["product_material"]) * (patent_factor ** state["active_patents"]),
+                "component_storage_unit_price": float(home["component_storage"]),
+                "product_storage_unit_price": float(home["product_storage"]),
+                "quality_investment": state["quality"],
             },
             "research": {"investment": research, "probability": probability, "success": bool(research_success), "active_patents_this_round": state["active_patents"], "patents_after": patents_after, "effective_from_round": round_no + 1 if research_success else None},
             "sales": city_report_rows,

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -235,6 +236,11 @@ def init_db() -> None:
                 PRIMARY KEY(city,round_no),
                 FOREIGN KEY(city) REFERENCES market_config(city) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS round_snapshots(
+                round_no INTEGER PRIMARY KEY,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         market_columns = {row["name"] for row in all_rows(conn, "PRAGMA table_info(market_config)")}
@@ -334,8 +340,174 @@ def current_round(conn: sqlite3.Connection) -> sqlite3.Row | None:
     ) or one(conn, "SELECT * FROM rounds ORDER BY round_no DESC LIMIT 1")
 
 
+def capture_round_snapshot(conn: sqlite3.Connection, round_no: int) -> None:
+    """Store the exact mutable competition state before a round is settled."""
+    company_columns = (
+        "id,code,name,home_city,cash,debt,patents,product_inventory,"
+        "component_storage_capacity,product_storage_capacity,setup_submitted_at"
+    )
+    snapshot = {
+        "companies": [dict(row) for row in all_rows(conn, f"SELECT {company_columns} FROM companies ORDER BY id")],
+        "employee_cohorts": [
+            dict(row)
+            for row in all_rows(conn, "SELECT company_id,role,count,hire_round FROM employee_cohorts ORDER BY id")
+        ],
+        "agents": [dict(row) for row in all_rows(conn, "SELECT company_id,city,count FROM agents ORDER BY company_id,city")],
+    }
+    conn.execute(
+        "INSERT INTO round_snapshots(round_no,snapshot_json,created_at) VALUES(?,?,?) "
+        "ON CONFLICT(round_no) DO UPDATE SET snapshot_json=excluded.snapshot_json,created_at=excluded.created_at",
+        (int(round_no), json.dumps(snapshot, ensure_ascii=False), now_iso()),
+    )
+
+
+def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int) -> dict[str, Any]:
+    """Best-effort migration path for rounds settled before snapshots existed."""
+    companies: list[dict[str, Any]] = []
+    cohorts: list[dict[str, Any]] = []
+    agents: list[dict[str, Any]] = []
+    initial_cash = float(get_setting(conn, "initial_cash", 15_000_000.0))
+    company_rows = all_rows(conn, "SELECT * FROM companies ORDER BY id")
+    for company_row in company_rows:
+        company = dict(company_row)
+        company_id = int(company["id"])
+        previous_result = one(
+            conn,
+            "SELECT * FROM results WHERE company_id=? AND round_no<? ORDER BY round_no DESC LIMIT 1",
+            (company_id, target_round),
+        )
+        previous_report: dict[str, Any] = {}
+        if previous_result is not None:
+            previous_report = json.loads(previous_result["report_json"])
+        production = previous_report.get("production", {})
+        research = previous_report.get("research", {})
+        companies.append(
+            {
+                "id": company_id,
+                "code": company["code"],
+                "name": company["name"],
+                "home_city": company["home_city"],
+                "cash": float(previous_result["cash"]) if previous_result is not None else initial_cash,
+                "debt": float(previous_result["debt"]) if previous_result is not None else 0.0,
+                "patents": int(research.get("patents_after", 0)) if previous_result is not None else 0,
+                "product_inventory": int(previous_result["inventory"]) if previous_result is not None else 0,
+                "component_storage_capacity": int(production.get("component_storage_after", 0)),
+                "product_storage_capacity": int(production.get("product_storage_after", 0)),
+                "setup_submitted_at": company["setup_submitted_at"],
+            }
+        )
+
+        replayed: list[dict[str, Any]] = []
+        for decision in all_rows(
+            conn,
+            "SELECT round_no,worker_delta,engineer_delta FROM decisions WHERE company_id=? AND round_no<? "
+            "AND round_no IN (SELECT round_no FROM results WHERE company_id=?) ORDER BY round_no",
+            (company_id, target_round, company_id),
+        ):
+            for role, field in (("worker", "worker_delta"), ("engineer", "engineer_delta")):
+                delta = int(decision[field] or 0)
+                if delta > 0:
+                    replayed.append({"company_id": company_id, "role": role, "count": delta, "hire_round": int(decision["round_no"])})
+                elif delta < 0:
+                    remaining = -delta
+                    for cohort in sorted(
+                        (item for item in replayed if item["role"] == role and item["count"] > 0),
+                        key=lambda item: item["hire_round"],
+                        reverse=True,
+                    ):
+                        removed = min(remaining, int(cohort["count"]))
+                        cohort["count"] -= removed
+                        remaining -= removed
+                        if remaining <= 0:
+                            break
+        cohorts.extend(item for item in replayed if int(item["count"]) > 0)
+
+        if previous_report:
+            agents.extend(
+                {
+                    "company_id": company_id,
+                    "city": item["city"],
+                    "count": int(item.get("agents", 0)),
+                }
+                for item in previous_report.get("sales", [])
+                if int(item.get("agents", 0)) > 0
+            )
+        elif company.get("home_city"):
+            agents.append({"company_id": company_id, "city": company["home_city"], "count": 1})
+    return {"companies": companies, "employee_cohorts": cohorts, "agents": agents}
+
+
+def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: int = 30) -> int:
+    """Undo the latest settlement and reopen that round for fresh submissions."""
+    latest = one(conn, "SELECT MAX(round_no) AS round_no FROM results")
+    if latest is None or latest["round_no"] is None:
+        raise ValueError("还没有已结算回合，无法回退。")
+    target_round = int(latest["round_no"])
+    snapshot_row = one(conn, "SELECT snapshot_json FROM round_snapshots WHERE round_no=?", (target_round,))
+    snapshot = json.loads(snapshot_row["snapshot_json"]) if snapshot_row else _reconstruct_pre_round_snapshot(conn, target_round)
+
+    conn.execute("DELETE FROM employee_cohorts")
+    conn.execute("DELETE FROM agents")
+    existing_company_ids = {int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies")}
+    existing_cities = {str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config")}
+    company_fields = (
+        "name=?,home_city=?,cash=?,debt=?,patents=?,product_inventory=?,"
+        "component_storage_capacity=?,product_storage_capacity=?,setup_submitted_at=?"
+    )
+    for company in snapshot.get("companies", []):
+        company_id = int(company["id"])
+        if company_id not in existing_company_ids:
+            continue
+        restored_home = company.get("home_city") if company.get("home_city") in existing_cities else None
+        conn.execute(
+            f"UPDATE companies SET {company_fields} WHERE id=?",
+            (
+                company["name"], restored_home, float(company.get("cash", 0)),
+                float(company.get("debt", 0)), int(company.get("patents", 0)),
+                int(company.get("product_inventory", 0)), int(company.get("component_storage_capacity", 0)),
+                int(company.get("product_storage_capacity", 0)),
+                company.get("setup_submitted_at") if restored_home else None,
+                company_id,
+            ),
+        )
+    conn.executemany(
+        "INSERT INTO employee_cohorts(company_id,role,count,hire_round) VALUES(?,?,?,?)",
+        [
+            (int(item["company_id"]), str(item["role"]), int(item["count"]), int(item["hire_round"]))
+            for item in snapshot.get("employee_cohorts", [])
+            if int(item.get("count", 0)) > 0 and int(item["company_id"]) in existing_company_ids
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO agents(company_id,city,count) VALUES(?,?,?)",
+        [
+            (int(item["company_id"]), str(item["city"]), int(item["count"]))
+            for item in snapshot.get("agents", [])
+            if int(item.get("count", 0)) > 0
+            and int(item["company_id"]) in existing_company_ids
+            and str(item["city"]) in existing_cities
+        ],
+    )
+
+    conn.execute("DELETE FROM market_round_stats WHERE round_no>=?", (target_round,))
+    conn.execute("DELETE FROM city_results WHERE round_no>=?", (target_round,))
+    conn.execute("DELETE FROM results WHERE round_no>=?", (target_round,))
+    conn.execute("DELETE FROM city_decisions WHERE round_no>?", (target_round,))
+    conn.execute("DELETE FROM decisions WHERE round_no>?", (target_round,))
+    conn.execute("UPDATE decisions SET submitted_at=NULL WHERE round_no=?", (target_round,))
+    conn.execute("DELETE FROM rounds WHERE round_no>=?", (target_round,))
+    conn.execute("DELETE FROM round_snapshots WHERE round_no>=?", (target_round,))
+    start = datetime.now(timezone.utc)
+    end = start + timedelta(minutes=max(1, int(duration_minutes)))
+    conn.execute(
+        "INSERT INTO rounds(round_no,status,starts_at,ends_at,settled_at) VALUES(?,'open',?,?,NULL)",
+        (target_round, start.isoformat(), end.isoformat()),
+    )
+    return target_round
+
+
 def reset_competition(conn: sqlite3.Connection) -> None:
-    for table in ("market_round_stats", "city_results", "results", "city_decisions", "decisions", "agents", "employee_cohorts", "rounds"):
+    for table in ("round_snapshots", "market_round_stats", "city_results", "results", "city_decisions", "decisions", "agents", "employee_cohorts", "rounds"):
         conn.execute(f"DELETE FROM {table}")
     initial_cash = get_setting(conn, "initial_cash", 15_000_000)
     for company in all_rows(conn, "SELECT id,code FROM companies ORDER BY id"):

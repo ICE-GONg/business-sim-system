@@ -35,7 +35,8 @@ from sim import engine as _engine_module
 if (
     not hasattr(_db_module, "delete_city")
     or not hasattr(_engine_module, "current_company_net_assets")
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 3
+    or not hasattr(_db_module, "rollback_latest_settled_round")
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 4
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -54,6 +55,7 @@ from sim.db import (
     now_iso,
     one,
     reset_competition,
+    rollback_latest_settled_round,
     restore_database_bytes,
     set_setting,
     settings_dict,
@@ -1454,6 +1456,38 @@ def render_admin_rounds() -> None:
         st.dataframe(status_frame, hide_index=True, use_container_width=True)
     st.subheader("回合历史")
     st.dataframe(pd.DataFrame([dict(row) for row in history]), hide_index=True, use_container_width=True)
+    st.divider()
+    settled_round_numbers = [int(row["round_no"]) for row in history if row["status"] == "settled"]
+    st.subheader("回退上一轮")
+    if settled_round_numbers:
+        rollback_target = max(settled_round_numbers)
+        st.markdown(
+            f'<div class="danger">将撤销第 {rollback_target} 轮结算，恢复该轮结算前的现金、负债、库存、专利、员工和 Agent；'
+            '更晚回合会被删除；该轮原决策保留为草稿，玩家需重新提交。</div>',
+            unsafe_allow_html=True,
+        )
+        rollback_cols = st.columns([1, 2])
+        rollback_minutes = rollback_cols[0].number_input(
+            "重新开放时长（分钟）", min_value=1, value=default_minutes, step=1, key="rollback_duration"
+        )
+        rollback_confirm = rollback_cols[1].text_input(
+            "输入 ROLLBACK 确认回退", key="round_rollback_confirm"
+        )
+        if st.button(
+            f"撤销第 {rollback_target} 轮并重新开放",
+            disabled=rollback_confirm != "ROLLBACK",
+            key="round_rollback_button",
+            use_container_width=True,
+        ):
+            try:
+                with connect() as conn:
+                    reopened_round = rollback_latest_settled_round(conn, int(rollback_minutes))
+                flash("success", f"已撤销第 {reopened_round} 轮结算并重新开放，玩家可以修改后重新提交。")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+    else:
+        st.caption("暂无已结算回合可回退。")
     st.divider()
     st.subheader("中断并重开比赛")
     st.markdown('<div class="danger">重开会清空所有回合、提交、结算报表、员工和 Agent，并让所有玩家重新选择主场与公司名称；玩家账号和 KDS 保留。</div>', unsafe_allow_html=True)
