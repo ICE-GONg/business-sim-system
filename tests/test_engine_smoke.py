@@ -160,6 +160,14 @@ class SettlementSmokeTest(unittest.TestCase):
                 first_id = int(companies[0]["id"])
                 conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'南京',1)", (first_id,))
                 conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'无锡',1)", (first_id,))
+                conn.execute(
+                    "INSERT INTO city_decisions(company_id,round_no,city,marketing_investment,price) VALUES(?,1,'南京',1,8800)",
+                    (first_id,),
+                )
+                conn.execute(
+                    "INSERT INTO city_decisions(company_id,round_no,city,marketing_investment,price) VALUES(?,1,'无锡',1,7600)",
+                    (first_id,),
+                )
 
                 settle_round(conn, 1)
 

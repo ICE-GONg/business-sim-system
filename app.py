@@ -25,6 +25,7 @@ import altair as alt
 import streamlit as st
 
 from sim import APP_NAME
+from sim import cpi as _cpi_module
 from sim import db as _db_module
 from sim import engine as _engine_module
 
@@ -37,10 +38,12 @@ if (
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 5
+    or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 6
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
+    importlib.reload(_cpi_module)
     importlib.reload(_engine_module)
 
 from sim.db import (

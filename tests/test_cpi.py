@@ -15,6 +15,43 @@ class CPIGeneratorPortTests(unittest.TestCase):
         self.assertAlmostEqual(results[1]["cpi"], 10.0)
         self.assertAlmostEqual(sum(row["cpi"] for row in results), 20.0)
 
+    def test_zero_investment_gets_no_gift_and_only_ma_is_exactly_twenty(self) -> None:
+        empty = allocate_index_cpi(1, 500, [0], [9_800], 9_800)
+        self.assertEqual(empty[0]["cpi"], 0)
+        self.assertEqual(empty[0]["breakdown"]["gift_cpi"], 0)
+
+        result = allocate_city_cpi(
+            [{"company_id": 1, "qi_index": 0, "ma_index": 5_200, "mi_investment": 0, "price": 9_800, "agents": 1}],
+            market_size=80_000,
+            max_price=25_000,
+            ma_large_threshold=1_300,
+            average_price=9_800,
+            market_average_price=9_800,
+        )[0]
+        self.assertAlmostEqual(result["ma_cpi"], 20.0)
+        self.assertEqual(result["qi_cpi"], 0)
+        self.assertEqual(result["mi_cpi"], 0)
+        self.assertEqual(result["price_cpi"], 0)
+        self.assertAlmostEqual(result["total_cpi"], 20.0)
+
+    def test_each_component_pool_respects_twenty_twenty_twenty_forty_caps(self) -> None:
+        entries = [
+            {"company_id": index, "qi_index": 5_000 + index, "ma_index": 13_000 + index, "mi_investment": 20_000_000 + index, "price": 8_000 + index * 100, "agents": index}
+            for index in range(1, 9)
+        ]
+        results = allocate_city_cpi(
+            entries,
+            market_size=80_000,
+            max_price=25_000,
+            ma_large_threshold=1_300,
+            average_price=9_000,
+            market_average_price=9_500,
+        )
+        self.assertLessEqual(sum(row["ma_cpi"] for row in results), 20.0 + 1e-9)
+        self.assertLessEqual(sum(row["qi_cpi"] for row in results), 20.0 + 1e-9)
+        self.assertLessEqual(sum(row["mi_cpi"] for row in results), 20.0 + 1e-9)
+        self.assertLessEqual(sum(row["price_cpi"] for row in results), 40.0 + 1e-9)
+
     def test_price_cpi_uses_eighth_power_and_city_is_independent(self) -> None:
         entries = [
             {"company_id": 1, "qi_index": 2000, "ma_index": 5200, "mi_investment": 32_000_000, "price": 80},

@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 5
+ENGINE_API_VERSION = 6
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:

@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 
+CPI_API_VERSION = 2
 GIFT_CPI = 0.01
 LAYER1_TOTAL_CPI = 5.0
 LAYER2_TOTAL_CPI = 10.0
 WELFARE_PART1_BASE = 1.5
 WELFARE_PART2_BASE = 3.5
 PRICE_CPI_TOTAL = 40.0
+INDEX_CPI_TOTAL = LAYER1_TOTAL_CPI + LAYER2_TOTAL_CPI + WELFARE_PART1_BASE + WELFARE_PART2_BASE
 
 
 def agent_mi_benefit(agent_count: int | float) -> float:
@@ -59,7 +61,9 @@ def allocate_index_cpi(
         player["above_large_adjusted"] = player["adjusted"] >= layer2_threshold
         player["below_min_original"] = player["original"] < min_threshold
         player["above_large_original"] = player["original"] >= large_threshold
-        player["gift"] = GIFT_CPI if player["below_min_adjusted"] else 0.0
+        # A zero investment must contribute exactly zero CPI. The 0.01 gift is
+        # only for a positive investment that misses the minimum threshold.
+        player["gift"] = GIFT_CPI if player["original"] > 0 and player["below_min_adjusted"] else 0.0
         gift_total += player["gift"]
 
     layer1_adjusted: list[float] = []
@@ -165,6 +169,16 @@ def allocate_index_cpi(
                 "breakdown": breakdown,
             }
         )
+    # Defensive cap: each MA/QI/MI pool is strictly limited to 20 CPI even
+    # under unusually large player counts or floating-point accumulation.
+    allocated_total = sum(float(result["cpi"]) for result in results)
+    if allocated_total > INDEX_CPI_TOTAL:
+        scale = INDEX_CPI_TOTAL / allocated_total
+        for result in results:
+            result["breakdown"] = {
+                key: float(value) * scale for key, value in result["breakdown"].items()
+            }
+            result["cpi"] = sum(result["breakdown"].values())
     return results
 
 
