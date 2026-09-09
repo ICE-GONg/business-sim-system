@@ -68,7 +68,6 @@ from sim.db import (
 )
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
-from sim.kds_image import build_kds_png
 from sim.report_pdf import build_round_report_pdf
 
 
@@ -1008,10 +1007,6 @@ def render_player_kds(company: sqlite3.Row) -> None:
     st.dataframe(setting_frame, hide_index=True, use_container_width=True)
     market_frame = pd.DataFrame([dict(row) for row in markets]).rename(columns=MARKET_COLUMNS)
     st.dataframe(market_frame, hide_index=True, use_container_width=True)
-    kds_png = build_kds_png(settings, markets)
-    st.subheader("官方样式 KDS")
-    st.image(kds_png, use_container_width=True)
-    st.download_button("下载高清 KDS 图片", kds_png, file_name="Key_Data_Sheet.png", mime="image/png", use_container_width=True)
 
 
 def render_admin_overview() -> None:
@@ -1303,17 +1298,6 @@ def render_admin_kds() -> None:
             st.session_state.pop("admin_kds_unlocked", None)
             st.rerun()
         note_col.info("KDS 当前已临时解锁；退出登录或点击“重新锁定”后恢复锁定。")
-    kds_png = build_kds_png(settings, markets)
-    with st.expander("KDS 官方图片预览与下载", expanded=True):
-        st.image(kds_png, use_container_width=True)
-        st.download_button(
-            "下载高清 KDS 图片",
-            kds_png,
-            file_name="Key_Data_Sheet.png",
-            mime="image/png",
-            use_container_width=True,
-            key="admin_kds_download",
-        )
     with st.form("global_kds"):
         values: dict[str, Any] = {}
         items = [key for key in GLOBAL_SETTING_LABELS if key in settings]

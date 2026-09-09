@@ -313,24 +313,6 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(db.one(conn, "SELECT status FROM rounds WHERE round_no=1")["status"], "open")
                 self.assertEqual(current_company_net_assets(conn, restored), 15_000_000)
 
-    def test_kds_png_contains_live_market_costs_at_high_resolution(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "kds.db")
-            from PIL import Image
-            from sim import db
-            from sim.kds_image import build_kds_png
-            from io import BytesIO
-
-            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
-            db.init_db()
-            with db.connect() as conn:
-                conn.execute("UPDATE market_config SET transport_cost=88,worker_training_cost=500,engineer_training_cost=900 WHERE city='广州'")
-                image_bytes = build_kds_png(db.settings_dict(conn), db.all_rows(conn, "SELECT * FROM market_config ORDER BY city"))
-            self.assertTrue(image_bytes.startswith(b"\x89PNG"))
-            image = Image.open(BytesIO(image_bytes))
-            self.assertEqual(image.width, 2400)
-            self.assertGreater(image.height, 2000)
-
     def test_patent_reduces_material_cost_starting_next_round(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "patent.db")
