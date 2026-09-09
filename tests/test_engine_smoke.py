@@ -69,7 +69,7 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(report["research"]["patents_after"], 1)
                 pdf_bytes = build_round_report_pdf(dict(companies[0]), 1, report, 1, [])
                 self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
-                self.assertGreater(len(pdf_bytes), 8_000)
+                self.assertGreater(len(pdf_bytes), 7_000)
                 finance = report["finance"]
                 expected_cash = (
                     finance["round_begins"] + finance["loan_change"]

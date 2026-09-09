@@ -295,7 +295,16 @@ def build_round_report_pdf(
 
     agent_rows: list[list[Any]] = [["Agents", "Previous", "Change", "After", "Change Cost", "Marketing Investment"]]
     sales_rows: list[list[Any]] = [["Market", "Competitive Power", "Sales Volume", "Market Share", "Price", "Sales"]]
-    for item in sales:
+    active_sales = [
+        item
+        for item in sales
+        if int(item.get("agents", 0)) > 0
+        or int(item.get("agents_previous", 0)) > 0
+        or int(item.get("agent_change", 0)) != 0
+        or float(item.get("marketing", 0)) > 0
+        or int(item.get("sold", 0)) > 0
+    ]
+    for item in active_sales:
         agent_rows.append([
             item.get("city", ""), item.get("agents_previous", max(0, int(item.get("agents", 0)) - int(item.get("agent_change", 0)))),
             item.get("agent_change", 0), item.get("agents", 0), _money(item.get("agent_change_cost", 0)), _money(item.get("marketing", 0)),
