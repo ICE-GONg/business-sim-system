@@ -105,12 +105,44 @@ st.markdown(
     .danger { background:#fff1f2; border-left:4px solid #e11d48; padding:12px 14px; border-radius:8px; }
     .report-title { border-bottom:2px solid #3f4650; padding-bottom:.35rem; margin:1.25rem 0 .6rem; font-weight:750; font-size:1.05rem; }
     .report-note { color:var(--muted); font-size:.82rem; margin:.25rem 0 .7rem; }
+    .overview-card { background:#fff; border:1px solid var(--line); border-radius:14px; overflow:hidden; box-shadow:0 4px 18px rgba(30,35,45,.045); }
+    .overview-main { display:grid; grid-template-columns:minmax(150px,.8fr) minmax(360px,2.2fr); gap:28px; align-items:center; padding:30px 34px 22px; }
+    .current-rank { text-align:center; color:var(--brand); border-right:1px solid var(--line); padding-right:28px; }
+    .current-rank .label { font-size:1rem; letter-spacing:.06em; }
+    .current-rank .position { font-size:3.25rem; line-height:1.05; font-weight:760; margin-top:5px; }
+    .podium { display:flex; align-items:flex-end; justify-content:center; gap:26px; min-height:142px; }
+    .podium-item { flex:1; max-width:150px; text-align:center; color:var(--ink); font-weight:700; min-width:0; }
+    .podium-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-bottom:8px; font-size:.88rem; }
+    .podium-bar { display:flex; align-items:flex-end; justify-content:center; padding-bottom:10px; color:#fff; background:linear-gradient(180deg,#ee5149,#d93f3d); border-radius:7px 7px 0 0; font-size:1.05rem; }
+    .podium-item.rank-1 .podium-bar { height:88px; }
+    .podium-item.rank-2 .podium-bar { height:68px; opacity:.90; }
+    .podium-item.rank-3 .podium-bar { height:54px; opacity:.80; }
+    .company-profile { text-align:center; padding:4px 24px 28px; }
+    .company-profile h2 { margin:0 0 12px; font-size:1.8rem; }
+    .company-meta { display:flex; flex-wrap:wrap; justify-content:center; gap:10px; }
+    .company-pill { background:#f7f5f2; border:1px solid var(--line); border-radius:999px; padding:7px 13px; color:#4d535d; font-size:.9rem; }
+    .summary-title { background:#ef7772; color:#fff; text-align:center; font-size:1.15rem; padding:8px 12px; }
+    .asset-summary { display:grid; grid-template-columns:repeat(3,1fr); padding:20px 28px 24px; }
+    .asset-item { text-align:center; border-right:1px solid var(--line); }
+    .asset-item:last-child { border-right:0; }
+    .asset-label { color:var(--muted); font-size:.86rem; margin-bottom:5px; }
+    .asset-value { color:var(--ink); font-size:1.25rem; font-weight:720; }
+    .reports-strip { margin-top:16px; background:#3f76b8; color:#fff; text-align:center; padding:15px; border-radius:12px 12px 0 0; font-size:1.25rem; }
+    .reports-note { background:#fff; border:1px solid var(--line); border-top:0; border-radius:0 0 12px 12px; text-align:center; color:var(--muted); padding:13px; margin-bottom:14px; }
     @media (max-width: 720px) {
       .block-container { padding-left: .75rem; padding-right: .75rem; }
       .block-container h2 { font-size:1.65rem; }
       .hero { padding:14px; }
       .hero h1 { font-size:1.3rem; }
       .round-strip .value { font-size:1.1rem; }
+      .overview-main { grid-template-columns:1fr; padding:22px 16px 18px; gap:20px; }
+      .current-rank { border-right:0; border-bottom:1px solid var(--line); padding:0 0 20px; }
+      .current-rank .position { font-size:2.7rem; }
+      .podium { gap:10px; min-height:120px; }
+      .podium-name { font-size:.76rem; }
+      .asset-summary { padding:16px 6px 20px; }
+      .asset-label { font-size:.72rem; }
+      .asset-value { font-size:.92rem; }
     }
     </style>
     """,
@@ -350,7 +382,6 @@ def player_setup_header(company: sqlite3.Row) -> None:
 
 
 def render_player_overview(company: sqlite3.Row) -> None:
-    hero(f"你好，{company['name']}", "以 Net Assets（总资产减负债）为核心，平衡生产、价格、投资和库存风险。")
     with connect() as conn:
         round_row = current_round(conn)
         latest = one(conn, "SELECT * FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no DESC LIMIT 1", (company["id"],))
@@ -364,31 +395,53 @@ def render_player_overview(company: sqlite3.Row) -> None:
             "SELECT round_no,net_assets FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no",
             (company["id"],),
         )
-    cols = st.columns(4)
-    cols[0].metric("现金", money(company["cash"]))
-    cols[1].metric("负债", money(company["debt"]))
-    cols[2].metric("库存", number(company["product_inventory"]))
-    cols[3].metric("主场", company["home_city"] or "—")
-    secondary_cols = st.columns(2)
-    secondary_cols[0].metric("员工", f"{workers + engineers:,}")
-    secondary_cols[1].metric("最新排名", f"#{my_rank}" if my_rank else "—")
+
+    podium_items = []
+    for position in range(1, 4):
+        ranked = next((row for row in ranking if int(row["rank"]) == position), None)
+        podium_name = f"{ranked['code']} · {ranked['name']}" if ranked else "待结算"
+        podium_items.append(
+            f'<div class="podium-item rank-{position}"><div class="podium-name">{html.escape(podium_name)}</div>'
+            f'<div class="podium-bar">第 {position} 名</div></div>'
+        )
+    if latest:
+        summary_title = f"Round {int(latest['round_no'])} Summary"
+        total_assets = float(latest["total_assets"])
+        debt = float(latest["debt"])
+        net_assets = float(latest["net_assets"])
+    else:
+        summary_title = "Initial Assets"
+        total_assets = float(company["cash"])
+        debt = float(company["debt"])
+        net_assets = total_assets - debt
+    rank_display = f"{my_rank}" if my_rank else "—"
+    st.markdown(
+        '<div class="overview-card">'
+        '<div class="overview-main">'
+        f'<div class="current-rank"><div class="label">CURRENTLY · 当前</div><div class="position">#{rank_display}</div></div>'
+        f'<div class="podium">{"".join(podium_items)}</div>'
+        '</div>'
+        '<div class="company-profile">'
+        f'<h2>{html.escape(str(company["name"]))}</h2>'
+        '<div class="company-meta">'
+        f'<span class="company-pill">🪪 {html.escape(str(company["code"]))}</span>'
+        f'<span class="company-pill">🏠 {html.escape(str(company["home_city"] or "未选择"))}</span>'
+        f'<span class="company-pill">👥 员工 {workers + engineers:,}</span>'
+        f'<span class="company-pill">📦 库存 {int(company["product_inventory"]):,}</span>'
+        '</div></div>'
+        f'<div class="summary-title">{html.escape(summary_title)}</div>'
+        '<div class="asset-summary">'
+        f'<div class="asset-item"><div class="asset-label">Total Assets · 总资产</div><div class="asset-value">{money(total_assets)}</div></div>'
+        f'<div class="asset-item"><div class="asset-label">Debt · 负债</div><div class="asset-value">{money(debt)}</div></div>'
+        f'<div class="asset-item"><div class="asset-label">Net Assets · 净资产</div><div class="asset-value">{money(net_assets)}</div></div>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="reports-strip">Reports · 赛后报表</div><div class="reports-note">完整回合报表请在顶部“报表”页面直接查看。</div>', unsafe_allow_html=True)
     if round_row and round_row["status"] == "waiting":
         st.info(f"已有 {ready['ready']}/{ready['total']} 支队伍完成赛前设置。全部就绪后管理员才能开始第一轮。")
-    if latest:
-        st.subheader("上一轮摘要")
-        summary = pd.DataFrame(
-            [{
-                "轮次": int(latest["round_no"]),
-                "生产": int(latest["produced"]),
-                "售出": int(latest["sold"]),
-                "库存": int(latest["inventory"]),
-                "净利润": money(latest["net_profit"]),
-                "净资产": money(latest["net_assets"]),
-            }]
-        )
-        st.dataframe(summary, hide_index=True, use_container_width=True)
     if wealth_rows:
-        with st.expander("查看财富趋势", expanded=False):
+        with st.expander("查看资产变化", expanded=False):
             wealth_frame = pd.DataFrame([dict(row) for row in wealth_rows]).rename(
                 columns={"round_no": "轮次", "net_assets": "净资产"}
             )
