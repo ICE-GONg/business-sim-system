@@ -214,6 +214,7 @@ def build_round_report_pdf(
         ("Management investment", -float(finance.get("management", 0)), 0.0),
         ("Sales revenue", float(metrics.get("sales_revenue", finance.get("sales_revenue", 0))), 0.0),
         ("Research investment", -float(finance.get("research", 0)), 0.0),
+        ("Transportation cost", -float(finance.get("transport", 0)), 0.0),
         ("Market report cost", -float(finance.get("market_reports", 0)), 0.0),
         ("Debt interest", 0.0, float(finance.get("interest", 0))),
         ("Tax deduction", -float(finance.get("tax", 0)), 0.0),
@@ -311,10 +312,9 @@ def build_round_report_pdf(
             item.get("agent_change", 0), item.get("agents", 0), _money(item.get("agent_change_cost", 0)), _money(item.get("marketing", 0)),
         ])
         gross_sales = float(item.get("sold", 0)) * float(item.get("price", 0))
-        net_sales = gross_sales - float(item.get("transport", 0))
         sales_rows.append([
             item.get("city", ""), _pct_points(item.get("cpi", 0)), _num(item.get("sold", 0)),
-            _pct_points(float(item.get("market_share", 0)) * 100), _money(item.get("price", 0)), _money(net_sales),
+            _pct_points(float(item.get("market_share", 0)) * 100), _money(item.get("price", 0)), _money(gross_sales),
         ])
 
     story: list[Any] = [
@@ -358,7 +358,7 @@ def build_round_report_pdf(
         Spacer(1, 4),
         table(sales_rows, [36 * mm, 34 * mm, 28 * mm, 30 * mm, 27 * mm, 29 * mm],
               alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"}),
-        *notes(["Sales values are net of inter-city transport charges where applicable."]),
+        *notes(["Transportation cost applies only to products sold outside the company's home market."]),
     ]
 
     for market in market_sections:

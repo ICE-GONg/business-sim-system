@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 6
+ENGINE_API_VERSION = 7
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -453,7 +453,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         cash, layoff_cost = spend(cash, requested_layoff)
         requested_quit_penalty = worker_quits * float(decision["worker_salary"]) * 2 + engineer_quits * float(decision["engineer_salary"]) * 2
         cash, quit_penalty = spend(cash, requested_quit_penalty)
-        requested_training = max(actual_worker_delta, 0) * float(home["worker_training_cost"]) + max(actual_engineer_delta, 0) * float(home["engineer_training_cost"])
+        worker_training_cost = get_setting(conn, "worker_training_cost", 0.0)
+        engineer_training_cost = get_setting(conn, "engineer_training_cost", 0.0)
+        requested_training = max(actual_worker_delta, 0) * worker_training_cost + max(actual_engineer_delta, 0) * engineer_training_cost
         cash, training_cost = spend(cash, requested_training)
 
         active_patents = int(company["patents"])
@@ -723,10 +725,12 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
 
     amount_25 = get_setting(conn, "research_25", 1_500_000.0)
     amount_75 = get_setting(conn, "research_75", 6_000_000.0)
+    transport_unit_cost = get_setting(conn, "transport_cost", 0.0)
     for company_id, state in states.items():
         company = state["company"]
         home = state["home"]
         revenue = 0.0
+        requested_transport_total = 0.0
         sold = 0
         city_report_rows: list[dict[str, Any]] = []
         for market_row in markets:
@@ -735,10 +739,11 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             city_decision = state["city_decisions"][city]
             units = int(state["city_sales_units"][city])
             sold += units
-            transport = float(market["transport_cost"]) if company["home_city"] != city else 0.0
+            transport = transport_unit_cost if company["home_city"] != city else 0.0
             transport_total = units * transport
-            net_city_revenue = units * float(city_decision["price"]) - transport_total
-            revenue += net_city_revenue
+            gross_city_revenue = units * float(city_decision["price"])
+            revenue += gross_city_revenue
+            requested_transport_total += transport_total
             size = market_size(market, round_no, growth)
             share = units / max(size, 1.0)
             allocation = state["city_breakdown"][city]
@@ -749,7 +754,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             if int(city_decision["agents_after"]) > 0:
                 conn.execute(
                     "INSERT INTO city_results(company_id,round_no,city,cpi,cpi_units,sold,revenue,price,marketing,market_share,breakdown_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (company_id, round_no, city, float(state["city_cpi"][city]), allocated_before_secondary, units, net_city_revenue, float(city_decision["price"]), float(city_decision["marketing_investment"]), share, json.dumps(breakdown, ensure_ascii=False)),
+                    (company_id, round_no, city, float(state["city_cpi"][city]), allocated_before_secondary, units, gross_city_revenue, float(city_decision["price"]), float(city_decision["marketing_investment"]), share, json.dumps(breakdown, ensure_ascii=False)),
                 )
             public_allocation = {key: value for key, value in allocation.items() if key not in {"average_price", "market_average_price"}} if allocation else {}
             city_report_rows.append({
@@ -766,6 +771,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         inventory = max(0, int(state["available"] - sold))
         cash = state["cash_pre_sales"] + revenue
         cash, research = spend(cash, state["research_requested"])
+        cash, transport_cost = spend(cash, requested_transport_total)
         total_report_cost = 0.0
         for item in city_report_rows:
             if not item["report_requested"] or cash + 1e-9 < report_cost_each:
@@ -777,7 +783,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         interest = max(0.0, float(state["debt_before_interest"])) * float(home["interest_rate"])
         debt = float(state["debt_before_interest"]) + interest
         pre_sales_cost = state["wage_cost"] + state["layoff_cost"] + state["quit_penalty"] + state["training_cost"] + state["component_material_cost"] + state["product_material_cost"] + state["storage_cost"] + state["agent_cost"] + state["marketing_total"] + state["quality"] + state["management"]
-        operating_cost = pre_sales_cost + research + total_report_cost + interest
+        operating_cost = pre_sales_cost + research + total_report_cost + transport_cost + interest
         pre_tax_profit = revenue - operating_cost
         cash, tax = spend(cash, max(0.0, pre_tax_profit * tax_rate))
         total_cost = operating_cost + tax
@@ -800,7 +806,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "component_storage": state["component_storage_cost"], "product_storage": state["product_storage_cost"],
                 "materials": state["component_material_cost"] + state["product_material_cost"], "storage": state["storage_cost"],
                 "agents": state["agent_cost"], "marketing": state["marketing_total"], "quality": state["quality"], "management": state["management"],
-                "sales_revenue": revenue, "research": research, "market_reports": total_report_cost, "interest": interest, "tax": tax, "round_ends": cash,
+                "sales_revenue": revenue, "research": research, "market_reports": total_report_cost, "transport": transport_cost, "interest": interest, "tax": tax, "round_ends": cash,
             },
             "human_resources": {
                 "workers": state["workers"], "engineers": state["engineers"], "previous_workers": state["previous_workers"], "previous_engineers": state["previous_engineers"],

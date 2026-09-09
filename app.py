@@ -39,7 +39,7 @@ if (
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 6
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 7
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -666,7 +666,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 step=50.0,
             )
             st.caption(
-                f"当前：工人 {current_workers:,}、工程师 {current_engineers:,}。新员工按主场 KDS 收取培训费；第三轮起老员工享受经验倍率。"
+                f"当前：工人 {current_workers:,}、工程师 {current_engineers:,}。新员工按全局 KDS 收取培训费；第三轮起老员工享受经验倍率。"
             )
 
         with st.expander("🏭 生产与研发", expanded=True):
@@ -879,7 +879,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     cols[0].metric("销售收入", money(metrics["sales_revenue"]))
     cols[1].metric("总成本", money(metrics["cost"]))
     cols[2].metric("净利润", money(metrics["net_profit"]))
-    st.markdown('<div class="report-note">净利润 = 销售收入 − 全部成本；排名依据 Net Assets（总资产 − 负债），专利、市场报告、税费和贷款利息均已计入。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="report-note">净利润 = 销售收入 − 全部成本；排名依据 Net Assets（总资产 − 负债），专利、市场报告、运输费、税费和贷款利息均已计入。</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="report-title">财务 Finance</div>', unsafe_allow_html=True)
     finance = report["finance"]
@@ -904,6 +904,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         ("管理投入 / Management", -float(finance.get("management", 0.0)), 0.0),
         ("销售收入 / Sales revenue", float(metrics["sales_revenue"]), 0.0),
         ("研发投入 / Research", -float(finance.get("research", 0.0)), 0.0),
+        ("跨城运输 / Transportation", -float(finance.get("transport", 0.0)), 0.0),
         ("市场报告 / Market report", -float(finance.get("market_reports", 0.0)), 0.0),
         ("贷款利息 / Debt interest", 0.0, float(finance.get("interest", 0.0))),
         ("税费 / Tax", -float(finance.get("tax", 0.0)), 0.0),
@@ -1077,31 +1078,70 @@ def render_wealth(company: sqlite3.Row | None, admin: bool = False) -> None:
 
 
 def render_player_kds(company: sqlite3.Row) -> None:
-    hero("规则速查", "比赛参数与核心公式只读；管理员可在后台统一修改。")
+    hero("KDS · Key Data Sheet", "本场比赛公开参数；数值由管理员统一设置。")
     with connect() as conn:
         settings = settings_dict(conn)
         markets = all_rows(conn, "SELECT * FROM market_config ORDER BY city")
+    st.markdown(f'<div class="report-note" style="text-align:right">Initial Cash · 初始现金：<b>{money(settings["initial_cash"])}</b></div>', unsafe_allow_html=True)
+    st.markdown('<div class="report-title">Markets Details · 城市参数</div>', unsafe_allow_html=True)
+    market_frame = pd.DataFrame(
+        [
+            {
+                "城市": row["city"],
+                "第一轮最高贷款": row["max_loan"],
+                "利率": float(row["interest_rate"]) * 100,
+                "工人初始工资": row["worker_initial_salary"],
+                "工程师初始工资": row["engineer_initial_salary"],
+                "零件材料单价": row["component_material"],
+                "产品材料单价": row["product_material"],
+                "零件仓储单价": row["component_storage"],
+                "产品仓储单价": row["product_storage"],
+                "人口": row["population"],
+                "初始渗透率": float(row["penetration"]) * 100,
+                "初始均价": row["initial_avg_price"],
+            }
+            for row in markets
+        ]
+    )
+    st.dataframe(
+        market_frame,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "第一轮最高贷款": st.column_config.NumberColumn(format="¥ %.0f"),
+            "利率": st.column_config.NumberColumn(format="%.2f%%"),
+            "工人初始工资": st.column_config.NumberColumn(format="¥ %.0f"),
+            "工程师初始工资": st.column_config.NumberColumn(format="¥ %.0f"),
+            "零件材料单价": st.column_config.NumberColumn(format="¥ %.0f"),
+            "产品材料单价": st.column_config.NumberColumn(format="¥ %.0f"),
+            "零件仓储单价": st.column_config.NumberColumn(format="¥ %.0f"),
+            "产品仓储单价": st.column_config.NumberColumn(format="¥ %.0f"),
+            "人口": st.column_config.NumberColumn(format="%.0f"),
+            "初始渗透率": st.column_config.NumberColumn(format="%.2f%%"),
+            "初始均价": st.column_config.NumberColumn(format="¥ %.0f"),
+        },
+    )
+    st.caption("Maximum loans, salaries, prices and penetrations may change from round to round.")
+    st.caption("Market penetration: the number of customers interested in buying products in that market.")
+    st.markdown('<div class="report-title">Equations & Ranges & Prices · 公式与范围</div>', unsafe_allow_html=True)
     st.markdown(
         f"""
-        - 每轮工时：`504`
-        - 工人 : 工程师 = `A × B × E : C × D`
-        - 平均工资：每个主场独立计算，`[Σ(对应岗位人数 × 玩家工资) + Σ(对应岗位人数 × 主场 KDS 初始工资 × 2)] ÷ (岗位总人数 × 3)`。
-        - 工资产能倍率：`min(本队工资 ÷ 本主场平均工资, 1.1)`；低于平均工资时员工按比例离职并补偿两个月工资；每轮工资涨跌不超过 KDS 限额。
-        - 贷款总额度：第一轮使用主场贷款上限；第二轮起为 `净资产 ÷ 贷款阈值 × 全局最高贷款`，达到全局上限即封顶；利息计入负债。
-        - MA 指数：`MA 投资 ÷ (工人 + 工程师)`
-        - QI 指数：`QI 投资 ÷ (旧产品 × 1.2 + 新产品)`
-        - QI 大量 CPI 门槛：`城市最高价 ÷ 50`；超过门槛后进入第二层分配，QI 完整分配池合计 `20 CPI`。
-        - MI 大量 CPI 门槛：`QI 大量门槛 × 市场大小 × 20% ÷ Agent 效益 ÷ 1.5 ÷ 2`；Agent 效益为 `1 + Agent 数 × 10%`。
-        - CPI：按城市独立执行赠品、第一层、第二层、福利 1/2；价格差使用 `{int(settings['cpi_price_power'])}` 次方。
-        - 二次分配：只把缺货玩家未用完的 CPI 份额分给该城市原本 CPI 大于 0 且仍有库存的玩家；报表 CPI 不增加，因此市场份额可高于 CPI。
-        - 现金不会低于 0；投资按 `MI → QI → MA` 扣除，不足时只投入剩余现金。
-        - 专利在中奖后的下一轮开始降低材料成本；市场报告与专利投入都在销售收入到账后扣除。
+        - 1 Component · 1 个零件 = `{int(settings['component_workers'])} Inexperienced Workers + {int(settings['component_hours'])} Hours + 1 Component Material`
+        - 1 Product · 1 个产品 = `{int(settings['product_engineers'])} Inexperienced Engineers + {int(settings['product_hours'])} Hours + {int(settings['components_per_product'])} Components + 1 Product Material`
+        - Experienced workers and engineers produce `10%` more per unit time than inexperienced employees.
+        - Training Cost：`{money(settings['worker_training_cost'])} / Worker`，`{money(settings['engineer_training_cost'])} / Engineer`
+        - Product Quality Index = `Quality Investment ÷ (Old Products × 1.20 + New Products)`
+        - Management Index = `Management Investment ÷ (Workers + Engineers)`
+        - Salary Range：`{money(settings['salary_min'])} – {money(settings['salary_max'])}`
+        - Product Price Range：`{money(settings['price_min'])} – {money(settings['price_max'])}`
+        - Transportation Fee：`{money(settings['transport_cost'])} / Product`（仅主场之外实际售出的产品收取）
+        - Add One Sales Agent：`{money(settings['agent_add_cost'])}`
+        - Remove One Sales Agent：`{money(settings['agent_remove_cost'])}`
+        - Order One Market Report：`{money(settings['report_cost'])}`
+        - Research & Development：`{money(settings['research_25'])} = 25%`，`{money(settings['research_75'])} = 75%`
+        - Patent：每项专利将材料成本乘以 `{float(settings['patent_factor']):.2f}`，中奖后的下一轮开始生效。
         """
     )
-    setting_frame = pd.DataFrame([{"参数": GLOBAL_SETTING_LABELS.get(key, key), "值": value} for key, value in settings.items() if key in GLOBAL_SETTING_LABELS])
-    st.dataframe(setting_frame, hide_index=True, use_container_width=True)
-    market_frame = pd.DataFrame([dict(row) for row in markets]).rename(columns=MARKET_COLUMNS)
-    st.dataframe(market_frame, hide_index=True, use_container_width=True)
 
 
 def render_admin_overview() -> None:
@@ -1414,6 +1454,8 @@ def render_admin_kds() -> None:
             st.error("贷款净资产阈值必须大于 0，贷款公式才能生效。")
         elif float(values["global_max_loan"]) < 0:
             st.error("第二轮起全局最高贷款不能为负数。")
+        elif any(float(values[key]) < 0 for key in ("transport_cost", "worker_training_cost", "engineer_training_cost")):
+            st.error("运输费和培训费不能为负数。")
         else:
             with connect() as conn:
                 for key, value in values.items():
@@ -1424,7 +1466,7 @@ def render_admin_kds() -> None:
     st.subheader("城市参数")
     frame = pd.DataFrame([dict(row) for row in markets])
     ordered_columns = [column for column in MARKET_COLUMNS if column in frame.columns]
-    frame = frame[ordered_columns + [column for column in frame.columns if column not in ordered_columns]]
+    frame = frame[ordered_columns]
     edited = st.data_editor(
         frame,
         hide_index=True,

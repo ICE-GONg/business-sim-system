@@ -18,6 +18,9 @@ class SettlementSmokeTest(unittest.TestCase):
             db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
             db.init_db()
             with db.connect() as conn:
+                db.set_setting(conn, "worker_training_cost", 100)
+                db.set_setting(conn, "engineer_training_cost", 200)
+                db.set_setting(conn, "transport_cost", 123)
                 companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
                 conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
                 for company in companies:
@@ -56,6 +59,9 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(report["finance"]["interest"], 30_000)
                 self.assertGreater(report["finance"]["research"], 0)
                 self.assertGreater(report["finance"]["market_reports"], 0)
+                self.assertEqual(report["finance"]["training"], 1_100)
+                non_home_sales = sum(item["sold"] for item in report["sales"] if item["city"] != "广州")
+                self.assertEqual(report["finance"]["transport"], non_home_sales * 123)
                 self.assertAlmostEqual(results[0]["net_assets"], results[0]["total_assets"] - results[0]["debt"])
                 self.assertAlmostEqual(
                     results[0]["net_assets"],
@@ -76,7 +82,7 @@ class SettlementSmokeTest(unittest.TestCase):
                     - finance["wages"] - finance["layoff"] - finance["training"]
                     - finance["materials"] - finance["storage"] - finance["agents"]
                     - finance["marketing"] - finance["quality"] - finance["management"]
-                    + finance["sales_revenue"] - finance["research"] - finance["market_reports"] - finance["tax"]
+                    + finance["sales_revenue"] - finance["research"] - finance["market_reports"] - finance["transport"] - finance["tax"]
                 )
                 self.assertAlmostEqual(finance["round_ends"], expected_cash)
                 taxable_profit = report["key_metrics"]["sales_revenue"] - (report["key_metrics"]["cost"] - finance["tax"])
