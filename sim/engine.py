@@ -10,7 +10,7 @@ from .cpi import allocate_city_cpi
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one, remove_employees
 
 
-ENGINE_API_VERSION = 2
+ENGINE_API_VERSION = 3
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -31,6 +31,15 @@ def weighted_market_average(base_average_price: float, size: float, price_quanti
     player_value = sum(price * quantity * scale for price, quantity in pairs)
     served = min(player_total, market_capacity)
     return (player_value + base * (market_capacity - served)) / market_capacity
+
+
+def weighted_player_average(price_quantity_pairs: list[tuple[float, float]], fallback: float) -> float:
+    """Return the sales-weighted player price, excluding unserved demand."""
+    pairs = [(max(0.0, float(price)), max(0.0, float(quantity))) for price, quantity in price_quantity_pairs]
+    total_quantity = sum(quantity for _, quantity in pairs)
+    if total_quantity <= 0:
+        return max(0.0, float(fallback))
+    return sum(price * quantity for price, quantity in pairs) / total_quantity
 
 
 def reference_market_average(conn: sqlite3.Connection, city: str, round_no: int, initial_average: float) -> float:
@@ -385,60 +394,112 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "city_breakdown": {str(m["city"]): {} for m in markets},
         }
 
-    for market_row in markets:
-        market = dict(market_row)
-        city = str(market["city"])
-        size = market_size(market, round_no, growth)
-        entries = []
-        for company_id, state in states.items():
-            city_decision = state["city_decisions"][city]
-            if int(city_decision["agents_after"]) <= 0:
-                continue
-            entries.append({"company_id": company_id, "ma_index": state["ma_index"], "qi_index": state["qi_index"], "mi_investment": float(city_decision["marketing_investment"]), "price": float(city_decision["price"])})
-        allocations = allocate_city_cpi(entries, market_size=size, max_price=float(market["max_price"]), ma_large_threshold=ma_large_threshold, price_power=price_power, average_price=market_base_averages[city], market_average_price=market_base_averages[city])
-        for allocation in allocations:
-            company_id = int(allocation["company_id"])
-            cpi = float(allocation["total_cpi"])
-            states[company_id]["city_cpi"][city] = cpi
-            states[company_id]["city_cpi_units"][city] = size * cpi / 100.0
-            states[company_id]["city_breakdown"][city] = allocation
+    def calculate_cpi_and_sales(player_average_prices: dict[str, float]) -> None:
+        """Calculate CPI and sales once for the supplied per-city player averages."""
+        for state in states.values():
+            state["city_sales"] = {str(m["city"]): 0.0 for m in markets}
+            state["city_secondary"] = {str(m["city"]): 0.0 for m in markets}
+            state["city_cpi"] = {str(m["city"]): 0.0 for m in markets}
+            state["city_cpi_units"] = {str(m["city"]): 0.0 for m in markets}
+            state["city_breakdown"] = {str(m["city"]): {} for m in markets}
 
-    for state in states.values():
-        total_capacity = sum(state["city_cpi_units"].values())
-        available = float(state["available"])
-        if total_capacity <= 0 or available <= 0:
-            continue
-        factor = min(1.0, available / total_capacity)
-        for city, capacity in state["city_cpi_units"].items():
-            state["city_sales"][city] = capacity * factor
-
-    for _ in range(10):
-        remaining = {company_id: max(0.0, state["available"] - sum(state["city_sales"].values())) for company_id, state in states.items()}
-        moved = 0.0
         for market_row in markets:
             market = dict(market_row)
             city = str(market["city"])
             size = market_size(market, round_no, growth)
-            gap = max(0.0, size - sum(state["city_sales"][city] for state in states.values()))
-            candidates = []
+            entries = []
             for company_id, state in states.items():
-                if remaining[company_id] <= 0.5 or int(state["city_decisions"][city]["agents_after"]) <= 0:
+                city_decision = state["city_decisions"][city]
+                if int(city_decision["agents_after"]) <= 0:
                     continue
-                candidates.append((company_id, max(float(state["city_cpi_units"][city]), size * 0.0001)))
-            if gap <= 0.5 or not candidates:
-                continue
-            score_sum = sum(score for _, score in candidates)
-            for company_id, score in candidates:
-                addition = min(remaining[company_id], gap * score / score_sum)
-                states[company_id]["city_sales"][city] += addition
-                states[company_id]["city_secondary"][city] += addition
-                remaining[company_id] -= addition
-                moved += addition
-        if moved < 1.0:
-            break
+                entries.append({"company_id": company_id, "ma_index": state["ma_index"], "qi_index": state["qi_index"], "mi_investment": float(city_decision["marketing_investment"]), "price": float(city_decision["price"])})
+            allocations = allocate_city_cpi(
+                entries,
+                market_size=size,
+                max_price=float(market["max_price"]),
+                ma_large_threshold=ma_large_threshold,
+                price_power=price_power,
+                average_price=player_average_prices[city],
+                market_average_price=market_base_averages[city],
+            )
+            for allocation in allocations:
+                company_id = int(allocation["company_id"])
+                cpi = float(allocation["total_cpi"])
+                states[company_id]["city_cpi"][city] = cpi
+                states[company_id]["city_cpi_units"][city] = size * cpi / 100.0
+                states[company_id]["city_breakdown"][city] = allocation
 
-    for state in states.values():
-        state["city_sales_units"] = allocate_integer_sales(state["city_sales"], state["available"])
+        for state in states.values():
+            total_capacity = sum(state["city_cpi_units"].values())
+            available = float(state["available"])
+            if total_capacity <= 0 or available <= 0:
+                continue
+            factor = min(1.0, available / total_capacity)
+            for city, capacity in state["city_cpi_units"].items():
+                state["city_sales"][city] = capacity * factor
+
+        for _ in range(10):
+            remaining = {company_id: max(0.0, state["available"] - sum(state["city_sales"].values())) for company_id, state in states.items()}
+            moved = 0.0
+            for market_row in markets:
+                market = dict(market_row)
+                city = str(market["city"])
+                size = market_size(market, round_no, growth)
+                gap = max(0.0, size - sum(state["city_sales"][city] for state in states.values()))
+                candidates = []
+                for company_id, state in states.items():
+                    if remaining[company_id] <= 0.5 or int(state["city_decisions"][city]["agents_after"]) <= 0:
+                        continue
+                    candidates.append((company_id, max(float(state["city_cpi_units"][city]), size * 0.0001)))
+                if gap <= 0.5 or not candidates:
+                    continue
+                score_sum = sum(score for _, score in candidates)
+                for company_id, score in candidates:
+                    addition = min(remaining[company_id], gap * score / score_sum)
+                    states[company_id]["city_sales"][city] += addition
+                    states[company_id]["city_secondary"][city] += addition
+                    remaining[company_id] -= addition
+                    moved += addition
+            if moved < 1.0:
+                break
+
+        for state in states.values():
+            state["city_sales_units"] = allocate_integer_sales(state["city_sales"], state["available"])
+
+    # The CPI generator distinguishes the sales-weighted player average used
+    # by QI/MA/MI from the broader market average used by price CPI. Because
+    # CPI affects sales and sales affect the weighted player average, iterate
+    # until the per-city averages stabilize. Available stock is only the
+    # deterministic initial weighting and is replaced by actual sold units.
+    player_average_prices: dict[str, float] = {}
+    for market_row in markets:
+        city = str(market_row["city"])
+        active = [
+            (float(state["city_decisions"][city]["price"]), float(state["available"]))
+            for state in states.values()
+            if int(state["city_decisions"][city]["agents_after"]) > 0
+        ]
+        active_prices = [price for price, _ in active]
+        fallback = sum(active_prices) / len(active_prices) if active_prices else market_base_averages[city]
+        player_average_prices[city] = weighted_player_average(active, fallback)
+
+    for _ in range(25):
+        calculate_cpi_and_sales(player_average_prices)
+        next_averages: dict[str, float] = {}
+        for market_row in markets:
+            city = str(market_row["city"])
+            sold_pairs = [
+                (float(state["city_decisions"][city]["price"]), float(state["city_sales_units"][city]))
+                for state in states.values()
+            ]
+            next_averages[city] = weighted_player_average(sold_pairs, player_average_prices[city])
+        if all(math.isclose(next_averages[city], player_average_prices[city], abs_tol=0.005) for city in player_average_prices):
+            player_average_prices = next_averages
+            calculate_cpi_and_sales(player_average_prices)
+            break
+        player_average_prices = next_averages
+    else:
+        calculate_cpi_and_sales(player_average_prices)
 
     market_round_stats: dict[str, dict[str, float]] = {}
     for market_row in markets:
@@ -548,7 +609,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             },
             "research": {"investment": research, "probability": probability, "success": bool(research_success), "active_patents_this_round": state["active_patents"], "patents_after": patents_after, "effective_from_round": round_no + 1 if research_success else None},
             "sales": city_report_rows,
-            "cpi_algorithm": {"version": get_setting(conn, "cpi_algorithm_version", "cpi-generator-admin-v1", str), "description": "赠品 + 第一层 + 第二层 + 福利1/2；价格差按设定幂次分配 40 CPI；各城市独立计算。", "price_power": price_power},
+            "cpi_algorithm": {"version": get_setting(conn, "cpi_algorithm_version", "cpi-generator-admin-v1", str), "description": "赠品 + 第一层 + 第二层 + 福利1/2；价格差按设定幂次分配 40 CPI；各城市独立计算。", "price_power": price_power, "player_average_price_formula": "sum(player_price * player_sold) / sum(player_sold)"},
         }
         conn.execute(
             "INSERT INTO results(company_id,round_no,total_assets,debt,net_assets,cash,sales_revenue,total_cost,net_profit,produced,sold,inventory,ma_index,qi_index,research_success,report_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",

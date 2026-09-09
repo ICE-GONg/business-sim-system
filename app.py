@@ -35,7 +35,7 @@ from sim import engine as _engine_module
 if (
     not hasattr(_db_module, "delete_city")
     or not hasattr(_engine_module, "current_company_net_assets")
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 2
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 3
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)

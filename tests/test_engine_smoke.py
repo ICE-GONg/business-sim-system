@@ -88,11 +88,49 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(hidden_rows["n"], 0)
 
     def test_weighted_market_average_blends_unserved_demand(self) -> None:
-        from sim.engine import weighted_market_average
+        from sim.engine import weighted_market_average, weighted_player_average
 
         average = weighted_market_average(100, 1_000, [(80, 100), (120, 200)])
         self.assertAlmostEqual(average, 102.0)
         self.assertEqual(weighted_market_average(100, 1_000, []), 100)
+        self.assertAlmostEqual(weighted_player_average([(80, 100), (120, 200)], 100), 106.6666666667)
+        self.assertEqual(weighted_player_average([], 100), 100)
+
+    def test_cpi_uses_sales_weighted_player_price_not_market_base_price(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "player-average.db")
+            from sim import db
+            from sim.engine import settle_round
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+                for index, company in enumerate(companies):
+                    conn.execute(
+                        "UPDATE companies SET home_city='广州',setup_submitted_at=?,product_inventory=? WHERE id=?",
+                        (db.now_iso(), 200 if index < 2 else 0, company["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,submitted_at) VALUES(?,1,3300,6400,?)",
+                        (company["id"], db.now_iso()),
+                    )
+                    if index < 2:
+                        conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'无锡',1)", (company["id"],))
+                        conn.execute(
+                            "INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,1,'无锡',24888)",
+                            (company["id"],),
+                        )
+
+                settle_round(conn, 1)
+
+                rows = db.all_rows(conn, "SELECT breakdown_json FROM city_results WHERE city='无锡' AND round_no=1 ORDER BY company_id")
+                self.assertEqual(len(rows), 2)
+                for row in rows:
+                    breakdown = json.loads(row["breakdown_json"])
+                    self.assertAlmostEqual(breakdown["average_price"], 24_888)
+                    self.assertAlmostEqual(breakdown["market_average_price"], 7_600)
 
     def test_one_product_split_across_positive_cpi_markets_is_not_lost(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
