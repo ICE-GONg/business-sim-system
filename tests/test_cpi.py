@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sim.cpi import allocate_city_cpi, allocate_index_cpi, minimum_threshold
+from sim.cpi import agent_mi_benefit, allocate_city_cpi, allocate_index_cpi, minimum_threshold
 
 
 class CPIGeneratorPortTests(unittest.TestCase):
@@ -32,8 +32,26 @@ class CPIGeneratorPortTests(unittest.TestCase):
         self.assertAlmostEqual(results[0]["price_cpi"], 40.0)
         self.assertAlmostEqual(results[1]["price_cpi"], 0.0)
         self.assertEqual(results[0]["thresholds"]["qi_large"], 500.0)
-        self.assertEqual(results[0]["thresholds"]["mi_large"], 8_000_000)
+        self.assertAlmostEqual(results[0]["thresholds"]["mi_large"], 8_000_000 / 3)
         self.assertAlmostEqual(sum(item["qi_cpi"] for item in results), 20.0)
+
+    def test_agent_count_increases_mi_effect_and_reduces_player_threshold(self) -> None:
+        entries = [
+            {"company_id": 1, "qi_index": 0, "ma_index": 0, "mi_investment": 1_000_000, "price": 9_800, "agents": 1},
+            {"company_id": 2, "qi_index": 0, "ma_index": 0, "mi_investment": 1_000_000, "price": 9_800, "agents": 3},
+        ]
+        results = allocate_city_cpi(
+            entries,
+            market_size=80_000,
+            max_price=25_000,
+            ma_large_threshold=1_300,
+            average_price=9_800,
+            market_average_price=9_800,
+        )
+        self.assertAlmostEqual(agent_mi_benefit(1), 1.1)
+        self.assertAlmostEqual(agent_mi_benefit(3), 1.3)
+        self.assertLess(results[1]["thresholds"]["mi_large"], results[0]["thresholds"]["mi_large"])
+        self.assertGreater(results[1]["mi_cpi"], results[0]["mi_cpi"])
 
 
 if __name__ == "__main__":

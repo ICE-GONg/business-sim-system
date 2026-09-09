@@ -3,3 +3,4 @@ pandas>=2.0,<3
 altair>=5,<6
 typing-extensions>=4.13.2
 reportlab>=4.4.10,<6
+Pillow>=10,<13

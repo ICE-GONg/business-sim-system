@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 4
+ENGINE_API_VERSION = 5
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -54,7 +54,7 @@ def weighted_player_average(price_quantity_pairs: list[tuple[float, float]], fal
 def reference_market_average(conn: sqlite3.Connection, city: str, round_no: int, initial_average: float) -> float:
     previous = one(
         conn,
-        "SELECT average_price FROM market_round_stats WHERE city=? AND round_no<? ORDER BY round_no DESC LIMIT 1",
+        "SELECT average_price FROM market_round_stats WHERE city=? AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
         (city, round_no),
     )
     return float(previous["average_price"]) if previous else float(initial_average)
@@ -80,11 +80,18 @@ def available_loan_limit(net_assets: float, threshold: float, minimum: float, ma
     return min(ceiling, max(floor, calculated))
 
 
+def loan_ceiling_for_round(round_no: int, home_market: dict[str, Any] | sqlite3.Row, global_maximum: float) -> float:
+    """The city ceiling applies to round one/test; later rounds use one global ceiling."""
+    if int(round_no) <= 1:
+        return max(0.0, float(home_market["max_loan"]))
+    return max(0.0, float(global_maximum))
+
+
 def current_company_net_assets(conn: sqlite3.Connection, company: sqlite3.Row | dict[str, Any]) -> float:
     """Return the latest settled net assets, including unsold inventory value."""
     latest = one(
         conn,
-        "SELECT net_assets FROM results WHERE company_id=? ORDER BY round_no DESC LIMIT 1",
+        "SELECT net_assets FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no DESC LIMIT 1",
         (int(company["id"]),),
     )
     if latest is not None:
@@ -118,6 +125,49 @@ def spend(available_cash: float, requested: float) -> tuple[float, float]:
     """Pay as much as possible without ever making cash negative."""
     paid = min(max(0.0, float(available_cash)), max(0.0, float(requested)))
     return max(0.0, float(available_cash) - paid), paid
+
+
+def proportional_quits(employee_count_value: int, salary: float, average_salary: float) -> int:
+    """Employees below their home-market average quit in the same proportion."""
+    count = max(0, int(employee_count_value))
+    average = max(0.0, float(average_salary))
+    if count <= 0 or average <= 0 or float(salary) >= average:
+        return 0
+    retained_ratio = max(0.0, float(salary)) / average
+    return min(count, max(0, math.floor(count * (1.0 - retained_ratio) + 0.5)))
+
+
+def redistribute_unused_cpi(
+    cpi_capacities: dict[int, float],
+    primary_sales: dict[int, float],
+    remaining_stock: dict[int, float],
+) -> dict[int, float]:
+    """Redistribute only unused visible CPI, and only to positive-CPI players."""
+    capacities = {company_id: max(0.0, float(value)) for company_id, value in cpi_capacities.items()}
+    sales = {company_id: max(0.0, float(primary_sales.get(company_id, 0.0))) for company_id in capacities}
+    remaining = {company_id: max(0.0, float(remaining_stock.get(company_id, 0.0))) for company_id in capacities}
+    additions = {company_id: 0.0 for company_id in capacities}
+    pool = max(0.0, sum(capacities.values()) - sum(sales.values()))
+    for _ in range(max(1, len(capacities) + 1)):
+        candidates = [
+            company_id
+            for company_id, capacity in capacities.items()
+            if capacity > 1e-9 and remaining[company_id] > 1e-9
+        ]
+        if pool <= 1e-9 or not candidates:
+            break
+        weight_sum = sum(capacities[company_id] for company_id in candidates)
+        moved = 0.0
+        for company_id in candidates:
+            requested = pool * capacities[company_id] / weight_sum
+            addition = min(remaining[company_id], requested)
+            additions[company_id] += addition
+            remaining[company_id] -= addition
+            moved += addition
+        pool -= moved
+        if moved <= 1e-9:
+            break
+    return additions
 
 
 def allocate_integer_sales(city_sales: dict[str, float], available_units: int | float) -> dict[str, int]:
@@ -155,7 +205,7 @@ def _previous_salary(conn: sqlite3.Connection, company_id: int, round_no: int, f
     row = one(
         conn,
         f"SELECT d.{field} AS salary FROM decisions d JOIN results r ON r.company_id=d.company_id "
-        "AND r.round_no=d.round_no WHERE d.company_id=? AND d.round_no<? ORDER BY d.round_no DESC LIMIT 1",
+        "AND r.round_no=d.round_no WHERE d.company_id=? AND d.round_no>=1 AND d.round_no<? ORDER BY d.round_no DESC LIMIT 1",
         (company_id, round_no),
     )
     return float(row["salary"]) if row else float(fallback)
@@ -220,12 +270,15 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
     report_cost_each = get_setting(conn, "report_cost", 200_000.0)
     tax_rate = get_setting(conn, "tax_rate", 0.20)
     loan_threshold = get_setting(conn, "loan_asset_threshold", 15_000_000.0)
+    global_max_loan = get_setting(conn, "global_max_loan", 10_000_000.0)
     ma_large_threshold = get_setting(conn, "cpi_ma_large_threshold", 1_300.0)
     price_power = get_setting(conn, "cpi_price_power", 8, int)
 
     decisions: dict[int, dict[str, Any]] = {}
-    worker_average_rows: list[tuple[int, float, float]] = []
-    engineer_average_rows: list[tuple[int, float, float]] = []
+    worker_average_rows: dict[str, list[tuple[int, float, float]]] = {}
+    engineer_average_rows: dict[str, list[tuple[int, float, float]]] = {}
+    worker_salary_fallbacks: dict[str, float] = {}
+    engineer_salary_fallbacks: dict[str, float] = {}
     for company_row in companies:
         company = dict(company_row)
         company_id = int(company["id"])
@@ -258,13 +311,24 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         decision["engineer_delta"] = engineer_delta
         decision["home"] = home
         decisions[company_id] = decision
-        worker_average_rows.append((workers_after, decision["worker_salary"], float(home["worker_initial_salary"])))
-        engineer_average_rows.append((engineers_after, decision["engineer_salary"], float(home["engineer_initial_salary"])))
+        home_city = str(home["city"])
+        worker_salary_fallbacks[home_city] = float(home["worker_initial_salary"])
+        engineer_salary_fallbacks[home_city] = float(home["engineer_initial_salary"])
+        worker_average_rows.setdefault(home_city, []).append(
+            (workers_after, decision["worker_salary"], float(home["worker_initial_salary"]))
+        )
+        engineer_average_rows.setdefault(home_city, []).append(
+            (engineers_after, decision["engineer_salary"], float(home["engineer_initial_salary"]))
+        )
 
-    fallback_worker = sum(float(decisions[int(row["id"])]["home"]["worker_initial_salary"]) for row in companies) / len(companies)
-    fallback_engineer = sum(float(decisions[int(row["id"])]["home"]["engineer_initial_salary"]) for row in companies) / len(companies)
-    average_worker_wage = weighted_salary_average(worker_average_rows, fallback_worker)
-    average_engineer_wage = weighted_salary_average(engineer_average_rows, fallback_engineer)
+    average_worker_wages = {
+        city: weighted_salary_average(rows, worker_salary_fallbacks[city])
+        for city, rows in worker_average_rows.items()
+    }
+    average_engineer_wages = {
+        city: weighted_salary_average(rows, engineer_salary_fallbacks[city])
+        for city, rows in engineer_average_rows.items()
+    }
     market_base_averages = {
         str(market["city"]): reference_market_average(conn, str(market["city"]), round_no, float(market["initial_avg_price"]))
         for market in markets
@@ -279,10 +343,10 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         previous_workers = employee_count(conn, company_id, "worker")
         previous_engineers = employee_count(conn, company_id, "engineer")
         previous_inexperienced_workers, previous_experienced_workers = _employee_breakdown(
-            conn, company_id, "worker", round_no
+            conn, company_id, "worker", round_no - 1
         )
         previous_inexperienced_engineers, previous_experienced_engineers = _employee_breakdown(
-            conn, company_id, "engineer", round_no
+            conn, company_id, "engineer", round_no - 1
         )
         actual_worker_delta = int(decision["worker_delta"])
         actual_engineer_delta = int(decision["engineer_delta"])
@@ -295,6 +359,24 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             conn.execute("INSERT INTO employee_cohorts(company_id,role,count,hire_round) VALUES(?,?,?,?)", (company_id, "engineer", actual_engineer_delta, round_no))
         elif actual_engineer_delta < 0:
             remove_employees(conn, company_id, "engineer", -actual_engineer_delta)
+
+        workers_after_decision = employee_count(conn, company_id, "worker")
+        engineers_after_decision = employee_count(conn, company_id, "engineer")
+        post_decision_inexperienced_workers, post_decision_experienced_workers = _employee_breakdown(
+            conn, company_id, "worker", round_no
+        )
+        post_decision_inexperienced_engineers, post_decision_experienced_engineers = _employee_breakdown(
+            conn, company_id, "engineer", round_no
+        )
+        home_city = str(home["city"])
+        average_worker_wage = average_worker_wages[home_city]
+        average_engineer_wage = average_engineer_wages[home_city]
+        worker_quits = proportional_quits(workers_after_decision, float(decision["worker_salary"]), average_worker_wage)
+        engineer_quits = proportional_quits(engineers_after_decision, float(decision["engineer_salary"]), average_engineer_wage)
+        if worker_quits:
+            remove_employees(conn, company_id, "worker", worker_quits)
+        if engineer_quits:
+            remove_employees(conn, company_id, "engineer", engineer_quits)
 
         workers = employee_count(conn, company_id, "worker")
         engineers = employee_count(conn, company_id, "engineer")
@@ -320,18 +402,22 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         added_engineers = max(0, actual_engineer_delta)
         laid_inexperienced_workers = max(
             0,
-            previous_inexperienced_workers - promoted_workers + added_workers - inexperienced_workers,
+            previous_inexperienced_workers - promoted_workers + added_workers - post_decision_inexperienced_workers,
         )
         laid_experienced_workers = max(
-            0, previous_experienced_workers + promoted_workers - experienced_workers
+            0, previous_experienced_workers + promoted_workers - post_decision_experienced_workers
         )
         laid_inexperienced_engineers = max(
             0,
-            previous_inexperienced_engineers - promoted_engineers + added_engineers - inexperienced_engineers,
+            previous_inexperienced_engineers - promoted_engineers + added_engineers - post_decision_inexperienced_engineers,
         )
         laid_experienced_engineers = max(
-            0, previous_experienced_engineers + promoted_engineers - experienced_engineers
+            0, previous_experienced_engineers + promoted_engineers - post_decision_experienced_engineers
         )
+        quitted_inexperienced_workers = max(0, post_decision_inexperienced_workers - inexperienced_workers)
+        quitted_experienced_workers = max(0, post_decision_experienced_workers - experienced_workers)
+        quitted_inexperienced_engineers = max(0, post_decision_inexperienced_engineers - inexperienced_engineers)
+        quitted_experienced_engineers = max(0, post_decision_experienced_engineers - experienced_engineers)
         worker_multiplier = min(float(decision["worker_salary"]) / max(average_worker_wage, 1.0), 1.10)
         engineer_multiplier = min(float(decision["engineer_salary"]) / max(average_engineer_wage, 1.0), 1.10)
         effective_workers = effective_employee_count(conn, company_id, "worker", round_no) * worker_multiplier
@@ -345,7 +431,10 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         debt = float(company["debt"])
         cash = max(0.0, float(company["cash"]))
         loan_base_net_assets = current_company_net_assets(conn, company)
-        loan_limit = available_loan_limit(loan_base_net_assets, loan_threshold, float(home.get("min_loan", 0.0)), float(home["max_loan"]))
+        loan_ceiling = loan_ceiling_for_round(round_no, home, global_max_loan)
+        loan_limit = available_loan_limit(
+            loan_base_net_assets, loan_threshold, float(home.get("min_loan", 0.0)), loan_ceiling
+        )
         requested_loan_change = float(decision["loan_change"])
         if requested_loan_change >= 0:
             requested_new_loan = requested_loan_change if requested_loan_change + 1e-9 >= float(home.get("min_loan", 0.0)) else 0.0
@@ -362,6 +451,8 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         cash, engineer_wage_cost = spend(cash, engineers * float(decision["engineer_salary"]) * 3)
         requested_layoff = max(-actual_worker_delta, 0) * float(decision["worker_salary"]) + max(-actual_engineer_delta, 0) * float(decision["engineer_salary"])
         cash, layoff_cost = spend(cash, requested_layoff)
+        requested_quit_penalty = worker_quits * float(decision["worker_salary"]) * 2 + engineer_quits * float(decision["engineer_salary"]) * 2
+        cash, quit_penalty = spend(cash, requested_quit_penalty)
         requested_training = max(actual_worker_delta, 0) * float(home["worker_training_cost"]) + max(actual_engineer_delta, 0) * float(home["engineer_training_cost"])
         cash, training_cost = spend(cash, requested_training)
 
@@ -457,6 +548,11 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "laid_experienced_workers": laid_experienced_workers,
             "laid_inexperienced_engineers": laid_inexperienced_engineers,
             "laid_experienced_engineers": laid_experienced_engineers,
+            "quitted_inexperienced_workers": quitted_inexperienced_workers,
+            "quitted_experienced_workers": quitted_experienced_workers,
+            "quitted_inexperienced_engineers": quitted_inexperienced_engineers,
+            "quitted_experienced_engineers": quitted_experienced_engineers,
+            "worker_quits": worker_quits, "engineer_quits": engineer_quits,
             "worker_delta": actual_worker_delta, "engineer_delta": actual_engineer_delta,
             "effective_workers": effective_workers, "effective_engineers": effective_engineers,
             "component_capacity": component_capacity, "engineer_product_capacity": engineer_product_capacity,
@@ -464,9 +560,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "average_worker_wage": average_worker_wage, "average_engineer_wage": average_engineer_wage,
             "produced": produced, "components": components, "available": old_products + produced, "old_products": old_products,
             "cash_pre_sales": cash, "debt_before_interest": debt, "loan_base_net_assets": loan_base_net_assets,
-            "loan_limit": loan_limit, "loan_change": actual_loan_change,
+            "loan_ceiling": loan_ceiling, "loan_limit": loan_limit, "loan_change": actual_loan_change,
             "worker_wage_cost": worker_wage_cost, "engineer_wage_cost": engineer_wage_cost, "wage_cost": worker_wage_cost + engineer_wage_cost,
-            "layoff_cost": layoff_cost, "training_cost": training_cost,
+            "layoff_cost": layoff_cost, "quit_penalty": quit_penalty, "training_cost": training_cost,
             "component_material_cost": component_material_cost, "product_material_cost": product_material_cost,
             "component_storage_cost": component_storage_cost, "product_storage_cost": product_storage_cost, "storage_cost": storage_cost,
             "component_storage_before": component_storage_before, "product_storage_before": product_storage_before,
@@ -497,7 +593,14 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 city_decision = state["city_decisions"][city]
                 if int(city_decision["agents_after"]) <= 0:
                     continue
-                entries.append({"company_id": company_id, "ma_index": state["ma_index"], "qi_index": state["qi_index"], "mi_investment": float(city_decision["marketing_investment"]), "price": float(city_decision["price"])})
+                entries.append({
+                    "company_id": company_id,
+                    "ma_index": state["ma_index"],
+                    "qi_index": state["qi_index"],
+                    "mi_investment": float(city_decision["marketing_investment"]),
+                    "price": float(city_decision["price"]),
+                    "agents": int(city_decision["agents_after"]),
+                })
             allocations = allocate_city_cpi(
                 entries,
                 market_size=size,
@@ -523,29 +626,45 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             for city, capacity in state["city_cpi_units"].items():
                 state["city_sales"][city] = capacity * factor
 
-        for _ in range(10):
-            remaining = {company_id: max(0.0, state["available"] - sum(state["city_sales"].values())) for company_id, state in states.items()}
+        # Secondary allocation is only the visible CPI capacity left unused by
+        # stock-constrained players. It can never create sales for zero-CPI
+        # players, and the redistributed units do not change the reported CPI.
+        secondary_pools = {
+            str(market["city"]): max(
+                0.0,
+                sum(state["city_cpi_units"][str(market["city"])] for state in states.values())
+                - sum(state["city_sales"][str(market["city"])] for state in states.values()),
+            )
+            for market in markets
+        }
+        for _ in range(max(1, len(states) + len(markets))):
+            remaining = {
+                company_id: max(0.0, state["available"] - sum(state["city_sales"].values()))
+                for company_id, state in states.items()
+            }
             moved = 0.0
             for market_row in markets:
-                market = dict(market_row)
-                city = str(market["city"])
-                size = market_size(market, round_no, growth)
-                gap = max(0.0, size - sum(state["city_sales"][city] for state in states.values()))
+                city = str(market_row["city"])
+                pool = secondary_pools[city]
                 candidates = []
                 for company_id, state in states.items():
-                    if remaining[company_id] <= 0.5 or int(state["city_decisions"][city]["agents_after"]) <= 0:
+                    visible_capacity = float(state["city_cpi_units"][city])
+                    if remaining[company_id] <= 1e-9 or visible_capacity <= 1e-9:
                         continue
-                    candidates.append((company_id, max(float(state["city_cpi_units"][city]), size * 0.0001)))
-                if gap <= 0.5 or not candidates:
+                    candidates.append((company_id, visible_capacity))
+                if pool <= 1e-9 or not candidates:
                     continue
                 score_sum = sum(score for _, score in candidates)
+                city_moved = 0.0
                 for company_id, score in candidates:
-                    addition = min(remaining[company_id], gap * score / score_sum)
+                    addition = min(remaining[company_id], pool * score / score_sum)
                     states[company_id]["city_sales"][city] += addition
                     states[company_id]["city_secondary"][city] += addition
                     remaining[company_id] -= addition
-                    moved += addition
-            if moved < 1.0:
+                    city_moved += addition
+                secondary_pools[city] = max(0.0, pool - city_moved)
+                moved += city_moved
+            if moved <= 1e-9:
                 break
 
         for state in states.values():
@@ -657,7 +776,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
 
         interest = max(0.0, float(state["debt_before_interest"])) * float(home["interest_rate"])
         debt = float(state["debt_before_interest"]) + interest
-        pre_sales_cost = state["wage_cost"] + state["layoff_cost"] + state["training_cost"] + state["component_material_cost"] + state["product_material_cost"] + state["storage_cost"] + state["agent_cost"] + state["marketing_total"] + state["quality"] + state["management"]
+        pre_sales_cost = state["wage_cost"] + state["layoff_cost"] + state["quit_penalty"] + state["training_cost"] + state["component_material_cost"] + state["product_material_cost"] + state["storage_cost"] + state["agent_cost"] + state["marketing_total"] + state["quality"] + state["management"]
         operating_cost = pre_sales_cost + research + total_report_cost + interest
         pre_tax_profit = revenue - operating_cost
         cash, tax = spend(cash, max(0.0, pre_tax_profit * tax_rate))
@@ -674,9 +793,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "key_metrics": {"total_assets": total_assets, "debt": debt, "net_assets": net_assets, "sales_revenue": revenue, "cost": total_cost, "net_profit": net_profit, "inventory_book_value": inventory_book_value},
             "finance": {
                 "round_begins": company["cash"], "starting_debt": company["debt"], "loan_base_net_assets": state["loan_base_net_assets"],
-                "loan_limit": state["loan_limit"], "loan_change": state["loan_change"],
+                "loan_ceiling": state["loan_ceiling"], "loan_limit": state["loan_limit"], "loan_change": state["loan_change"],
                 "worker_wages": state["worker_wage_cost"], "engineer_wages": state["engineer_wage_cost"], "wages": state["wage_cost"],
-                "layoff": state["layoff_cost"], "training": state["training_cost"],
+                "layoff": state["layoff_cost"], "quit_penalty": state["quit_penalty"], "training": state["training_cost"],
                 "component_material": state["component_material_cost"], "product_material": state["product_material_cost"],
                 "component_storage": state["component_storage_cost"], "product_storage": state["product_storage_cost"],
                 "materials": state["component_material_cost"] + state["product_material_cost"], "storage": state["storage_cost"],
@@ -690,10 +809,10 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "average_worker_salary": state["average_worker_wage"], "average_engineer_salary": state["average_engineer_wage"],
                 "worker_wage_multiplier": state["worker_multiplier"], "engineer_wage_multiplier": state["engineer_multiplier"],
                 "rows": [
-                    {"employee": "Inexperienced Workers", "previous": state["previous_inexperienced_workers"], "laid": state["laid_inexperienced_workers"], "quitted": 0, "added": max(0, state["worker_delta"]), "promoted": 0, "working": state["inexperienced_workers"], "salary": state["decision"]["worker_salary"], "average": state["average_worker_wage"]},
-                    {"employee": "Experienced Workers", "previous": state["previous_experienced_workers"], "laid": state["laid_experienced_workers"], "quitted": 0, "added": 0, "promoted": state["promoted_workers"], "working": state["experienced_workers"], "salary": state["decision"]["worker_salary"], "average": state["average_worker_wage"]},
-                    {"employee": "Inexperienced Engineers", "previous": state["previous_inexperienced_engineers"], "laid": state["laid_inexperienced_engineers"], "quitted": 0, "added": max(0, state["engineer_delta"]), "promoted": 0, "working": state["inexperienced_engineers"], "salary": state["decision"]["engineer_salary"], "average": state["average_engineer_wage"]},
-                    {"employee": "Experienced Engineers", "previous": state["previous_experienced_engineers"], "laid": state["laid_experienced_engineers"], "quitted": 0, "added": 0, "promoted": state["promoted_engineers"], "working": state["experienced_engineers"], "salary": state["decision"]["engineer_salary"], "average": state["average_engineer_wage"]},
+                    {"employee": "Inexperienced Workers", "previous": state["previous_inexperienced_workers"], "laid": state["laid_inexperienced_workers"], "quitted": state["quitted_inexperienced_workers"], "added": max(0, state["worker_delta"]), "promoted": 0, "working": state["inexperienced_workers"], "salary": state["decision"]["worker_salary"], "average": state["average_worker_wage"]},
+                    {"employee": "Experienced Workers", "previous": state["previous_experienced_workers"], "laid": state["laid_experienced_workers"], "quitted": state["quitted_experienced_workers"], "added": 0, "promoted": state["promoted_workers"], "working": state["experienced_workers"], "salary": state["decision"]["worker_salary"], "average": state["average_worker_wage"]},
+                    {"employee": "Inexperienced Engineers", "previous": state["previous_inexperienced_engineers"], "laid": state["laid_inexperienced_engineers"], "quitted": state["quitted_inexperienced_engineers"], "added": max(0, state["engineer_delta"]), "promoted": 0, "working": state["inexperienced_engineers"], "salary": state["decision"]["engineer_salary"], "average": state["average_engineer_wage"]},
+                    {"employee": "Experienced Engineers", "previous": state["previous_experienced_engineers"], "laid": state["laid_experienced_engineers"], "quitted": state["quitted_experienced_engineers"], "added": 0, "promoted": state["promoted_engineers"], "working": state["experienced_engineers"], "salary": state["decision"]["engineer_salary"], "average": state["average_engineer_wage"]},
                 ],
             },
             "production": {

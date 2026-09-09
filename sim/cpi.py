@@ -11,6 +11,11 @@ WELFARE_PART2_BASE = 3.5
 PRICE_CPI_TOTAL = 40.0
 
 
+def agent_mi_benefit(agent_count: int | float) -> float:
+    """Every sales agent increases the effectiveness of MI by 10%."""
+    return 1.0 + max(0.0, float(agent_count)) * 0.10
+
+
 def minimum_threshold(large_threshold: float) -> float:
     """Exact helper used by the supplied CPI generator: large / 5 / 100."""
     return large_threshold / 500.0 if large_threshold > 0 else 0.0
@@ -185,12 +190,18 @@ def allocate_city_cpi(
     qi_min = minimum_threshold(qi_large)
     ma_large = max(0.0, float(ma_large_threshold))
     ma_min = minimum_threshold(ma_large)
-    mi_large = qi_large * market_size * 0.20
-    mi_min = qi_min * market_size * 0.20
+    # The large-MI base is QI threshold × market size × 20% ÷ 1.5 ÷ 2.
+    # Player-specific thresholds are lower when the player has more agents;
+    # multiplying MI by the agent benefit before allocation is algebraically
+    # equivalent and keeps one common comparison scale for all players.
+    mi_large_base = qi_large * market_size * 0.20 / 1.5 / 2.0
+    mi_min_base = minimum_threshold(mi_large_base)
 
     qi_results = allocate_index_cpi(qi_min, qi_large, [float(e["qi_index"]) for e in entries], prices, average_price)
     ma_results = allocate_index_cpi(ma_min, ma_large, [float(e["ma_index"]) for e in entries], prices, average_price)
-    mi_results = allocate_index_cpi(mi_min, mi_large, [float(e["mi_investment"]) for e in entries], prices, average_price)
+    agent_benefits = [agent_mi_benefit(e.get("agents", 0)) for e in entries]
+    effective_mi = [float(entry["mi_investment"]) * agent_benefits[index] for index, entry in enumerate(entries)]
+    mi_results = allocate_index_cpi(mi_min_base, mi_large_base, effective_mi, prices, average_price)
 
     price_cpis = [0.0] * len(entries)
     eligible: list[tuple[int, float]] = []
@@ -225,8 +236,11 @@ def allocate_city_cpi(
                     "qi_large": qi_large,
                     "ma_min": ma_min,
                     "ma_large": ma_large,
-                    "mi_min": mi_min,
-                    "mi_large": mi_large,
+                    "mi_min": mi_min_base / agent_benefits[index],
+                    "mi_large": mi_large_base / agent_benefits[index],
+                    "mi_base_min": mi_min_base,
+                    "mi_base_large": mi_large_base,
+                    "mi_agent_benefit": agent_benefits[index],
                 },
                 "average_price": average_price,
                 "market_average_price": market_average_price,

@@ -373,7 +373,7 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
         company_id = int(company["id"])
         previous_result = one(
             conn,
-            "SELECT * FROM results WHERE company_id=? AND round_no<? ORDER BY round_no DESC LIMIT 1",
+            "SELECT * FROM results WHERE company_id=? AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
             (company_id, target_round),
         )
         previous_report: dict[str, Any] = {}
@@ -400,7 +400,7 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
         replayed: list[dict[str, Any]] = []
         for decision in all_rows(
             conn,
-            "SELECT round_no,worker_delta,engineer_delta FROM decisions WHERE company_id=? AND round_no<? "
+            "SELECT round_no,worker_delta,engineer_delta FROM decisions WHERE company_id=? AND round_no>=1 AND round_no<? "
             "AND round_no IN (SELECT round_no FROM results WHERE company_id=?) ORDER BY round_no",
             (company_id, target_round, company_id),
         ):
@@ -437,15 +437,8 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
     return {"companies": companies, "employee_cohorts": cohorts, "agents": agents}
 
 
-def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: int = 30) -> int:
-    """Undo the latest settlement and reopen that round for fresh submissions."""
-    latest = one(conn, "SELECT MAX(round_no) AS round_no FROM results")
-    if latest is None or latest["round_no"] is None:
-        raise ValueError("还没有已结算回合，无法回退。")
-    target_round = int(latest["round_no"])
-    snapshot_row = one(conn, "SELECT snapshot_json FROM round_snapshots WHERE round_no=?", (target_round,))
-    snapshot = json.loads(snapshot_row["snapshot_json"]) if snapshot_row else _reconstruct_pre_round_snapshot(conn, target_round)
-
+def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) -> None:
+    """Restore mutable team state without deleting historical reports."""
     conn.execute("DELETE FROM employee_cohorts")
     conn.execute("DELETE FROM agents")
     existing_company_ids = {int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies")}
@@ -489,6 +482,59 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
         ],
     )
 
+
+def start_competition(conn: sqlite3.Connection, duration_minutes: int, use_test_round: bool) -> int:
+    """Start either the optional -1 test round or official round one."""
+    waiting = one(conn, "SELECT * FROM rounds WHERE round_no=1 AND status='waiting'")
+    if waiting is None:
+        raise ValueError("比赛已经开始，不能再次选择测试轮。")
+    start = datetime.now(timezone.utc)
+    end = start + timedelta(minutes=max(1, int(duration_minutes)))
+    set_setting(conn, "test_round_enabled", int(bool(use_test_round)))
+    if use_test_round:
+        conn.execute("DELETE FROM rounds WHERE round_no=1")
+        conn.execute(
+            "INSERT INTO rounds(round_no,status,starts_at,ends_at,settled_at) VALUES(-1,'open',?,?,NULL)",
+            (start.isoformat(), end.isoformat()),
+        )
+        return -1
+    conn.execute(
+        "UPDATE rounds SET status='open',starts_at=?,ends_at=?,settled_at=NULL WHERE round_no=1",
+        (start.isoformat(), end.isoformat()),
+    )
+    return 1
+
+
+def prepare_first_round_after_test(conn: sqlite3.Connection, duration_minutes: int) -> int:
+    """Discard test-round state effects while retaining its decisions and reports."""
+    test_round = one(conn, "SELECT status FROM rounds WHERE round_no=-1")
+    if test_round is None or test_round["status"] != "settled":
+        raise ValueError("测试轮尚未结算。")
+    snapshot_row = one(conn, "SELECT snapshot_json FROM round_snapshots WHERE round_no=-1")
+    if snapshot_row is None:
+        raise ValueError("找不到测试轮赛前快照，无法安全开始第一轮。")
+    _restore_snapshot_state(conn, json.loads(snapshot_row["snapshot_json"]))
+    conn.execute("DELETE FROM rounds WHERE round_no>=1")
+    start = datetime.now(timezone.utc)
+    end = start + timedelta(minutes=max(1, int(duration_minutes)))
+    conn.execute(
+        "INSERT INTO rounds(round_no,status,starts_at,ends_at,settled_at) VALUES(1,'open',?,?,NULL)",
+        (start.isoformat(), end.isoformat()),
+    )
+    return 1
+
+
+def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: int = 30) -> int:
+    """Undo the latest settlement and reopen that round for fresh submissions."""
+    latest = one(conn, "SELECT MAX(round_no) AS round_no FROM results")
+    if latest is None or latest["round_no"] is None:
+        raise ValueError("还没有已结算回合，无法回退。")
+    target_round = int(latest["round_no"])
+    snapshot_row = one(conn, "SELECT snapshot_json FROM round_snapshots WHERE round_no=?", (target_round,))
+    snapshot = json.loads(snapshot_row["snapshot_json"]) if snapshot_row else _reconstruct_pre_round_snapshot(conn, target_round)
+
+    _restore_snapshot_state(conn, snapshot)
+
     conn.execute("DELETE FROM market_round_stats WHERE round_no>=?", (target_round,))
     conn.execute("DELETE FROM city_results WHERE round_no>=?", (target_round,))
     conn.execute("DELETE FROM results WHERE round_no>=?", (target_round,))
@@ -516,6 +562,7 @@ def reset_competition(conn: sqlite3.Connection) -> None:
             "product_inventory=0,component_storage_capacity=0,product_storage_capacity=0 WHERE id=?",
             (f"待命名-{company['code']}", initial_cash, company["id"]),
         )
+    set_setting(conn, "test_round_enabled", 0)
     conn.execute("INSERT INTO rounds(round_no,status) VALUES(1,'waiting')")
 
 

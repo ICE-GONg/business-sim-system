@@ -171,13 +171,22 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(sum(int(row["sold"]) for row in city_rows), 1)
 
     def test_finance_helpers_follow_kds_rules(self) -> None:
-        from sim.engine import available_loan_limit, spend, weighted_salary_average
+        from sim.engine import available_loan_limit, proportional_quits, redistribute_unused_cpi, spend, weighted_salary_average
 
         self.assertEqual(available_loan_limit(7_500_000, 15_000_000, 1_000_000, 6_000_000), 3_000_000)
         self.assertEqual(available_loan_limit(-1, 15_000_000, 1_000_000, 6_000_000), 1_000_000)
         self.assertEqual(available_loan_limit(50_000_000, 15_000_000, 0, 6_000_000), 6_000_000)
         self.assertEqual(weighted_salary_average([(10, 3900, 3300), (20, 3000, 3300)], 3300), 3300)
+        self.assertEqual(proportional_quits(100, 2_300, 3_300), 30)
         self.assertEqual(spend(400_000, 600_000), (0, 400_000))
+        secondary = redistribute_unused_cpi(
+            {1: 22, 2: 18, 3: 0},
+            {1: 8, 2: 18, 3: 0},
+            {1: 0, 2: 50, 3: 50},
+        )
+        self.assertAlmostEqual(secondary[2], 14)
+        self.assertEqual(secondary[1], 0)
+        self.assertEqual(secondary[3], 0)
 
     def test_loan_limit_is_a_per_round_new_loan_amount(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -205,6 +214,122 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertAlmostEqual(first["finance"]["loan_limit"], 5_200_000)
                 self.assertAlmostEqual(first["finance"]["loan_change"], 5_000_000)
                 self.assertAlmostEqual(first["key_metrics"]["debt"], 7_210_000)
+
+                conn.execute("INSERT INTO rounds(round_no,status) VALUES(2,'open')")
+                for company in companies:
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,loan_change,worker_salary,engineer_salary,submitted_at) "
+                        "VALUES(?,2,20000000,3300,6400,?)",
+                        (company["id"], db.now_iso()),
+                    )
+                settle_round(conn, 2)
+                second = json.loads(db.one(
+                    conn,
+                    "SELECT report_json FROM results WHERE company_id=? AND round_no=2",
+                    (companies[0]["id"],),
+                )["report_json"])
+                self.assertAlmostEqual(second["finance"]["loan_ceiling"], 10_000_000)
+                self.assertAlmostEqual(
+                    second["finance"]["loan_limit"],
+                    min(10_000_000, first["key_metrics"]["net_assets"] / 15_000_000 * 10_000_000),
+                )
+
+    def test_salary_average_and_quits_are_independent_per_home_market(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "salary-home.db")
+            from sim import db
+            from sim.engine import settle_round
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+                homes = ["广州", "广州", "大连", "大连"]
+                worker_salaries = [2_300, 4_300, 2_300, 2_300]
+                for company, home, worker_salary in zip(companies, homes, worker_salaries):
+                    conn.execute(
+                        "UPDATE companies SET home_city=?,setup_submitted_at=? WHERE id=?",
+                        (home, db.now_iso(), company["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO employee_cohorts(company_id,role,count,hire_round) VALUES(?,'worker',100,0)",
+                        (company["id"],),
+                    )
+                    engineer_salary = 6_400 if home == "广州" else 4_400
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,submitted_at) VALUES(?,1,?,?,?)",
+                        (company["id"], worker_salary, engineer_salary, db.now_iso()),
+                    )
+                settle_round(conn, 1)
+                guangzhou = json.loads(db.one(conn, "SELECT report_json FROM results WHERE company_id=?", (companies[0]["id"],))["report_json"])
+                dalian = json.loads(db.one(conn, "SELECT report_json FROM results WHERE company_id=?", (companies[2]["id"],))["report_json"])
+                self.assertAlmostEqual(guangzhou["human_resources"]["average_worker_salary"], 3_300)
+                self.assertAlmostEqual(dalian["human_resources"]["average_worker_salary"], 2_300)
+                self.assertEqual(guangzhou["human_resources"]["workers"], 70)
+                self.assertEqual(sum(row["quitted"] for row in guangzhou["human_resources"]["rows"]), 30)
+                self.assertEqual(guangzhou["finance"]["quit_penalty"], 138_000)
+                self.assertEqual(dalian["human_resources"]["workers"], 100)
+
+    def test_optional_test_round_restores_state_before_official_round(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "test-round.db")
+            from sim import db
+            from sim.engine import current_company_net_assets, settle_round
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                for company in companies:
+                    conn.execute(
+                        "UPDATE companies SET home_city='广州',setup_submitted_at=? WHERE id=?",
+                        (db.now_iso(), company["id"]),
+                    )
+                    conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company["id"],))
+                self.assertEqual(db.start_competition(conn, 5, True), -1)
+                for company in companies:
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_salary,submitted_at) "
+                        "VALUES(?,-1,1000000,2,3300,6400,?)",
+                        (company["id"], db.now_iso()),
+                    )
+                    conn.execute(
+                        "INSERT INTO city_decisions(company_id,round_no,city,agent_delta,price) VALUES(?,-1,'广州',1,9800)",
+                        (company["id"],),
+                    )
+                settle_round(conn, -1)
+                first_id = int(companies[0]["id"])
+                self.assertEqual(db.employee_count(conn, first_id, "worker"), 2)
+                self.assertEqual(db.one(conn, "SELECT count FROM agents WHERE company_id=? AND city='广州'", (first_id,))["count"], 2)
+
+                self.assertEqual(db.prepare_first_round_after_test(conn, 30), 1)
+                restored = db.one(conn, "SELECT * FROM companies WHERE id=?", (first_id,))
+                self.assertEqual(restored["cash"], 15_000_000)
+                self.assertEqual(restored["debt"], 0)
+                self.assertEqual(db.employee_count(conn, first_id, "worker"), 0)
+                self.assertEqual(db.one(conn, "SELECT count FROM agents WHERE company_id=? AND city='广州'", (first_id,))["count"], 1)
+                self.assertIsNotNone(db.one(conn, "SELECT * FROM results WHERE company_id=? AND round_no=-1", (first_id,)))
+                self.assertEqual(db.one(conn, "SELECT status FROM rounds WHERE round_no=1")["status"], "open")
+                self.assertEqual(current_company_net_assets(conn, restored), 15_000_000)
+
+    def test_kds_png_contains_live_market_costs_at_high_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "kds.db")
+            from PIL import Image
+            from sim import db
+            from sim.kds_image import build_kds_png
+            from io import BytesIO
+
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                conn.execute("UPDATE market_config SET transport_cost=88,worker_training_cost=500,engineer_training_cost=900 WHERE city='广州'")
+                image_bytes = build_kds_png(db.settings_dict(conn), db.all_rows(conn, "SELECT * FROM market_config ORDER BY city"))
+            self.assertTrue(image_bytes.startswith(b"\x89PNG"))
+            image = Image.open(BytesIO(image_bytes))
+            self.assertEqual(image.width, 2400)
+            self.assertGreater(image.height, 2000)
 
     def test_patent_reduces_material_cost_starting_next_round(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

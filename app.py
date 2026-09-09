@@ -36,7 +36,8 @@ if (
     not hasattr(_db_module, "delete_city")
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 4
+    or not hasattr(_db_module, "prepare_first_round_after_test")
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 5
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -54,17 +55,20 @@ from sim.db import (
     hash_password,
     now_iso,
     one,
+    prepare_first_round_after_test,
     reset_competition,
     rollback_latest_settled_round,
     restore_database_bytes,
     set_setting,
     settings_dict,
     setup_status,
+    start_competition,
     submission_status,
     verify_password,
 )
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
-from sim.engine import available_loan_limit, current_company_net_assets, market_size, settle_round, weighted_market_average
+from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
+from sim.kds_image import build_kds_png
 from sim.report_pdf import build_round_report_pdf
 
 
@@ -167,9 +171,9 @@ def hero(title: str, subtitle: str) -> None:
 
 def rank_rows(conn: sqlite3.Connection, round_no: int | None = None) -> list[dict[str, Any]]:
     if round_no is None:
-        latest = one(conn, "SELECT MAX(round_no) AS n FROM results")
+        latest = one(conn, "SELECT MAX(round_no) AS n FROM results WHERE round_no>=1")
         round_no = int(latest["n"] or 0) if latest else 0
-    if not round_no:
+    if round_no == 0:
         return []
     rows = all_rows(
         conn,
@@ -281,7 +285,8 @@ def round_banner(round_row: sqlite3.Row | None) -> None:
         st.info("管理员尚未创建回合。")
         return
     cols = st.columns(3)
-    cols[0].metric("当前轮次", f"第 {round_row['round_no']} 轮")
+    round_label = "测试轮 -1" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
+    cols[0].metric("当前轮次", round_label)
     cols[1].metric("状态", STATUS_LABELS.get(round_row["status"], round_row["status"]))
     end = parse_time(round_row["ends_at"])
     if end and round_row["status"] == "open":
@@ -304,7 +309,7 @@ def player_navigation(company: sqlite3.Row) -> str:
         else:
             time_value = STATUS_LABELS.get(round_row["status"], str(round_row["status"]))
             time_label = "回合状态"
-        round_value = f"第 {round_row['round_no']} 轮"
+        round_value = "测试轮 -1" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
     else:
         round_value, time_label, time_value = "未开始", "回合状态", "等待管理员"
     st.markdown(
@@ -346,7 +351,7 @@ def render_player_overview(company: sqlite3.Row) -> None:
     hero(f"你好，{company['name']}", "以 Net Assets（总资产减负债）为核心，平衡生产、价格、投资和库存风险。")
     with connect() as conn:
         round_row = current_round(conn)
-        latest = one(conn, "SELECT * FROM results WHERE company_id=? ORDER BY round_no DESC LIMIT 1", (company["id"],))
+        latest = one(conn, "SELECT * FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no DESC LIMIT 1", (company["id"],))
         ranking = rank_rows(conn, int(latest["round_no"]) if latest else 0)
         my_rank = next((row["rank"] for row in ranking if row["id"] == company["id"]), None)
         workers = employee_count(conn, company["id"], "worker")
@@ -354,7 +359,7 @@ def render_player_overview(company: sqlite3.Row) -> None:
         ready = setup_status(conn)
         wealth_rows = all_rows(
             conn,
-            "SELECT round_no,net_assets FROM results WHERE company_id=? ORDER BY round_no",
+            "SELECT round_no,net_assets FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no",
             (company["id"],),
         )
     cols = st.columns(4)
@@ -390,7 +395,7 @@ def render_player_overview(company: sqlite3.Row) -> None:
 
 def decision_helper(conn: sqlite3.Connection, company: sqlite3.Row, round_no: int) -> dict[str, Any]:
     home = one(conn, "SELECT * FROM market_config WHERE city=?", (company["home_city"],))
-    previous_result = one(conn, "SELECT report_json FROM results WHERE company_id=? AND round_no<? ORDER BY round_no DESC LIMIT 1", (company["id"], round_no))
+    previous_result = one(conn, "SELECT report_json FROM results WHERE company_id=? AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1", (company["id"], round_no))
     previous_report = json.loads(previous_result["report_json"]) if previous_result else {}
     previous_hr = previous_report.get("human_resources", {})
     avg_worker = float(previous_hr.get("average_worker_salary", home["worker_initial_salary"]))
@@ -410,7 +415,7 @@ def previous_salary(conn: sqlite3.Connection, company: sqlite3.Row, round_no: in
     row = one(
         conn,
         f"SELECT d.{field} AS salary FROM decisions d JOIN results r ON r.company_id=d.company_id AND r.round_no=d.round_no "
-        "WHERE d.company_id=? AND d.round_no<? ORDER BY d.round_no DESC LIMIT 1",
+        "WHERE d.company_id=? AND d.round_no>=1 AND d.round_no<? ORDER BY d.round_no DESC LIMIT 1",
         (company["id"], round_no),
     )
     return float(row["salary"]) if row else float(fallback)
@@ -520,11 +525,12 @@ def render_player_decision(company: sqlite3.Row) -> None:
         worker_salary_low, worker_salary_high = salary_bounds(settings, previous_worker_salary)
         engineer_salary_low, engineer_salary_high = salary_bounds(settings, previous_engineer_salary)
         loan_base_net_assets = current_company_net_assets(conn, company)
+        loan_ceiling = loan_ceiling_for_round(round_no, home, float(settings["global_max_loan"]))
         loan_limit = available_loan_limit(
             loan_base_net_assets,
             float(settings["loan_asset_threshold"]),
             float(home["min_loan"]),
-            float(home["max_loan"]),
+            loan_ceiling,
         )
         minimum_new_loan = float(home["min_loan"])
 
@@ -549,7 +555,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
         with st.expander("💰 银行贷款", expanded=False):
             st.markdown(
                 f'<div class="section-note">计算净资产 {money(loan_base_net_assets)} ÷ 阈值 {money(settings["loan_asset_threshold"])} '
-                f'× 最高贷款 {money(home["max_loan"])}；本轮可新增至多 {money(loan_limit)}，新增贷款最少 {money(minimum_new_loan)}。负数为还款。</div>',
+                f'× 本轮封顶基数 {money(loan_ceiling)}；本轮可新增至多 {money(loan_limit)}，新增贷款最少 {money(minimum_new_loan)}。负数为还款。</div>',
                 unsafe_allow_html=True,
             )
             loan_change = st.number_input(
@@ -792,6 +798,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         ("工人工资 / Workers salary", -float(finance.get("worker_wages", finance.get("wages", 0.0))), 0.0),
         ("工程师工资 / Engineers salary", -float(finance.get("engineer_wages", 0.0)), 0.0),
         ("裁员费用 / Layoff", -float(finance.get("layoff", 0.0)), 0.0),
+        ("低工资离职补偿 / Quit compensation", -float(finance.get("quit_penalty", 0.0)), 0.0),
         ("培训费用 / Training", -float(finance.get("training", 0.0)), 0.0),
         ("零件材料 / Components material", -float(finance.get("component_material", finance.get("materials", 0.0))), 0.0),
         ("零件仓储 / Components storage", -float(finance.get("component_storage", finance.get("storage", 0.0))), 0.0),
@@ -821,7 +828,27 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         {"岗位": "工程师 Engineers", "期初": hr.get("previous_engineers", max(0, int(hr["engineers"]) - int(hr.get("engineer_delta", 0)))), "增减": hr.get("engineer_delta", 0), "当前": hr["engineers"], "有效人数": hr["effective_engineers"], "月薪": hr["engineer_salary"], "平均工资": hr.get("average_engineer_salary", 0), "工资倍率": hr["engineer_wage_multiplier"]},
     ])
     st.dataframe(hr_frame, hide_index=True, use_container_width=True, column_config={"月薪": st.column_config.NumberColumn(format="¥ %.0f"), "平均工资": st.column_config.NumberColumn(format="¥ %.0f"), "工资倍率": st.column_config.NumberColumn(format="%.2f")})
-    st.markdown('<div class="report-note">低工资会降低有效人数；新员工收取培训费，裁员按一个月工资支付补偿。</div>', unsafe_allow_html=True)
+    if hr.get("rows"):
+        employee_labels = {
+            "Inexperienced Workers": "非熟练工人",
+            "Experienced Workers": "熟练工人",
+            "Inexperienced Engineers": "非熟练工程师",
+            "Experienced Engineers": "熟练工程师",
+        }
+        detail_rows = pd.DataFrame([
+            {
+                "员工类别": employee_labels.get(item.get("employee", ""), item.get("employee", "")),
+                "期初": item.get("previous", 0),
+                "主动裁员": item.get("laid", 0),
+                "低工资离职": item.get("quitted", 0),
+                "新增": item.get("added", 0),
+                "晋升熟练": item.get("promoted", 0),
+                "期末在岗": item.get("working", 0),
+            }
+            for item in hr["rows"]
+        ])
+        st.dataframe(detail_rows, hide_index=True, use_container_width=True)
+    st.markdown('<div class="report-note">工资低于本主场平均值时员工会按比例离职，并按两个月本轮工资补偿；新员工收取培训费，主动裁员按一个月工资补偿。</div>', unsafe_allow_html=True)
 
     production = report["production"]
     st.markdown('<div class="report-title">管理与生产 Management / Production</div>', unsafe_allow_html=True)
@@ -925,7 +952,8 @@ def render_wealth(company: sqlite3.Row | None, admin: bool = False) -> None:
     with connect() as conn:
         rows = all_rows(
             conn,
-            "SELECT c.id,c.code,c.name,r.round_no,r.net_assets FROM results r JOIN companies c ON c.id=r.company_id ORDER BY r.round_no,c.id",
+            "SELECT c.id,c.code,c.name,r.round_no,r.net_assets FROM results r JOIN companies c ON c.id=r.company_id "
+            "WHERE r.round_no>=1 ORDER BY r.round_no,c.id",
         )
         companies = all_rows(conn, "SELECT id,code,name FROM companies ORDER BY id")
         initial_cash = float(get_setting(conn, "initial_cash", 6_500_000.0))
@@ -937,19 +965,20 @@ def render_wealth(company: sqlite3.Row | None, admin: bool = False) -> None:
     records.extend({"队伍": f"{item['code']} · {item['name']}", "轮次": 0, "净资产": initial_cash} for item in companies if int(item["id"]) in present_ids)
     frame = pd.DataFrame(records)
     max_round = int(frame["轮次"].max())
+    latest = frame.sort_values("轮次").groupby("队伍", as_index=False).tail(1).sort_values("净资产", ascending=False)
+    ranking_order = latest["队伍"].tolist()
     chart = (
         alt.Chart(frame)
         .mark_line(point=alt.OverlayMarkDef(size=58), strokeWidth=2.2)
         .encode(
             x=alt.X("轮次:Q", title="Round", scale=alt.Scale(domain=[0, max_round], nice=False), axis=alt.Axis(values=list(range(0, max_round + 1)), tickMinStep=1)),
             y=alt.Y("净资产:Q", title="Net Assets (RMB)", scale=alt.Scale(zero=False), axis=alt.Axis(format=",")),
-            color=alt.Color("队伍:N", title=None, legend=alt.Legend(orient="right")),
+            color=alt.Color("队伍:N", title=None, sort=ranking_order, legend=alt.Legend(orient="right")),
             tooltip=[alt.Tooltip("队伍:N"), alt.Tooltip("轮次:Q", format=".0f"), alt.Tooltip("净资产:Q", format=",.0f")],
         )
         .properties(height=520, title="Chart for Simulation")
     )
     st.altair_chart(chart, use_container_width=True)
-    latest = frame.sort_values("轮次").groupby("队伍", as_index=False).tail(1).sort_values("净资产", ascending=False)
     st.dataframe(latest[["队伍", "轮次", "净资产"]], hide_index=True, use_container_width=True, column_config={"净资产": st.column_config.NumberColumn(format="¥ %.0f")})
 
 
@@ -962,13 +991,15 @@ def render_player_kds(company: sqlite3.Row) -> None:
         f"""
         - 每轮工时：`504`
         - 工人 : 工程师 = `A × B × E : C × D`
-        - 平均工资：`[Σ(对应岗位人数 × 玩家工资) + Σ(对应岗位人数 × 主场 KDS 初始工资 × 2)] ÷ (岗位总人数 × 3)`
-        - 工资产能倍率：`min(本队工资 ÷ 本轮平均工资, 1.1)`；每轮工资涨跌不超过 KDS 限额。
-        - 贷款总额度：`净资产 ÷ 贷款阈值 × 主场最高贷款`，并受最低/最高贷款约束；利息计入负债。
+        - 平均工资：每个主场独立计算，`[Σ(对应岗位人数 × 玩家工资) + Σ(对应岗位人数 × 主场 KDS 初始工资 × 2)] ÷ (岗位总人数 × 3)`。
+        - 工资产能倍率：`min(本队工资 ÷ 本主场平均工资, 1.1)`；低于平均工资时员工按比例离职并补偿两个月工资；每轮工资涨跌不超过 KDS 限额。
+        - 贷款总额度：第一轮使用主场贷款上限；第二轮起为 `净资产 ÷ 贷款阈值 × 全局最高贷款`，达到全局上限即封顶；利息计入负债。
         - MA 指数：`MA 投资 ÷ (工人 + 工程师)`
         - QI 指数：`QI 投资 ÷ (旧产品 × 1.2 + 新产品)`
         - QI 大量 CPI 门槛：`城市最高价 ÷ 50`；超过门槛后进入第二层分配，QI 完整分配池合计 `20 CPI`。
+        - MI 大量 CPI 门槛：`QI 大量门槛 × 市场大小 × 20% ÷ Agent 效益 ÷ 1.5 ÷ 2`；Agent 效益为 `1 + Agent 数 × 10%`。
         - CPI：按城市独立执行赠品、第一层、第二层、福利 1/2；价格差使用 `{int(settings['cpi_price_power'])}` 次方。
+        - 二次分配：只把缺货玩家未用完的 CPI 份额分给该城市原本 CPI 大于 0 且仍有库存的玩家；报表 CPI 不增加，因此市场份额可高于 CPI。
         - 现金不会低于 0；投资按 `MI → QI → MA` 扣除，不足时只投入剩余现金。
         - 专利在中奖后的下一轮开始降低材料成本；市场报告与专利投入都在销售收入到账后扣除。
         """
@@ -977,6 +1008,10 @@ def render_player_kds(company: sqlite3.Row) -> None:
     st.dataframe(setting_frame, hide_index=True, use_container_width=True)
     market_frame = pd.DataFrame([dict(row) for row in markets]).rename(columns=MARKET_COLUMNS)
     st.dataframe(market_frame, hide_index=True, use_container_width=True)
+    kds_png = build_kds_png(settings, markets)
+    st.subheader("官方样式 KDS")
+    st.image(kds_png, use_container_width=True)
+    st.download_button("下载高清 KDS 图片", kds_png, file_name="Key_Data_Sheet.png", mime="image/png", use_container_width=True)
 
 
 def render_admin_overview() -> None:
@@ -1179,12 +1214,15 @@ def render_admin_decisions() -> None:
     engineer_low, engineer_high = salary_bounds(settings, previous_engineer_salary)
     with connect() as conn:
         loan_base_net_assets = current_company_net_assets(conn, company)
-    loan_limit = available_loan_limit(loan_base_net_assets, float(settings["loan_asset_threshold"]), float(home["min_loan"]), float(home["max_loan"]))
+    loan_ceiling = loan_ceiling_for_round(round_no, home, float(settings["global_max_loan"]))
+    loan_limit = available_loan_limit(
+        loan_base_net_assets, float(settings["loan_asset_threshold"]), float(home["min_loan"]), loan_ceiling
+    )
     with st.form(f"admin_decision_{round_no}_{company['id']}"):
         with st.expander("💰 银行贷款", expanded=False):
             st.caption(
                 f"计算净资产 {money(loan_base_net_assets)}；本轮最高新增 {money(loan_limit)}；"
-                f"新增贷款最少 {money(home['min_loan'])}。"
+                f"新增贷款最少 {money(home['min_loan'])}；本轮公式封顶基数 {money(loan_ceiling)}。"
             )
             loan_change = st.number_input("贷款变化", min_value=-float(company["debt"]), max_value=max(0.0, loan_limit), value=min(max(float(decision["loan_change"]), -float(company["debt"])), max(0.0, loan_limit)), step=10_000.0, disabled=not editable)
         with st.expander("👥 人力资源", expanded=True):
@@ -1254,7 +1292,7 @@ def render_admin_kds() -> None:
     competition_started = bool(started_row and int(started_row["n"]) > 0)
     unlocked = not competition_started or bool(st.session_state.get("admin_kds_unlocked"))
     if competition_started and not unlocked:
-        st.warning("比赛已进入第一轮，KDS 已锁定。输入 UNLOCK KDS 后才可编辑，修改只影响尚未结算的回合。")
+        st.warning("比赛已经开始，KDS 已锁定。输入 UNLOCK KDS 后才可编辑，修改只影响尚未结算的回合。")
         unlock_text = st.text_input("解锁确认", placeholder="UNLOCK KDS", type="password")
         if st.button("解锁 KDS 编辑", disabled=unlock_text != "UNLOCK KDS"):
             st.session_state["admin_kds_unlocked"] = True
@@ -1265,6 +1303,17 @@ def render_admin_kds() -> None:
             st.session_state.pop("admin_kds_unlocked", None)
             st.rerun()
         note_col.info("KDS 当前已临时解锁；退出登录或点击“重新锁定”后恢复锁定。")
+    kds_png = build_kds_png(settings, markets)
+    with st.expander("KDS 官方图片预览与下载", expanded=True):
+        st.image(kds_png, use_container_width=True)
+        st.download_button(
+            "下载高清 KDS 图片",
+            kds_png,
+            file_name="Key_Data_Sheet.png",
+            mime="image/png",
+            use_container_width=True,
+            key="admin_kds_download",
+        )
     with st.form("global_kds"):
         values: dict[str, Any] = {}
         items = [key for key in GLOBAL_SETTING_LABELS if key in settings]
@@ -1284,6 +1333,8 @@ def render_admin_kds() -> None:
             st.error("比赛总轮数必须至少为 1。")
         elif float(values["loan_asset_threshold"]) <= 0:
             st.error("贷款净资产阈值必须大于 0，贷款公式才能生效。")
+        elif float(values["global_max_loan"]) < 0:
+            st.error("第二轮起全局最高贷款不能为负数。")
         else:
             with connect() as conn:
                 for key, value in values.items():
@@ -1371,6 +1422,7 @@ def render_admin_rounds() -> None:
         round_row = current_round(conn)
         total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
         default_minutes = max(1, get_setting(conn, "round_duration_minutes", 30, int))
+        default_test_round = bool(get_setting(conn, "test_round_enabled", 0, int))
         setup = setup_status(conn)
         submission = submission_status(conn, int(round_row["round_no"])) if round_row and round_row["status"] in ("open", "paused") else None
         decisions = all_rows(
@@ -1389,7 +1441,8 @@ def render_admin_rounds() -> None:
         value=max(total_rounds, current_round_no),
         step=1,
     )
-    settings_cols[1].metric("比赛进度", f"{current_round_no}/{total_rounds}")
+    progress_text = "测试轮" if current_round_no < 0 else f"{current_round_no}/{total_rounds}"
+    settings_cols[1].metric("比赛进度", progress_text)
     if settings_cols[2].button("保存总轮数", use_container_width=True):
         with connect() as conn:
             set_setting(conn, "total_rounds", int(selected_total_rounds))
@@ -1400,12 +1453,18 @@ def render_admin_rounds() -> None:
         st.write(f"本轮提交：{submission['submitted']}/{submission['total']}")
 
     if round_row and round_row["status"] == "waiting":
-        minutes = st.number_input("第一轮时长（分钟）", min_value=1, value=default_minutes, step=1)
-        if st.button("开始第一轮", type="primary", disabled=not bool(setup["all_ready"])):
-            start = datetime.now(timezone.utc)
+        use_test_round = st.checkbox(
+            "开始正式比赛前先进行 -1 测试轮",
+            value=default_test_round,
+            help="测试轮会正常结算并生成报表；结束后系统恢复赛前现金、员工、库存、专利和 Agent，再开启正式第一轮。",
+        )
+        duration_label = "测试轮时长（分钟）" if use_test_round else "第一轮时长（分钟）"
+        minutes = st.number_input(duration_label, min_value=1, value=default_minutes, step=1)
+        start_label = "开始 -1 测试轮" if use_test_round else "开始第一轮"
+        if st.button(start_label, type="primary", disabled=not bool(setup["all_ready"])):
             with connect() as conn:
-                conn.execute("UPDATE rounds SET status='open',starts_at=?,ends_at=? WHERE round_no=?", (start.isoformat(), (start + timedelta(minutes=int(minutes))).isoformat(), round_row["round_no"]))
-            flash("success", "第一轮已开始。")
+                started_round = start_competition(conn, int(minutes), use_test_round)
+            flash("success", "测试轮已开始。" if started_round < 0 else "第一轮已开始。")
             st.rerun()
     elif round_row and round_row["status"] in ("open", "paused"):
         cols = st.columns(4)
@@ -1430,13 +1489,25 @@ def render_admin_rounds() -> None:
             try:
                 with connect() as conn:
                     settle_round(conn, int(round_row["round_no"]))
-                flash("success", f"第 {round_row['round_no']} 轮结算完成。")
+                completed_label = "测试轮" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
+                flash("success", f"{completed_label}结算完成。")
                 st.rerun()
             except Exception:
                 LOGGER.exception("Round settlement failed")
                 st.error("结算失败，请在部署后台日志中查看详细原因。")
     elif round_row and round_row["status"] == "settled":
-        if int(round_row["round_no"]) >= total_rounds:
+        if int(round_row["round_no"]) < 0:
+            st.success("-1 测试轮已经结束。测试报表会保留，但测试轮造成的现金、贷款、库存、专利、员工和 Agent 变化不会带入正式比赛。")
+            minutes = st.number_input("正式第一轮时长（分钟）", min_value=1, value=default_minutes, step=1)
+            if st.button("恢复赛前状态并开始第一轮", type="primary"):
+                try:
+                    with connect() as conn:
+                        prepare_first_round_after_test(conn, int(minutes))
+                    flash("success", "赛前状态已恢复，正式第一轮已开始。")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+        elif int(round_row["round_no"]) >= total_rounds:
             st.success(f"全部 {total_rounds} 轮已经结束。")
         else:
             minutes = st.number_input("下一轮时长（分钟）", min_value=1, value=default_minutes, step=1)

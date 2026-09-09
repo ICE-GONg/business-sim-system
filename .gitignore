@@ -7,3 +7,4 @@ data/*.db-shm
 data/*.db-wal
 tmp/
 output/pdf/
+output/kds/
