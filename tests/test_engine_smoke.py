@@ -94,6 +94,40 @@ class SettlementSmokeTest(unittest.TestCase):
         self.assertAlmostEqual(average, 102.0)
         self.assertEqual(weighted_market_average(100, 1_000, []), 100)
 
+    def test_one_product_split_across_positive_cpi_markets_is_not_lost(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "whole-unit-sales.db")
+            from sim import db
+            from sim.engine import allocate_integer_sales, settle_round
+
+            self.assertEqual(allocate_integer_sales({"南京": 0.7, "无锡": 0.3}, 1), {"南京": 1, "无锡": 0})
+            db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
+            db.init_db()
+            with db.connect() as conn:
+                companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+                for index, company in enumerate(companies):
+                    conn.execute(
+                        "UPDATE companies SET home_city='广州',setup_submitted_at=?,product_inventory=? WHERE id=?",
+                        (db.now_iso(), 1 if index == 0 else 0, company["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,submitted_at) VALUES(?,1,3300,6400,?)",
+                        (company["id"], db.now_iso()),
+                    )
+                first_id = int(companies[0]["id"])
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'南京',1)", (first_id,))
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'无锡',1)", (first_id,))
+
+                settle_round(conn, 1)
+
+                result = db.one(conn, "SELECT sold,inventory FROM results WHERE company_id=? AND round_no=1", (first_id,))
+                self.assertEqual(result["sold"], 1)
+                self.assertEqual(result["inventory"], 0)
+                city_rows = db.all_rows(conn, "SELECT cpi,sold FROM city_results WHERE company_id=? AND round_no=1", (first_id,))
+                self.assertTrue(all(float(row["cpi"]) > 0 for row in city_rows))
+                self.assertEqual(sum(int(row["sold"]) for row in city_rows), 1)
+
     def test_finance_helpers_follow_kds_rules(self) -> None:
         from sim.engine import available_loan_limit, spend, weighted_salary_average
 

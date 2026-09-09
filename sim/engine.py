@@ -99,6 +99,35 @@ def spend(available_cash: float, requested: float) -> tuple[float, float]:
     return max(0.0, float(available_cash) - paid), paid
 
 
+def allocate_integer_sales(city_sales: dict[str, float], available_units: int | float) -> dict[str, int]:
+    """Convert fractional city allocations to units without losing inventory.
+
+    CPI allocation is continuous, but products are whole units. Flooring every
+    city separately can turn one product split across two markets into zero
+    sales in both. The largest-remainder method rounds the company total once,
+    then assigns the remaining units to the strongest fractional allocations.
+    """
+    available = max(0, int(available_units))
+    targets = {city: max(0.0, float(value)) for city, value in city_sales.items()}
+    continuous_total = sum(targets.values())
+    target_total = min(available, max(0, math.floor(continuous_total + 0.5 + 1e-9)))
+    units = {city: max(0, math.floor(value + 1e-9)) for city, value in targets.items()}
+    assigned = sum(units.values())
+    remaining = max(0, target_total - assigned)
+    ranked = sorted(
+        targets,
+        key=lambda city: (-(targets[city] - math.floor(targets[city])), city),
+    )
+    for city in ranked:
+        if remaining <= 0:
+            break
+        if targets[city] <= 0:
+            continue
+        units[city] += 1
+        remaining -= 1
+    return units
+
+
 def _previous_salary(conn: sqlite3.Connection, company_id: int, round_no: int, field: str, fallback: float) -> float:
     if field not in {"worker_salary", "engineer_salary"}:
         raise ValueError("Invalid salary field")
@@ -405,12 +434,15 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         if moved < 1.0:
             break
 
+    for state in states.values():
+        state["city_sales_units"] = allocate_integer_sales(state["city_sales"], state["available"])
+
     market_round_stats: dict[str, dict[str, float]] = {}
     for market_row in markets:
         market = dict(market_row)
         city = str(market["city"])
         size = market_size(market, round_no, growth)
-        pairs = [(float(state["city_decisions"][city]["price"]), float(max(0, math.floor(state["city_sales"][city])))) for state in states.values()]
+        pairs = [(float(state["city_decisions"][city]["price"]), float(state["city_sales_units"][city])) for state in states.values()]
         total_volume = sum(quantity for _, quantity in pairs)
         base_average = market_base_averages[city]
         average_price = weighted_market_average(base_average, size, pairs)
@@ -433,7 +465,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             market = dict(market_row)
             city = str(market["city"])
             city_decision = state["city_decisions"][city]
-            units = max(0, math.floor(state["city_sales"][city]))
+            units = int(state["city_sales_units"][city])
             sold += units
             transport = float(market["transport_cost"]) if company["home_city"] != city else 0.0
             transport_total = units * transport
