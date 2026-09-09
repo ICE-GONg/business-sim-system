@@ -129,6 +129,17 @@ st.markdown(
     .asset-value { color:var(--ink); font-size:1.25rem; font-weight:720; }
     .reports-strip { margin-top:16px; background:#3f76b8; color:#fff; text-align:center; padding:15px; border-radius:12px 12px 0 0; font-size:1.25rem; }
     .reports-note { background:#fff; border:1px solid var(--line); border-top:0; border-radius:0 0 12px 12px; text-align:center; color:var(--muted); padding:13px; margin-bottom:14px; }
+    .ranking-card { background:#fff; border:1px solid var(--line); border-radius:14px; overflow:hidden; box-shadow:0 4px 18px rgba(30,35,45,.045); }
+    .ranking-round { padding:22px 20px 16px; text-align:center; color:var(--brand); font-size:1.45rem; font-weight:800; letter-spacing:.035em; }
+    .ranking-head, .ranking-row { display:grid; grid-template-columns:72px minmax(76px,.7fr) minmax(86px,.8fr) minmax(150px,1.7fr); align-items:center; column-gap:12px; padding:0 24px; }
+    .ranking-head { min-height:54px; color:#9297a0; border-bottom:1px solid var(--line); font-size:.86rem; }
+    .ranking-row { min-height:68px; color:var(--ink); border-bottom:1px solid #f1f2f4; }
+    .ranking-row:last-child { border-bottom:0; }
+    .ranking-row.is-me { background:#fff6f4; box-shadow:inset 4px 0 0 var(--brand); }
+    .ranking-avatar { width:34px; height:34px; margin:auto; border-radius:50%; background:#f7f5f2; color:var(--brand); display:flex; align-items:center; justify-content:center; font-size:1rem; }
+    .ranking-position { font-size:1.18rem; font-weight:800; color:var(--brand); }
+    .ranking-team { font-weight:720; }
+    .ranking-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:620; }
     @media (max-width: 720px) {
       .block-container { padding-left: .75rem; padding-right: .75rem; }
       .block-container h2 { font-size:1.65rem; }
@@ -143,6 +154,10 @@ st.markdown(
       .asset-summary { padding:16px 6px 20px; }
       .asset-label { font-size:.72rem; }
       .asset-value { font-size:.92rem; }
+      .ranking-head, .ranking-row { grid-template-columns:42px 62px 70px minmax(100px,1fr); column-gap:7px; padding:0 10px; }
+      .ranking-head { font-size:.73rem; }
+      .ranking-row { min-height:62px; font-size:.9rem; }
+      .ranking-avatar { width:30px; height:30px; }
     }
     </style>
     """,
@@ -796,7 +811,8 @@ def ranking_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def render_ranking(admin: bool = False) -> None:
-    hero("财富排行榜", "按当轮结束后的 Net Assets 排序；Net Assets = 总资产（含期末库存价值）− 负债，所有费用均已计入。")
+    if admin:
+        hero("财富排行榜", "按当轮结束后的 Net Assets 排序；Net Assets = 总资产（含期末库存价值）− 负债，所有费用均已计入。")
     with connect() as conn:
         latest = one(conn, "SELECT MAX(round_no) AS n FROM results")
         latest_round = int(latest["n"] or 0) if latest else 0
@@ -806,6 +822,29 @@ def render_ranking(admin: bool = False) -> None:
         round_numbers = [int(row["round_no"]) for row in all_rows(conn, "SELECT DISTINCT round_no FROM results ORDER BY round_no DESC")]
         selected = st.selectbox("选择轮次", round_numbers, index=0)
         rows = rank_rows(conn, selected)
+    if not admin:
+        current_company_id = int(st.session_state.get("auth", {}).get("company_id", 0))
+        ranking_rows = []
+        for row in rows:
+            mine = " is-me" if int(row["id"]) == current_company_id else ""
+            ranking_rows.append(
+                f'<div class="ranking-row{mine}">'
+                '<div class="ranking-avatar">●</div>'
+                f'<div class="ranking-position">{int(row["rank"])}</div>'
+                f'<div class="ranking-team">{html.escape(str(row["code"]))}</div>'
+                f'<div class="ranking-name">{html.escape(str(row["name"]))}</div>'
+                '</div>'
+            )
+        st.markdown(
+            '<div class="ranking-card">'
+            f'<div class="ranking-round">ROUND {int(selected)}</div>'
+            '<div class="ranking-head"><div>头像</div><div>排名</div><div>队伍</div><div>公司名称</div></div>'
+            f'{"".join(ranking_rows)}'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("排行榜仅公开名次、队伍编号和公司名称；经营数据仅本人及管理员可见。")
+        return
     frame = ranking_table(rows)
     st.dataframe(
         frame,
