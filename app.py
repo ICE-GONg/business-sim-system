@@ -28,6 +28,7 @@ from sim import APP_NAME
 from sim import cpi as _cpi_module
 from sim import db as _db_module
 from sim import engine as _engine_module
+from sim import bots as _bots_module
 
 # Streamlit Community Cloud can rerun a freshly downloaded app.py inside a
 # process that still has the previous internal modules cached. Refresh only
@@ -39,12 +40,16 @@ if (
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 7
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 8
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 1
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
     importlib.reload(_cpi_module)
     importlib.reload(_engine_module)
+    importlib.reload(_bots_module)
+
+from sim.bots import submit_bot_decisions
 
 from sim.db import (
     all_rows,
@@ -289,12 +294,17 @@ def render_setup(company: sqlite3.Row) -> None:
         if not markets:
             st.error("管理员尚未配置可选主场。")
             return
-        labels = [f"{m['city']}｜贷款 {money(m['min_loan'])}–{money(m['max_loan'])}｜材料 {money(m['component_material'])}/{money(m['product_material'])}" for m in markets]
         with st.form("home_setup"):
-            selected = st.selectbox("主场城市（确认后锁定）", labels)
+            city_names = [str(m["city"]) for m in markets]
+            selected = st.radio("选择主场（确认后永久锁定）", city_names, horizontal=True)
+            selected_market = markets[city_names.index(selected)]
+            st.caption(
+                f"{selected}：第一轮最高贷款 {money(selected_market['max_loan'])} · "
+                f"零件/产品材料 {money(selected_market['component_material'])}/{money(selected_market['product_material'])}"
+            )
             confirmed = st.form_submit_button("确认主场", type="primary")
         if confirmed:
-            city = markets[labels.index(selected)]["city"]
+            city = selected
             with connect() as conn:
                 conn.execute("UPDATE companies SET home_city=?,setup_submitted_at=NULL WHERE id=?", (city, company["id"]))
                 conn.execute(
@@ -606,7 +616,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
 
     st.markdown(
         f'<div class="hint">工资建议：工人约 <b>{money(helper["worker_wage"])}</b>，工程师约 '
-        f'<b>{money(helper["engineer_wage"])}</b>；75% 专利参考投入约 <b>{money(helper["research"])}</b>。</div>',
+        f'<b>{money(helper["engineer_wage"])}</b>；专利投入失败会累计，真实成功概率仅管理员可见。</div>',
         unsafe_allow_html=True,
     )
     if decision.get("submitted_at"):
@@ -891,8 +901,8 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         ("银行贷款 / Bank loan", float(finance.get("loan_change", 0.0)), float(finance.get("loan_change", 0.0))),
         ("工人工资 / Workers salary", -float(finance.get("worker_wages", finance.get("wages", 0.0))), 0.0),
         ("工程师工资 / Engineers salary", -float(finance.get("engineer_wages", 0.0)), 0.0),
-        ("裁员费用 / Layoff", -float(finance.get("layoff", 0.0)), 0.0),
-        ("低工资离职补偿 / Quit compensation", -float(finance.get("quit_penalty", 0.0)), 0.0),
+        ("裁员费用 / Layoff", -float(finance.get("layoff_cash", finance.get("layoff", 0.0))), float(finance.get("layoff_debt", 0.0))),
+        ("离职补偿 / Quit compensation", -float(finance.get("quit_penalty_cash", finance.get("quit_penalty", 0.0))), float(finance.get("quit_penalty_debt", 0.0))),
         ("培训费用 / Training", -float(finance.get("training", 0.0)), 0.0),
         ("零件材料 / Components material", -float(finance.get("component_material", finance.get("materials", 0.0))), 0.0),
         ("零件仓储 / Components storage", -float(finance.get("component_storage", finance.get("storage", 0.0))), 0.0),
@@ -950,7 +960,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     management_frame = pd.DataFrame([{"管理投入": finance.get("management", 0.0), "管理指数": production.get("ma_index", row["ma_index"]), "品质投入": finance.get("quality", 0.0), "品质指数": production.get("qi_index", row["qi_index"])}])
     st.dataframe(management_frame, hide_index=True, use_container_width=True, column_config={"管理投入": st.column_config.NumberColumn(format="¥ %.0f"), "品质投入": st.column_config.NumberColumn(format="¥ %.0f")})
     product_frame = pd.DataFrame([
-        {"项目": "零件 Components", "计划": int(production.get("planned", 0)) * 7, "期初": 0, "本轮生产": production.get("components", int(production.get("produced", 0)) * 7), "总量": production.get("components", int(production.get("produced", 0)) * 7), "使用/售出": production.get("components", int(production.get("produced", 0)) * 7), "结余": 0},
+        {"项目": "零件 Components", "计划": int(production.get("planned", 0)) * int(production.get("components_per_product", 7)), "期初": production.get("old_components", 0), "本轮生产": production.get("components", int(production.get("produced", 0)) * 7), "总量": production.get("old_components", 0) + production.get("components", int(production.get("produced", 0)) * 7), "使用/售出": production.get("component_used", production.get("components", int(production.get("produced", 0)) * 7)), "结余": production.get("component_surplus", 0)},
         {"项目": "产品 Products", "计划": production.get("planned", 0), "期初": production.get("old_products", 0), "本轮生产": production.get("produced", 0), "总量": production.get("old_products", 0) + production.get("produced", 0), "使用/售出": production.get("sold", 0), "结余": production.get("surplus", 0)},
     ])
     st.dataframe(product_frame, hide_index=True, use_container_width=True)
@@ -963,8 +973,14 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
 
     research = report["research"]
     st.markdown('<div class="report-title">研发 Research Investment</div>', unsafe_allow_html=True)
-    research_frame = pd.DataFrame([{"本轮投入": research["investment"], "成功概率": research["probability"] * 100, "本轮结果": "获得专利" if research["success"] else "未获得专利", "累计专利": research["patents_after"]}])
-    st.dataframe(research_frame, hide_index=True, use_container_width=True, column_config={"本轮投入": st.column_config.NumberColumn(format="¥ %.0f"), "成功概率": st.column_config.NumberColumn(format="%.1f%%")})
+    research_record = {"本轮投入": research["investment"], "累计研发投入": research.get("accumulated_for_probability", research["investment"]), "本轮结果": "获得专利" if research["success"] else "未获得专利", "累计专利": research["patents_after"]}
+    if admin:
+        research_record["真实成功概率"] = research["probability"] * 100
+    research_frame = pd.DataFrame([research_record])
+    research_columns = {"本轮投入": st.column_config.NumberColumn(format="¥ %.0f"), "累计研发投入": st.column_config.NumberColumn(format="¥ %.0f")}
+    if admin:
+        research_columns["真实成功概率"] = st.column_config.NumberColumn(format="%.1f%%")
+    st.dataframe(research_frame, hide_index=True, use_container_width=True, column_config=research_columns)
     if research.get("success"):
         st.caption(f"本轮获得的专利从第 {research.get('effective_from_round', round_no + 1)} 轮开始降低材料成本，本轮生产成本不受影响。")
 
@@ -1138,7 +1154,7 @@ def render_player_kds(company: sqlite3.Row) -> None:
         - Add One Sales Agent：`{money(settings['agent_add_cost'])}`
         - Remove One Sales Agent：`{money(settings['agent_remove_cost'])}`
         - Order One Market Report：`{money(settings['report_cost'])}`
-        - Research & Development：`{money(settings['research_25'])} = 25%`，`{money(settings['research_75'])} = 75%`
+        - Research & Development：研发投入未成功时会累计到下一轮；成功后累计投入清零。真实成功概率仅管理员可见。
         - Patent：每项专利将材料成本乘以 `{float(settings['patent_factor']):.2f}`，中奖后的下一轮开始生效。
         """
     )
@@ -1193,11 +1209,38 @@ def render_admin_companies() -> None:
         round_row = current_round(conn)
     setup_editable = bool(round_row and round_row["status"] == "waiting")
     home_options = ["未选择"] + [str(row["city"]) for row in markets]
+    with st.form("add_bots"):
+        bot_cols = st.columns([2, 2, 1])
+        bot_count = bot_cols[0].number_input("新增 Bot 数量", min_value=1, max_value=30, value=1, step=1, disabled=not setup_editable)
+        bot_cols[1].caption("Bot 会自动选择主场，并在每轮开启后立即提交；不添加则完全不触发。")
+        add_bots = bot_cols[2].form_submit_button("添加 Bot", type="primary", disabled=not setup_editable, use_container_width=True)
+    if add_bots:
+        if not markets:
+            st.error("请先创建至少一个可选主场。")
+        else:
+            with connect() as conn:
+                existing = int(one(conn, "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1")["n"])
+                initial_cash = get_setting(conn, "initial_cash", 15_000_000.0)
+                for offset in range(int(bot_count)):
+                    number_index = existing + offset + 1
+                    code_value = f"BOT{number_index:02d}"
+                    while one(conn, "SELECT 1 FROM companies WHERE code=?", (code_value,)):
+                        number_index += 1
+                        code_value = f"BOT{number_index:02d}"
+                    home = str(markets[(number_index - 1) % len(markets)]["city"])
+                    cursor = conn.execute(
+                        "INSERT INTO companies(code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,bot_profile,created_at) VALUES(?,?,?,?,?,?,1,?,?)",
+                        (code_value, f"Auto Company {number_index}", hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(), number_index % 7, now_iso()),
+                    )
+                    conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cursor.lastrowid, home))
+            flash("success", f"已添加 {int(bot_count)} 支 Bot 队伍。")
+            st.rerun()
     if not setup_editable:
         st.info("比赛已开始：为避免影响结算，赛前资料已锁定。密码仍可重置。")
 
     for company in companies:
-        with st.expander(f"{company['code']} · {company['name']} · {company['home_city'] or '未选主场'}"):
+        bot_tag = " · BOT" if bool(company["is_bot"]) else ""
+        with st.expander(f"{company['code']} · {company['name']} · {company['home_city'] or '未选主场'}{bot_tag}"):
             st.markdown("##### 代管赛前资料")
             with st.form(f"admin_company_setup_{company['id']}"):
                 setup_cols = st.columns([2, 2, 1])
@@ -1544,6 +1587,7 @@ def render_admin_rounds() -> None:
         total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
         default_minutes = max(1, get_setting(conn, "round_duration_minutes", 30, int))
         default_test_round = bool(get_setting(conn, "test_round_enabled", 0, int))
+        companies_for_bonus = all_rows(conn, "SELECT id,code,name,is_bot FROM companies ORDER BY id")
         setup = setup_status(conn)
         submission = submission_status(conn, int(round_row["round_no"])) if round_row and round_row["status"] in ("open", "paused") else None
         decisions = all_rows(
@@ -1585,6 +1629,7 @@ def render_admin_rounds() -> None:
         if st.button(start_label, type="primary", disabled=not bool(setup["all_ready"])):
             with connect() as conn:
                 started_round = start_competition(conn, int(minutes), use_test_round)
+                submit_bot_decisions(conn, started_round)
             flash("success", "测试轮已开始。" if started_round < 0 else "第一轮已开始。")
             st.rerun()
     elif round_row and round_row["status"] in ("open", "paused"):
@@ -1624,6 +1669,7 @@ def render_admin_rounds() -> None:
                 try:
                     with connect() as conn:
                         prepare_first_round_after_test(conn, int(minutes))
+                        submit_bot_decisions(conn, 1)
                     flash("success", "赛前状态已恢复，正式第一轮已开始。")
                     st.rerun()
                 except ValueError as exc:
@@ -1631,12 +1677,35 @@ def render_admin_rounds() -> None:
         elif int(round_row["round_no"]) >= total_rounds:
             st.success(f"全部 {total_rounds} 轮已经结束。")
         else:
-            minutes = st.number_input("下一轮时长（分钟）", min_value=1, value=default_minutes, step=1)
-            if st.button("开启下一轮", type="primary"):
+            next_round = int(round_row["round_no"]) + 1
+            st.markdown("#### 下一轮 Bonus")
+            st.caption("填写后点击开启下一轮，Bonus 会先加入对应队伍现金；留空或填 0 即不发放。")
+            with st.form(f"next_round_{next_round}"):
+                minutes = st.number_input("下一轮时长（分钟）", min_value=1, value=default_minutes, step=1)
+                bonus_values: dict[int, float] = {}
+                for start_index in range(0, len(companies_for_bonus), 3):
+                    bonus_cols = st.columns(3)
+                    for offset, team in enumerate(companies_for_bonus[start_index:start_index + 3]):
+                        bonus_values[int(team["id"])] = bonus_cols[offset].number_input(
+                            f"{team['code']} · {team['name']}", min_value=0.0, value=0.0, step=10_000.0,
+                            key=f"bonus_{next_round}_{team['id']}",
+                        )
+                start_next = st.form_submit_button(f"发放 Bonus 并开启第 {next_round} 轮", type="primary", use_container_width=True)
+            if start_next:
                 start = datetime.now(timezone.utc)
-                next_round = int(round_row["round_no"]) + 1
                 with connect() as conn:
+                    for company_id, amount in bonus_values.items():
+                        clean_amount = max(0.0, float(amount))
+                        if clean_amount <= 0:
+                            continue
+                        conn.execute("UPDATE companies SET cash=cash+? WHERE id=?", (clean_amount, company_id))
+                        conn.execute(
+                            "INSERT INTO round_bonuses(company_id,round_no,amount,created_at) VALUES(?,?,?,?) "
+                            "ON CONFLICT(company_id,round_no) DO UPDATE SET amount=excluded.amount,created_at=excluded.created_at",
+                            (company_id, next_round, clean_amount, now_iso()),
+                        )
                     conn.execute("INSERT INTO rounds(round_no,status,starts_at,ends_at) VALUES(?,'open',?,?)", (next_round, start.isoformat(), (start + timedelta(minutes=int(minutes))).isoformat()))
+                    submit_bot_decisions(conn, next_round)
                 flash("success", f"第 {next_round} 轮已开始。")
                 st.rerun()
 

@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 7
+ENGINE_API_VERSION = 8
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -70,6 +70,20 @@ def research_probability(investment: float, amount_25: float, amount_75: float) 
     return min(0.95, 0.75 + 0.20 * (investment - amount_75) / max(amount_75, 1.0))
 
 
+def effective_research_probability(
+    accumulated_investment: float,
+    amount_25: float,
+    amount_75: float,
+    hidden_cap: float,
+    hidden_threshold_multiplier: float,
+) -> float:
+    probability = research_probability(accumulated_investment, amount_25, amount_75)
+    hidden_threshold = amount_75 * hidden_threshold_multiplier
+    if accumulated_investment + 1e-9 < hidden_threshold:
+        probability = min(probability, hidden_cap)
+    return max(0.0, min(0.95, probability))
+
+
 def available_loan_limit(net_assets: float, threshold: float, minimum: float, maximum: float) -> float:
     """Return this round's permitted new loan using the configured KDS range."""
     ceiling = max(0.0, float(maximum))
@@ -97,15 +111,14 @@ def current_company_net_assets(conn: sqlite3.Connection, company: sqlite3.Row | 
     if latest is not None:
         return float(latest["net_assets"])
     inventory_value = 0.0
-    if company["home_city"] and int(company["product_inventory"] or 0) > 0:
-        home = one(conn, "SELECT product_material FROM market_config WHERE city=?", (company["home_city"],))
+    component_inventory = int(company["component_inventory"] or 0) if "component_inventory" in company.keys() else 0
+    if company["home_city"] and (int(company["product_inventory"] or 0) > 0 or component_inventory > 0):
+        home = one(conn, "SELECT component_material,product_material FROM market_config WHERE city=?", (company["home_city"],))
         if home is not None:
             patent_factor = get_setting(conn, "patent_factor", 0.70)
-            inventory_value = (
-                int(company["product_inventory"])
-                * float(home["product_material"])
-                * (float(patent_factor) ** int(company["patents"] or 0))
-            )
+            multiplier = float(patent_factor) ** int(company["patents"] or 0)
+            inventory_value = int(company["product_inventory"]) * float(home["product_material"]) * multiplier
+            inventory_value += component_inventory * float(home["component_material"]) * multiplier
     return float(company["cash"]) + inventory_value - float(company["debt"])
 
 
@@ -447,12 +460,44 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             debt -= repayment
             cash -= repayment
 
-        cash, worker_wage_cost = spend(cash, workers * float(decision["worker_salary"]) * 3)
-        cash, engineer_wage_cost = spend(cash, engineers * float(decision["engineer_salary"]) * 3)
+        worker_unit_wage = max(0.0, float(decision["worker_salary"])) * 3
+        paid_workers = workers if worker_unit_wage <= 0 else min(workers, int(cash // worker_unit_wage))
+        wage_worker_quits = workers - paid_workers
+        if wage_worker_quits:
+            remove_employees(conn, company_id, "worker", wage_worker_quits)
+        cash, worker_wage_cost = spend(cash, paid_workers * worker_unit_wage)
+        engineer_unit_wage = max(0.0, float(decision["engineer_salary"])) * 3
+        paid_engineers = engineers if engineer_unit_wage <= 0 else min(engineers, int(cash // engineer_unit_wage))
+        wage_engineer_quits = engineers - paid_engineers
+        if wage_engineer_quits:
+            remove_employees(conn, company_id, "engineer", wage_engineer_quits)
+        cash, engineer_wage_cost = spend(cash, paid_engineers * engineer_unit_wage)
+        worker_quits += wage_worker_quits
+        engineer_quits += wage_engineer_quits
+        workers = employee_count(conn, company_id, "worker")
+        engineers = employee_count(conn, company_id, "engineer")
+        inexperienced_workers, experienced_workers = _employee_breakdown(conn, company_id, "worker", round_no)
+        inexperienced_engineers, experienced_engineers = _employee_breakdown(conn, company_id, "engineer", round_no)
+        quitted_inexperienced_workers = max(0, post_decision_inexperienced_workers - inexperienced_workers)
+        quitted_experienced_workers = max(0, post_decision_experienced_workers - experienced_workers)
+        quitted_inexperienced_engineers = max(0, post_decision_inexperienced_engineers - inexperienced_engineers)
+        quitted_experienced_engineers = max(0, post_decision_experienced_engineers - experienced_engineers)
+        effective_workers = effective_employee_count(conn, company_id, "worker", round_no) * worker_multiplier
+        effective_engineers = effective_employee_count(conn, company_id, "engineer", round_no) * engineer_multiplier
+        component_capacity = (504.0 / b) * (effective_workers / a) if a and b else 0.0
+        engineer_product_capacity = (504.0 / d_hours) * (effective_engineers / c) if c and d_hours else 0.0
+        component_product_capacity = component_capacity / components_per_product if components_per_product else 0.0
+        capacity_produced = max(0, math.floor(min(planned, engineer_product_capacity, component_product_capacity)))
         requested_layoff = max(-actual_worker_delta, 0) * float(decision["worker_salary"]) + max(-actual_engineer_delta, 0) * float(decision["engineer_salary"])
-        cash, layoff_cost = spend(cash, requested_layoff)
+        cash, layoff_cash = spend(cash, requested_layoff)
+        layoff_debt = max(0.0, requested_layoff - layoff_cash)
+        debt += layoff_debt
+        layoff_cost = requested_layoff
         requested_quit_penalty = worker_quits * float(decision["worker_salary"]) * 2 + engineer_quits * float(decision["engineer_salary"]) * 2
-        cash, quit_penalty = spend(cash, requested_quit_penalty)
+        cash, quit_penalty_cash = spend(cash, requested_quit_penalty)
+        quit_penalty_debt = max(0.0, requested_quit_penalty - quit_penalty_cash)
+        debt += quit_penalty_debt
+        quit_penalty = requested_quit_penalty
         worker_training_cost = get_setting(conn, "worker_training_cost", 0.0)
         engineer_training_cost = get_setting(conn, "engineer_training_cost", 0.0)
         requested_training = max(actual_worker_delta, 0) * worker_training_cost + max(actual_engineer_delta, 0) * engineer_training_cost
@@ -460,42 +505,64 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
 
         active_patents = int(company["patents"])
         material_multiplier = patent_factor ** active_patents
+        old_components = int(company.get("component_inventory", 0))
         old_products = int(company["product_inventory"])
         component_storage_before = int(company["component_storage_capacity"])
         product_storage_before = int(company["product_storage_capacity"])
 
-        def production_cost(quantity: int) -> tuple[int, float, float, float, float, int, int]:
-            component_units = math.ceil(max(0, quantity) * components_per_product)
-            component_storage_increase = max(0, component_units - component_storage_before)
-            product_storage_increase = max(0, old_products + max(0, quantity) - product_storage_before)
+        component_requirement = max(1, int(round(components_per_product)))
+        component_target = min(max(0, math.floor(component_capacity)), planned * component_requirement)
+
+        def component_cost(quantity: int) -> tuple[float, float, int]:
+            storage_increase = max(0, old_components + quantity - component_storage_before)
             return (
-                component_units,
-                component_units * float(home["component_material"]) * material_multiplier,
-                component_storage_increase * float(home["component_storage"]),
-                max(0, quantity) * float(home["product_material"]) * material_multiplier,
-                product_storage_increase * float(home["product_storage"]),
-                component_storage_increase,
-                product_storage_increase,
+                quantity * float(home["component_material"]) * material_multiplier,
+                storage_increase * float(home["component_storage"]),
+                storage_increase,
             )
 
-        low, high = 0, capacity_produced
+        low, high = 0, component_target
         while low < high:
             mid = (low + high + 1) // 2
-            candidate = production_cost(mid)
-            if sum(candidate[1:5]) <= cash + 1e-9:
+            material, storage, _ = component_cost(mid)
+            if material + storage <= cash + 1e-9:
+                low = mid
+            else:
+                high = mid - 1
+        components = low
+        requested_component_material, requested_component_storage, component_storage_increase = component_cost(components)
+        cash, component_material_cost = spend(cash, requested_component_material)
+        cash, component_storage_cost = spend(cash, requested_component_storage)
+
+        total_components = old_components + components
+        product_capacity = min(planned, math.floor(engineer_product_capacity), total_components // component_requirement)
+
+        def product_cost(quantity: int) -> tuple[float, float, int]:
+            storage_increase = max(0, old_products + quantity - product_storage_before)
+            return (
+                quantity * float(home["product_material"]) * material_multiplier,
+                storage_increase * float(home["product_storage"]),
+                storage_increase,
+            )
+
+        low, high = 0, max(0, product_capacity)
+        while low < high:
+            mid = (low + high + 1) // 2
+            material, storage, _ = product_cost(mid)
+            if material + storage <= cash + 1e-9:
                 low = mid
             else:
                 high = mid - 1
         produced = low
-        (components, requested_component_material, requested_component_storage, requested_product_material, requested_product_storage, component_storage_increase, product_storage_increase) = production_cost(produced)
-        cash, component_material_cost = spend(cash, requested_component_material)
-        cash, component_storage_cost = spend(cash, requested_component_storage)
+        requested_product_material, requested_product_storage, product_storage_increase = product_cost(produced)
         cash, product_material_cost = spend(cash, requested_product_material)
         cash, product_storage_cost = spend(cash, requested_product_storage)
+        component_used = produced * component_requirement
+        component_surplus = total_components - component_used
         storage_cost = component_storage_cost + product_storage_cost
         conn.execute(
             "UPDATE companies SET component_storage_capacity=MAX(component_storage_capacity,?),product_storage_capacity=MAX(product_storage_capacity,?) WHERE id=?",
-            (components, old_products + produced, company_id),
+            (old_components + components, old_products + produced, company_id),
         )
 
         city_decisions: dict[str, dict[str, Any]] = {}
@@ -560,20 +627,27 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "component_capacity": component_capacity, "engineer_product_capacity": engineer_product_capacity,
             "worker_multiplier": worker_multiplier, "engineer_multiplier": engineer_multiplier,
             "average_worker_wage": average_worker_wage, "average_engineer_wage": average_engineer_wage,
-            "produced": produced, "components": components, "available": old_products + produced, "old_products": old_products,
+            "produced": produced, "components": components, "old_components": old_components,
+            "component_used": component_used, "component_surplus": component_surplus,
+            "available": old_products + produced, "old_products": old_products,
             "cash_pre_sales": cash, "debt_before_interest": debt, "loan_base_net_assets": loan_base_net_assets,
             "loan_ceiling": loan_ceiling, "loan_limit": loan_limit, "loan_change": actual_loan_change,
             "worker_wage_cost": worker_wage_cost, "engineer_wage_cost": engineer_wage_cost, "wage_cost": worker_wage_cost + engineer_wage_cost,
-            "layoff_cost": layoff_cost, "quit_penalty": quit_penalty, "training_cost": training_cost,
+            "layoff_cost": layoff_cost, "layoff_cash": layoff_cash, "layoff_debt": layoff_debt,
+            "quit_penalty": quit_penalty, "quit_penalty_cash": quit_penalty_cash, "quit_penalty_debt": quit_penalty_debt,
+            "training_cost": training_cost,
             "component_material_cost": component_material_cost, "product_material_cost": product_material_cost,
             "component_storage_cost": component_storage_cost, "product_storage_cost": product_storage_cost, "storage_cost": storage_cost,
             "component_storage_before": component_storage_before, "product_storage_before": product_storage_before,
             "component_storage_increase": component_storage_increase, "product_storage_increase": product_storage_increase,
             "agent_cost": total_agent_cost, "marketing_total": total_marketing, "management": management, "quality": quality,
-            "research_requested": max(0.0, float(decision["research_investment"])), "active_patents": active_patents,
+            "research_requested": max(0.0, float(decision["research_investment"])),
+            "research_balance_before": max(0.0, float(company.get("research_balance", 0.0))), "active_patents": active_patents,
             "ma_index": ma_index, "qi_index": qi_index, "city_decisions": city_decisions,
             "city_sales": {str(m["city"]): 0.0 for m in markets}, "city_secondary": {str(m["city"]): 0.0 for m in markets},
             "city_cpi": {str(m["city"]): 0.0 for m in markets}, "city_cpi_units": {str(m["city"]): 0.0 for m in markets},
+            "city_price_units": {str(m["city"]): 0.0 for m in markets},
+            "city_investment_units": {str(m["city"]): 0.0 for m in markets},
             "city_breakdown": {str(m["city"]): {} for m in markets},
         }
 
@@ -584,6 +658,8 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             state["city_secondary"] = {str(m["city"]): 0.0 for m in markets}
             state["city_cpi"] = {str(m["city"]): 0.0 for m in markets}
             state["city_cpi_units"] = {str(m["city"]): 0.0 for m in markets}
+            state["city_price_units"] = {str(m["city"]): 0.0 for m in markets}
+            state["city_investment_units"] = {str(m["city"]): 0.0 for m in markets}
             state["city_breakdown"] = {str(m["city"]): {} for m in markets}
 
         for market_row in markets:
@@ -617,6 +693,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 cpi = float(allocation["total_cpi"])
                 states[company_id]["city_cpi"][city] = cpi
                 states[company_id]["city_cpi_units"][city] = size * cpi / 100.0
+                states[company_id]["city_price_units"][city] = size * float(allocation["price_cpi"]) / 100.0
+                investment_cpi = float(allocation["ma_cpi"]) + float(allocation["qi_cpi"]) + float(allocation["mi_cpi"])
+                states[company_id]["city_investment_units"][city] = size * investment_cpi / 100.0
                 states[company_id]["city_breakdown"][city] = allocation
 
         for state in states.values():
@@ -631,14 +710,15 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         # Secondary allocation is only the visible CPI capacity left unused by
         # stock-constrained players. It can never create sales for zero-CPI
         # players, and the redistributed units do not change the reported CPI.
-        secondary_pools = {
-            str(market["city"]): max(
-                0.0,
-                sum(state["city_cpi_units"][str(market["city"])] for state in states.values())
-                - sum(state["city_sales"][str(market["city"])] for state in states.values()),
-            )
-            for market in markets
-        }
+        secondary_pools: dict[str, dict[str, float]] = {}
+        for market in markets:
+            city = str(market["city"])
+            secondary_pools[city] = {"price": 0.0, "investment": 0.0}
+            for state in states.values():
+                total_capacity = float(state["city_cpi_units"][city])
+                used_ratio = min(1.0, float(state["city_sales"][city]) / total_capacity) if total_capacity > 0 else 0.0
+                secondary_pools[city]["price"] += float(state["city_price_units"][city]) * (1.0 - used_ratio)
+                secondary_pools[city]["investment"] += float(state["city_investment_units"][city]) * (1.0 - used_ratio)
         for _ in range(max(1, len(states) + len(markets))):
             remaining = {
                 company_id: max(0.0, state["available"] - sum(state["city_sales"].values()))
@@ -647,25 +727,25 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             moved = 0.0
             for market_row in markets:
                 city = str(market_row["city"])
-                pool = secondary_pools[city]
-                candidates = []
-                for company_id, state in states.items():
-                    visible_capacity = float(state["city_cpi_units"][city])
-                    if remaining[company_id] <= 1e-9 or visible_capacity <= 1e-9:
+                for category, capacity_key in (("price", "city_price_units"), ("investment", "city_investment_units")):
+                    pool = secondary_pools[city][category]
+                    candidates = [
+                        (company_id, float(state[capacity_key][city]))
+                        for company_id, state in states.items()
+                        if remaining[company_id] > 1e-9 and float(state[capacity_key][city]) > 1e-9
+                    ]
+                    if pool <= 1e-9 or not candidates:
                         continue
-                    candidates.append((company_id, visible_capacity))
-                if pool <= 1e-9 or not candidates:
-                    continue
-                score_sum = sum(score for _, score in candidates)
-                city_moved = 0.0
-                for company_id, score in candidates:
-                    addition = min(remaining[company_id], pool * score / score_sum)
-                    states[company_id]["city_sales"][city] += addition
-                    states[company_id]["city_secondary"][city] += addition
-                    remaining[company_id] -= addition
-                    city_moved += addition
-                secondary_pools[city] = max(0.0, pool - city_moved)
-                moved += city_moved
+                    score_sum = sum(score for _, score in candidates)
+                    category_moved = 0.0
+                    for company_id, score in candidates:
+                        addition = min(remaining[company_id], pool * score / score_sum)
+                        states[company_id]["city_sales"][city] += addition
+                        states[company_id]["city_secondary"][city] += addition
+                        remaining[company_id] -= addition
+                        category_moved += addition
+                    secondary_pools[city][category] = max(0.0, pool - category_moved)
+                    moved += category_moved
             if moved <= 1e-9:
                 break
 
@@ -725,6 +805,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
 
     amount_25 = get_setting(conn, "research_25", 1_500_000.0)
     amount_75 = get_setting(conn, "research_75", 6_000_000.0)
+    research_probability_cap = get_setting(conn, "research_probability_cap", 0.43)
+    hidden_threshold_multiplier = get_setting(conn, "research_hidden_threshold_multiplier", 4 / 3)
+    test_repeat_boost = get_setting(conn, "test_patent_repeat_boost", 2.0)
     transport_unit_cost = get_setting(conn, "transport_cost", 0.0)
     for company_id, state in states.items():
         company = state["company"]
@@ -789,10 +872,25 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         total_cost = operating_cost + tax
         net_profit = revenue - total_cost
 
-        probability = research_probability(research, amount_25, amount_75)
+        research_total = state["research_balance_before"] + research
+        hidden_threshold = amount_75 * hidden_threshold_multiplier
+        probability = effective_research_probability(
+            research_total, amount_25, amount_75, research_probability_cap, hidden_threshold_multiplier
+        )
+        test_repeat_applied = False
+        if round_no == 1:
+            test_result = one(conn, "SELECT report_json FROM results WHERE company_id=? AND round_no=-1", (company_id,))
+            if test_result:
+                test_research = json.loads(test_result["report_json"]).get("research", {})
+                if bool(test_research.get("success")) and math.isclose(float(test_research.get("investment", -1)), research, abs_tol=0.005):
+                    probability = min(0.95, probability * test_repeat_boost)
+                    test_repeat_applied = True
         research_success = 1 if random.Random(f"{round_no}:{company_id}:patent").random() < probability else 0
         patents_after = int(state["active_patents"]) + research_success
-        inventory_book_value = inventory * float(home["product_material"]) * (patent_factor ** state["active_patents"])
+        research_balance_after = 0.0 if research_success else research_total
+        product_inventory_book_value = inventory * float(home["product_material"]) * (patent_factor ** state["active_patents"])
+        component_inventory_book_value = state["component_surplus"] * float(home["component_material"]) * (patent_factor ** state["active_patents"])
+        inventory_book_value = product_inventory_book_value + component_inventory_book_value
         total_assets = cash + inventory_book_value
         net_assets = total_assets - debt
         report = {
@@ -801,7 +899,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "round_begins": company["cash"], "starting_debt": company["debt"], "loan_base_net_assets": state["loan_base_net_assets"],
                 "loan_ceiling": state["loan_ceiling"], "loan_limit": state["loan_limit"], "loan_change": state["loan_change"],
                 "worker_wages": state["worker_wage_cost"], "engineer_wages": state["engineer_wage_cost"], "wages": state["wage_cost"],
-                "layoff": state["layoff_cost"], "quit_penalty": state["quit_penalty"], "training": state["training_cost"],
+                "layoff": state["layoff_cost"], "layoff_cash": state["layoff_cash"], "layoff_debt": state["layoff_debt"],
+                "quit_penalty": state["quit_penalty"], "quit_penalty_cash": state["quit_penalty_cash"], "quit_penalty_debt": state["quit_penalty_debt"],
+                "training": state["training_cost"],
                 "component_material": state["component_material_cost"], "product_material": state["product_material_cost"],
                 "component_storage": state["component_storage_cost"], "product_storage": state["product_storage_cost"],
                 "materials": state["component_material_cost"] + state["product_material_cost"], "storage": state["storage_cost"],
@@ -822,7 +922,10 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 ],
             },
             "production": {
-                "planned": state["decision"]["production_volume"], "produced": state["produced"], "components": state["components"], "old_products": state["old_products"],
+                "planned": state["decision"]["production_volume"], "produced": state["produced"], "components": state["components"],
+                "old_components": state["old_components"], "component_used": state["component_used"], "component_surplus": state["component_surplus"],
+                "components_per_product": component_requirement,
+                "old_products": state["old_products"],
                 "sold": sold, "surplus": inventory, "ma_index": state["ma_index"], "qi_index": state["qi_index"],
                 "component_storage_before": state["component_storage_before"], "component_storage_after": state["component_storage_before"] + state["component_storage_increase"], "component_storage_increase": state["component_storage_increase"],
                 "product_storage_before": state["product_storage_before"], "product_storage_after": state["product_storage_before"] + state["product_storage_increase"], "product_storage_increase": state["product_storage_increase"],
@@ -834,7 +937,14 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "product_storage_unit_price": float(home["product_storage"]),
                 "quality_investment": state["quality"],
             },
-            "research": {"investment": research, "probability": probability, "success": bool(research_success), "active_patents_this_round": state["active_patents"], "patents_after": patents_after, "effective_from_round": round_no + 1 if research_success else None},
+            "research": {
+                "investment": research, "accumulated_before": state["research_balance_before"],
+                "accumulated_for_probability": research_total, "accumulated_after": research_balance_after,
+                "probability": probability, "hidden_threshold": hidden_threshold,
+                "test_repeat_boost_applied": test_repeat_applied, "success": bool(research_success),
+                "active_patents_this_round": state["active_patents"], "patents_after": patents_after,
+                "effective_from_round": round_no + 1 if research_success else None,
+            },
             "sales": city_report_rows,
             "cpi_algorithm": {"version": get_setting(conn, "cpi_algorithm_version", "cpi-generator-admin-v1", str), "description": "赠品 + 第一层 + 第二层 + 福利1/2；价格差按设定幂次分配 40 CPI；各城市独立计算。", "price_power": price_power, "player_average_price_formula": "sum(player_price * player_sold) / sum(player_sold)"},
         }
@@ -842,5 +952,8 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "INSERT INTO results(company_id,round_no,total_assets,debt,net_assets,cash,sales_revenue,total_cost,net_profit,produced,sold,inventory,ma_index,qi_index,research_success,report_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (company_id, round_no, total_assets, debt, net_assets, cash, revenue, total_cost, net_profit, state["produced"], sold, inventory, state["ma_index"], state["qi_index"], research_success, json.dumps(report, ensure_ascii=False)),
         )
-        conn.execute("UPDATE companies SET cash=?,debt=?,patents=?,product_inventory=? WHERE id=?", (cash, debt, patents_after, inventory, company_id))
+        conn.execute(
+            "UPDATE companies SET cash=?,debt=?,patents=?,research_balance=?,component_inventory=?,product_inventory=? WHERE id=?",
+            (cash, debt, patents_after, research_balance_after, state["component_surplus"], inventory, company_id),
+        )
     conn.execute("UPDATE rounds SET status='settled',settled_at=? WHERE round_no=?", (now_iso(), round_no))

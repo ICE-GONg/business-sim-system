@@ -114,7 +114,11 @@ def init_db() -> None:
                 cash REAL NOT NULL DEFAULT 0,
                 debt REAL NOT NULL DEFAULT 0,
                 patents INTEGER NOT NULL DEFAULT 0,
+                research_balance REAL NOT NULL DEFAULT 0,
+                component_inventory INTEGER NOT NULL DEFAULT 0,
                 product_inventory INTEGER NOT NULL DEFAULT 0,
+                is_bot INTEGER NOT NULL DEFAULT 0,
+                bot_profile INTEGER NOT NULL DEFAULT 0,
                 component_storage_capacity INTEGER NOT NULL DEFAULT 0,
                 product_storage_capacity INTEGER NOT NULL DEFAULT 0,
                 setup_submitted_at TEXT,
@@ -241,11 +245,28 @@ def init_db() -> None:
                 snapshot_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS round_bonuses(
+                company_id INTEGER NOT NULL,
+                round_no INTEGER NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(company_id,round_no),
+                FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
+            );
             """
         )
         market_columns = {row["name"] for row in all_rows(conn, "PRAGMA table_info(market_config)")}
         if "min_loan" not in market_columns:
             conn.execute("ALTER TABLE market_config ADD COLUMN min_loan REAL NOT NULL DEFAULT 0")
+        company_columns = {row["name"] for row in all_rows(conn, "PRAGMA table_info(companies)")}
+        if "research_balance" not in company_columns:
+            conn.execute("ALTER TABLE companies ADD COLUMN research_balance REAL NOT NULL DEFAULT 0")
+        if "component_inventory" not in company_columns:
+            conn.execute("ALTER TABLE companies ADD COLUMN component_inventory INTEGER NOT NULL DEFAULT 0")
+        if "is_bot" not in company_columns:
+            conn.execute("ALTER TABLE companies ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+        if "bot_profile" not in company_columns:
+            conn.execute("ALTER TABLE companies ADD COLUMN bot_profile INTEGER NOT NULL DEFAULT 0")
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
         count = one(conn, "SELECT COUNT(*) AS n FROM market_config")
@@ -343,7 +364,7 @@ def current_round(conn: sqlite3.Connection) -> sqlite3.Row | None:
 def capture_round_snapshot(conn: sqlite3.Connection, round_no: int) -> None:
     """Store the exact mutable competition state before a round is settled."""
     company_columns = (
-        "id,code,name,home_city,cash,debt,patents,product_inventory,"
+        "id,code,name,home_city,cash,debt,patents,research_balance,component_inventory,product_inventory,is_bot,bot_profile,"
         "component_storage_capacity,product_storage_capacity,setup_submitted_at"
     )
     snapshot = {
@@ -390,7 +411,11 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
                 "cash": float(previous_result["cash"]) if previous_result is not None else initial_cash,
                 "debt": float(previous_result["debt"]) if previous_result is not None else 0.0,
                 "patents": int(research.get("patents_after", 0)) if previous_result is not None else 0,
+                "research_balance": float(research.get("accumulated_after", 0)) if previous_result is not None else 0,
+                "component_inventory": int(production.get("component_surplus", 0)),
                 "product_inventory": int(previous_result["inventory"]) if previous_result is not None else 0,
+                "is_bot": int(company.get("is_bot", 0)),
+                "bot_profile": int(company.get("bot_profile", 0)),
                 "component_storage_capacity": int(production.get("component_storage_after", 0)),
                 "product_storage_capacity": int(production.get("product_storage_after", 0)),
                 "setup_submitted_at": company["setup_submitted_at"],
@@ -444,7 +469,7 @@ def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) 
     existing_company_ids = {int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies")}
     existing_cities = {str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config")}
     company_fields = (
-        "name=?,home_city=?,cash=?,debt=?,patents=?,product_inventory=?,"
+        "name=?,home_city=?,cash=?,debt=?,patents=?,research_balance=?,component_inventory=?,product_inventory=?,is_bot=?,bot_profile=?,"
         "component_storage_capacity=?,product_storage_capacity=?,setup_submitted_at=?"
     )
     for company in snapshot.get("companies", []):
@@ -457,7 +482,9 @@ def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) 
             (
                 company["name"], restored_home, float(company.get("cash", 0)),
                 float(company.get("debt", 0)), int(company.get("patents", 0)),
-                int(company.get("product_inventory", 0)), int(company.get("component_storage_capacity", 0)),
+                float(company.get("research_balance", 0)),
+                int(company.get("component_inventory", 0)), int(company.get("product_inventory", 0)),
+                int(company.get("is_bot", 0)), int(company.get("bot_profile", 0)), int(company.get("component_storage_capacity", 0)),
                 int(company.get("product_storage_capacity", 0)),
                 company.get("setup_submitted_at") if restored_home else None,
                 company_id,
@@ -543,6 +570,7 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
     conn.execute("UPDATE decisions SET submitted_at=NULL WHERE round_no=?", (target_round,))
     conn.execute("DELETE FROM rounds WHERE round_no>=?", (target_round,))
     conn.execute("DELETE FROM round_snapshots WHERE round_no>=?", (target_round,))
+    conn.execute("DELETE FROM round_bonuses WHERE round_no>?", (target_round,))
     start = datetime.now(timezone.utc)
     end = start + timedelta(minutes=max(1, int(duration_minutes)))
     conn.execute(
@@ -553,15 +581,25 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
 
 
 def reset_competition(conn: sqlite3.Connection) -> None:
-    for table in ("round_snapshots", "market_round_stats", "city_results", "results", "city_decisions", "decisions", "agents", "employee_cohorts", "rounds"):
+    for table in ("round_bonuses", "round_snapshots", "market_round_stats", "city_results", "results", "city_decisions", "decisions", "agents", "employee_cohorts", "rounds"):
         conn.execute(f"DELETE FROM {table}")
     initial_cash = get_setting(conn, "initial_cash", 15_000_000)
-    for company in all_rows(conn, "SELECT id,code FROM companies ORDER BY id"):
-        conn.execute(
-            "UPDATE companies SET name=?,home_city=NULL,setup_submitted_at=NULL,cash=?,debt=0,patents=0,"
-            "product_inventory=0,component_storage_capacity=0,product_storage_capacity=0 WHERE id=?",
-            (f"待命名-{company['code']}", initial_cash, company["id"]),
-        )
+    homes = [str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config WHERE home_enabled=1 ORDER BY city")]
+    for company in all_rows(conn, "SELECT id,code,is_bot,bot_profile FROM companies ORDER BY id"):
+        if bool(company["is_bot"]) and homes:
+            home = homes[int(company["bot_profile"] or 0) % len(homes)]
+            conn.execute(
+                "UPDATE companies SET name=?,home_city=?,setup_submitted_at=?,cash=?,debt=0,patents=0,research_balance=0,"
+                "component_inventory=0,product_inventory=0,component_storage_capacity=0,product_storage_capacity=0 WHERE id=?",
+                (f"Auto Company {company['id']}", home, now_iso(), initial_cash, company["id"]),
+            )
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (company["id"], home))
+        else:
+            conn.execute(
+                "UPDATE companies SET name=?,home_city=NULL,setup_submitted_at=NULL,cash=?,debt=0,patents=0,research_balance=0,"
+                "component_inventory=0,product_inventory=0,component_storage_capacity=0,product_storage_capacity=0 WHERE id=?",
+                (f"待命名-{company['code']}", initial_cash, company["id"]),
+            )
     set_setting(conn, "test_round_enabled", 0)
     conn.execute("INSERT INTO rounds(round_no,status) VALUES(1,'waiting')")
 

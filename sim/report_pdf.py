@@ -201,8 +201,8 @@ def build_round_report_pdf(
         ("Bank loan", float(finance.get("loan_change", 0)), float(finance.get("loan_change", 0))),
         ("Workers salary cost", -float(finance.get("worker_wages", finance.get("wages", 0))), 0.0),
         ("Engineers salary cost", -float(finance.get("engineer_wages", 0)), 0.0),
-        ("Layoff compensation", -float(finance.get("layoff", 0)), 0.0),
-        ("Low-salary quit compensation", -float(finance.get("quit_penalty", 0)), 0.0),
+        ("Layoff compensation", -float(finance.get("layoff_cash", finance.get("layoff", 0))), float(finance.get("layoff_debt", 0))),
+        ("Quit compensation", -float(finance.get("quit_penalty_cash", finance.get("quit_penalty", 0))), float(finance.get("quit_penalty_debt", 0))),
         ("Employee training cost", -float(finance.get("training", 0)), 0.0),
         ("Components material cost", -float(finance.get("component_material", finance.get("materials", 0))), 0.0),
         ("Components storage cost", -float(finance.get("component_storage", finance.get("storage", 0))), 0.0),
@@ -270,7 +270,8 @@ def build_round_report_pdf(
     ], [61 * mm, 61 * mm, 62 * mm], alignments={0: "CENTER", 1: "CENTER", 2: "CENTER"})
     overview_table = table([
         ["Overview", "Plan", "Previous", "Produced", "Total", "Used/Sold", "Surplus"],
-        ["Components", planned * 7, 0, components, components, components, 0],
+        ["Components", planned * int(production.get("components_per_product", 7)), production.get("old_components", 0), components,
+         int(production.get("old_components", 0)) + components, production.get("component_used", components), production.get("component_surplus", 0)],
         ["Products", planned, old_products, produced, old_products + produced, sold, surplus],
     ], [34 * mm, 25 * mm, 25 * mm, 25 * mm, 25 * mm, 25 * mm, 25 * mm],
        alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT"})
@@ -292,7 +293,7 @@ def build_round_report_pdf(
     ], [34 * mm, 39 * mm, 34 * mm, 34 * mm, 43 * mm], alignments={1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
     research_table = table([
         ["Overview", "Previous", "Change", "After", "Accumulated Research Investment"],
-        ["Patents", research.get("active_patents_this_round", 0), 1 if research.get("success") else 0, research.get("patents_after", 0), _money(research.get("investment", 0))],
+        ["Patents", research.get("active_patents_this_round", 0), 1 if research.get("success") else 0, research.get("patents_after", 0), _money(research.get("accumulated_after", 0))],
     ], [34 * mm, 28 * mm, 28 * mm, 28 * mm, 66 * mm], alignments={1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
 
     agent_rows: list[list[Any]] = [["Agents", "Previous", "Change", "After", "Change Cost", "Marketing Investment"]]
