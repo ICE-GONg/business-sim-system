@@ -14,7 +14,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 12
+BOT_API_VERSION = 13
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -725,6 +725,15 @@ def _submit_bots(
         )
     )
     progress_total = pending_total + (1 if super_mode and pending_total else 0)
+    submitted_super_ids = {
+        int(row["company_id"])
+        for row in all_rows(
+            conn,
+            "SELECT d.company_id FROM decisions d JOIN companies c ON c.id=d.company_id "
+            "WHERE d.round_no=? AND d.submitted_at IS NOT NULL AND c.is_super_bot=1",
+            (round_no,),
+        )
+    } if super_mode else set()
     for bot_row in bots:
         bot = dict(bot_row)
         company_id = int(bot["id"])
@@ -849,7 +858,7 @@ def _submit_bots(
                 "d.quality_investment,cd.city,cd.agent_delta,cd.marketing_investment,cd.price,c.product_inventory "
                 "FROM decisions d JOIN companies c ON c.id=d.company_id "
                 "JOIN city_decisions cd ON cd.company_id=d.company_id AND cd.round_no=d.round_no "
-                "WHERE d.round_no=? AND d.submitted_at IS NOT NULL AND d.company_id<>? AND c.is_super_bot=0",
+                "WHERE d.round_no=? AND d.submitted_at IS NOT NULL AND d.company_id<>?",
                 (round_no, company_id),
             )
             market_index = {str(market["city"]): index for index, market in enumerate(markets)}
@@ -885,14 +894,13 @@ def _submit_bots(
                     ) / max(1, int(active_count["n"] or 0)),
                 })
 
-            # Analyse all super bots against the same submitted-player snapshot.
-            # Synthetic peers prevent an all-super match from assuming each bot
-            # owns the whole market and avoid the sequential investment arms race
-            # that previously bankrupted every later super bot.
+            # Super Bots are analysed and committed one at a time. Decisions
+            # already saved in this pass are real rivals above; only the smaller
+            # unresolved remainder still needs a synthetic estimate.
             for other_row in bots:
                 other = dict(other_row)
                 other_id = int(other["id"])
-                if other_id == company_id:
+                if other_id == company_id or other_id in submitted_super_ids:
                     continue
                 other_profile = int(other["bot_profile"] if other["bot_profile"] is not None else other_id) % 7
                 other_style = BOT_STYLES[other_profile]
@@ -1541,6 +1549,7 @@ def _submit_bots(
         # the complete Super Bot submission set before starting again.
         if super_mode:
             conn.commit()
+            submitted_super_ids.add(company_id)
         submitted += 1
         if progress_callback:
             progress_callback(submitted, max(1, progress_total), str(bot["code"]))

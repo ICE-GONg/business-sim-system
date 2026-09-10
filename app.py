@@ -42,7 +42,7 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 3
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 12
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 13
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -1726,9 +1726,10 @@ def render_admin_rounds() -> None:
                 try:
                     super_progress = st.progress(0.0, text="超级 Bot 正在模拟 CPI 候选方案…")
                     def update_super_progress(done: int, total: int, code: str) -> None:
+                        stage = "联合复算完成" if code == "联合复算" else f"{code} 已分析并保存"
                         super_progress.progress(
                             min(1.0, done / max(1, total)),
-                            text=f"正在计算 {code} · {done}/{total}",
+                            text=f"{stage} · {done}/{total}",
                         )
                     with connect() as conn:
                         submit_super_bot_decisions(
@@ -1770,9 +1771,10 @@ def render_admin_rounds() -> None:
                     if super_total and super_submitted < super_total:
                         settlement_progress = st.progress(0.0, text="超级 Bot 正在模拟 CPI 候选方案…")
                         def update_settlement_progress(done: int, total: int, code: str) -> None:
+                            stage = "联合复算完成" if code == "联合复算" else f"{code} 已分析并保存"
                             settlement_progress.progress(
                                 min(1.0, done / max(1, total)),
-                                text=f"正在计算 {code} · {done}/{total}",
+                                text=f"{stage} · {done}/{total}",
                             )
                         submit_super_bot_decisions(
                             conn,
