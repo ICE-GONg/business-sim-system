@@ -42,7 +42,7 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 7
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 8
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -1724,8 +1724,19 @@ def render_admin_rounds() -> None:
                 use_container_width=True,
             ):
                 try:
+                    super_progress = st.progress(0.0, text="超级 Bot 正在模拟 CPI 候选方案…")
+                    def update_super_progress(done: int, total: int, code: str) -> None:
+                        super_progress.progress(
+                            min(1.0, done / max(1, total)),
+                            text=f"正在计算 {code} · {done}/{total}",
+                        )
                     with connect() as conn:
-                        submit_super_bot_decisions(conn, int(round_row["round_no"]))
+                        submit_super_bot_decisions(
+                            conn,
+                            int(round_row["round_no"]),
+                            update_super_progress,
+                        )
+                    super_progress.empty()
                     flash("success", f"{super_total} 支超级 Bot 已读取全部对手决策并完成提交。")
                     st.rerun()
                 except ValueError as exc:
@@ -1754,7 +1765,18 @@ def render_admin_rounds() -> None:
             try:
                 with connect() as conn:
                     if super_total and super_submitted < super_total:
-                        submit_super_bot_decisions(conn, int(round_row["round_no"]))
+                        settlement_progress = st.progress(0.0, text="超级 Bot 正在模拟 CPI 候选方案…")
+                        def update_settlement_progress(done: int, total: int, code: str) -> None:
+                            settlement_progress.progress(
+                                min(1.0, done / max(1, total)),
+                                text=f"正在计算 {code} · {done}/{total}",
+                            )
+                        submit_super_bot_decisions(
+                            conn,
+                            int(round_row["round_no"]),
+                            update_settlement_progress,
+                        )
+                        settlement_progress.empty()
                     settle_round(conn, int(round_row["round_no"]))
                 completed_label = "测试轮" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
                 flash("success", f"{completed_label}结算完成。")

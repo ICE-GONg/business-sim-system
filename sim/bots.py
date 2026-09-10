@@ -5,13 +5,13 @@ import hashlib
 import math
 import random
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
 from .cpi import allocate_city_cpi
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 
 
-BOT_API_VERSION = 7
+BOT_API_VERSION = 8
 
 BOT_PLANS = (
     {"production": 350, "ma": 1340, "markets": 1, "agents": 2, "research": 1_500_000},
@@ -161,7 +161,309 @@ def _affordable_group_count(
     return max(0, min(int(affordable), max(0, int(demand_groups))))
 
 
-def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> int:
+def _weighted_average(pairs: list[tuple[float, float]], fallback: float) -> float:
+    total = sum(max(0.0, weight) for _, weight in pairs)
+    if total <= 0:
+        return float(fallback)
+    return sum(value * max(0.0, weight) for value, weight in pairs) / total
+
+
+def _forecast_submitted_cpi_capacity(
+    conn: sqlite3.Connection,
+    round_no: int,
+    markets: list[dict[str, Any]],
+) -> dict[int, float]:
+    """Re-run CPI against the final submitted field and return unit capacity.
+
+    This intentionally happens after every Super Bot has selected a candidate.
+    Candidate-by-candidate forecasts cannot know the final choices of the other
+    Super Bots and may otherwise buy several times more CPI than their stock.
+    """
+    official_round = 1 if round_no < 0 else round_no
+    growth = float(get_setting(conn, "market_growth", 1.10))
+    ma_threshold = float(get_setting(conn, "cpi_ma_large_threshold", 1300))
+    price_power = max(1, int(get_setting(conn, "cpi_price_power", 8)))
+    states: dict[int, dict[str, Any]] = {}
+    for row in all_rows(
+        conn,
+        "SELECT c.id,c.product_inventory,d.worker_delta,d.engineer_delta,d.management_investment,"
+        "d.production_volume,d.quality_investment FROM companies c JOIN decisions d "
+        "ON d.company_id=c.id WHERE d.round_no=? AND d.submitted_at IS NOT NULL",
+        (round_no,),
+    ):
+        company_id = int(row["id"])
+        workers = max(0, employee_count(conn, company_id, "worker") + int(row["worker_delta"] or 0))
+        engineers = max(0, employee_count(conn, company_id, "engineer") + int(row["engineer_delta"] or 0))
+        production = max(0, int(row["production_volume"] or 0))
+        old_products = max(0, int(row["product_inventory"] or 0))
+        states[company_id] = {
+            "available": old_products + production,
+            "ma": float(row["management_investment"] or 0) / max(1, workers + engineers),
+            "qi": float(row["quality_investment"] or 0) / max(1.0, old_products * 1.2 + production),
+            "cities": {},
+        }
+    if not states:
+        return {}
+
+    base_averages: dict[str, float] = {}
+    market_sizes: dict[str, float] = {}
+    for market in markets:
+        city = str(market["city"])
+        previous = one(
+            conn,
+            "SELECT average_price FROM market_round_stats WHERE city=? AND round_no>=1 "
+            "AND round_no<? ORDER BY round_no DESC LIMIT 1",
+            (city, max(1, round_no)),
+        )
+        base_averages[city] = (
+            float(previous["average_price"])
+            if previous else float(market["initial_avg_price"])
+        )
+        market_sizes[city] = (
+            float(market["population"])
+            * float(market["penetration"])
+            * growth ** max(0, official_round - 1)
+        )
+        for row in all_rows(
+            conn,
+            "SELECT cd.company_id,cd.agent_delta,cd.marketing_investment,cd.price,COALESCE(a.count,0) AS current_agents "
+            "FROM city_decisions cd LEFT JOIN agents a ON a.company_id=cd.company_id AND a.city=cd.city "
+            "WHERE cd.round_no=? AND cd.city=?",
+            (round_no, city),
+        ):
+            company_id = int(row["company_id"])
+            if company_id not in states:
+                continue
+            agents = max(0, int(row["current_agents"] or 0) + int(row["agent_delta"] or 0))
+            if agents > 0:
+                states[company_id]["cities"][city] = {
+                    "agents": agents,
+                    "marketing": float(row["marketing_investment"] or 0),
+                    "price": float(row["price"] or 0),
+                }
+
+    player_averages = {
+        city: _weighted_average(
+            [
+                (float(state["cities"][city]["price"]), max(1.0, float(state["available"])))
+                for state in states.values() if city in state["cities"]
+            ],
+            base_averages[city],
+        )
+        for city in base_averages
+    }
+    capacities: dict[int, dict[str, float]] = {company_id: {} for company_id in states}
+    for _ in range(12):
+        capacities = {company_id: {} for company_id in states}
+        for market in markets:
+            city = str(market["city"])
+            entries = [
+                {
+                    "company_id": company_id,
+                    "ma_index": state["ma"],
+                    "qi_index": state["qi"],
+                    "mi_investment": state["cities"][city]["marketing"],
+                    "price": state["cities"][city]["price"],
+                    "agents": state["cities"][city]["agents"],
+                }
+                for company_id, state in states.items() if city in state["cities"]
+            ]
+            for allocation in allocate_city_cpi(
+                entries,
+                market_size=market_sizes[city],
+                max_price=float(market["max_price"]),
+                ma_large_threshold=ma_threshold,
+                price_power=price_power,
+                average_price=player_averages[city],
+                market_average_price=base_averages[city],
+            ):
+                capacities[int(allocation["company_id"])][city] = (
+                    market_sizes[city] * float(allocation["total_cpi"]) / 100.0
+                )
+        next_averages: dict[str, float] = {}
+        for city in base_averages:
+            sold_pairs: list[tuple[float, float]] = []
+            for company_id, state in states.items():
+                if city not in state["cities"]:
+                    continue
+                total_capacity = sum(capacities[company_id].values())
+                factor = min(1.0, float(state["available"]) / total_capacity) if total_capacity > 0 else 0.0
+                sold_pairs.append((
+                    float(state["cities"][city]["price"]),
+                    capacities[company_id].get(city, 0.0) * factor,
+                ))
+            next_averages[city] = _weighted_average(sold_pairs, player_averages[city])
+        if all(math.isclose(next_averages[city], player_averages[city], abs_tol=0.01) for city in player_averages):
+            break
+        player_averages = next_averages
+    return {
+        company_id: sum(city_values.values())
+        for company_id, city_values in capacities.items()
+    }
+
+
+def _rebalance_super_bot_production(
+    conn: sqlite3.Connection,
+    round_no: int,
+    markets: list[dict[str, Any]],
+) -> None:
+    """Jointly converge Super Bot stock toward final CPI unit capacity."""
+    worker_need = float(get_setting(conn, "component_workers", 3))
+    worker_hours = float(get_setting(conn, "component_hours", 7))
+    engineer_need = float(get_setting(conn, "product_engineers", 4))
+    engineer_hours = float(get_setting(conn, "product_hours", 14))
+    component_need = max(1, int(round(get_setting(conn, "components_per_product", 7))))
+    group = _balanced_production_group(
+        worker_need, worker_hours, engineer_need, engineer_hours, component_need,
+    )
+    worker_training = float(get_setting(conn, "worker_training_cost", 0))
+    engineer_training = float(get_setting(conn, "engineer_training_cost", 0))
+    add_agent_cost = float(get_setting(conn, "agent_add_cost", 300000))
+    remove_agent_cost = float(get_setting(conn, "agent_remove_cost", 100000))
+    patent_factor = float(get_setting(conn, "patent_factor", 0.70))
+
+    market_by_city = {str(market["city"]): market for market in markets}
+    for _ in range(10):
+        capacities = _forecast_submitted_cpi_capacity(conn, round_no, markets)
+        changed = False
+        for row in all_rows(
+            conn,
+            "SELECT c.*,d.worker_salary,d.engineer_salary,d.worker_delta,d.engineer_delta,"
+            "d.management_investment,d.production_volume,d.quality_investment FROM companies c "
+            "JOIN decisions d ON d.company_id=c.id WHERE c.is_super_bot=1 AND d.round_no=?",
+            (round_no,),
+        ):
+            company_id = int(row["id"])
+            home = market_by_city.get(str(row["home_city"]), markets[0])
+            old_products = max(0, int(row["product_inventory"] or 0))
+            old_components = max(0, int(row["component_inventory"] or 0))
+            current_production = max(0, int(row["production_volume"] or 0))
+            current_workers = max(0, employee_count(conn, company_id, "worker") + int(row["worker_delta"] or 0))
+            current_engineers = max(0, employee_count(conn, company_id, "engineer") + int(row["engineer_delta"] or 0))
+            ma_index = float(row["management_investment"] or 0) / max(1, current_workers + current_engineers)
+            qi_index = float(row["quality_investment"] or 0) / max(1.0, old_products * 1.2 + current_production)
+            material_factor = patent_factor ** int(row["patents"] or 0)
+            city_cost = one(
+                conn,
+                "SELECT COALESCE(SUM(CASE WHEN cd.agent_delta>0 THEN cd.agent_delta*? "
+                "WHEN cd.agent_delta<0 THEN -cd.agent_delta*? ELSE 0 END),0) AS agent_cost,"
+                "COALESCE(SUM(cd.marketing_investment),0) AS marketing FROM city_decisions cd "
+                "WHERE cd.company_id=? AND cd.round_no=?",
+                (add_agent_cost, remove_agent_cost, company_id, round_no),
+            )
+            fixed_cost = float(city_cost["agent_cost"] or 0) + float(city_cost["marketing"] or 0)
+
+            def plan_for(groups: int) -> dict[str, float | int]:
+                production = max(0, int(math.floor(groups * group["products"])))
+                components_to_make = max(0, production * component_need - old_components)
+                worker_required = components_to_make * worker_need * worker_hours / 504.0
+                engineer_required = production * engineer_need * engineer_hours / 504.0
+                worker_delta = _staff_delta(conn, company_id, "worker", round_no, worker_required)
+                engineer_delta = _staff_delta(conn, company_id, "engineer", round_no, engineer_required)
+                workers = max(0, employee_count(conn, company_id, "worker") + worker_delta)
+                engineers = max(0, employee_count(conn, company_id, "engineer") + engineer_delta)
+                staff = workers * float(row["worker_salary"]) * 3 + engineers * float(row["engineer_salary"]) * 3
+                staff += max(0, worker_delta) * worker_training + max(0, engineer_delta) * engineer_training
+                staff += max(0, -worker_delta) * float(row["worker_salary"])
+                staff += max(0, -engineer_delta) * float(row["engineer_salary"])
+                materials = components_to_make * float(home["component_material"]) * material_factor
+                materials += production * float(home["product_material"]) * material_factor
+                storage = max(
+                    0,
+                    old_components + components_to_make - int(row["component_storage_capacity"] or 0),
+                ) * float(home["component_storage"])
+                storage += max(
+                    0,
+                    old_products + production - int(row["product_storage_capacity"] or 0),
+                ) * float(home["product_storage"])
+                management = ma_index * max(1, workers + engineers)
+                quality = qi_index * max(1.0, old_products * 1.2 + production)
+                return {
+                    "production": production,
+                    "worker_delta": worker_delta,
+                    "engineer_delta": engineer_delta,
+                    "management": management,
+                    "quality": quality,
+                    "total": fixed_cost + staff + materials + storage + management + quality,
+                }
+
+            target_new = max(0.0, capacities.get(company_id, 0.0) - old_products)
+            target_groups = max(0, int(round(target_new / max(group["products"], 1.0))))
+            low, high = 0, target_groups
+            while low < high:
+                middle = (low + high + 1) // 2
+                if float(plan_for(middle)["total"]) <= float(row["cash"]) + 1e-9:
+                    low = middle
+                else:
+                    high = middle - 1
+            selected_plan = plan_for(low)
+            if int(selected_plan["production"]) == current_production:
+                continue
+            conn.execute(
+                "UPDATE decisions SET worker_delta=?,engineer_delta=?,management_investment=?,"
+                "production_volume=?,quality_investment=? WHERE company_id=? AND round_no=?",
+                (
+                    selected_plan["worker_delta"], selected_plan["engineer_delta"],
+                    selected_plan["management"], selected_plan["production"],
+                    selected_plan["quality"], company_id, round_no,
+                ),
+            )
+            changed = True
+        # Recalculate against the production changes above. If a Super Bot is
+        # still buying materially more CPI units than it can stock, taper all
+        # three investment indices together. Damping avoids a threshold cliff;
+        # later passes let rivals absorb the released CPI before adjusting
+        # again. MA/QI keep their documented minimum index of 1.
+        capacities = _forecast_submitted_cpi_capacity(conn, round_no, markets)
+        for row in all_rows(
+            conn,
+            "SELECT c.id,c.product_inventory,d.worker_delta,d.engineer_delta,d.management_investment,"
+            "d.production_volume,d.quality_investment FROM companies c JOIN decisions d "
+            "ON d.company_id=c.id WHERE c.is_super_bot=1 AND d.round_no=?",
+            (round_no,),
+        ):
+            company_id = int(row["id"])
+            available = max(0.0, float(row["product_inventory"] or 0) + float(row["production_volume"] or 0))
+            capacity = capacities.get(company_id, 0.0)
+            if available <= 0 or capacity <= available * 1.06:
+                continue
+            coverage = capacity / available
+            scale = max(0.18, min(0.96, math.sqrt(1.0 / coverage)))
+            workers = max(0, employee_count(conn, company_id, "worker") + int(row["worker_delta"] or 0))
+            engineers = max(0, employee_count(conn, company_id, "engineer") + int(row["engineer_delta"] or 0))
+            headcount = max(1, workers + engineers)
+            ma_index = float(row["management_investment"] or 0) / headcount
+            qi_denominator = max(
+                1.0,
+                float(row["product_inventory"] or 0) * 1.2 + float(row["production_volume"] or 0),
+            )
+            qi_index = float(row["quality_investment"] or 0) / qi_denominator
+            conn.execute(
+                "UPDATE decisions SET management_investment=?,quality_investment=? "
+                "WHERE company_id=? AND round_no=?",
+                (
+                    max(1.0, ma_index * scale) * headcount,
+                    max(1.0, qi_index * scale) * qi_denominator,
+                    company_id,
+                    round_no,
+                ),
+            )
+            conn.execute(
+                "UPDATE city_decisions SET marketing_investment=marketing_investment*? "
+                "WHERE company_id=? AND round_no=? AND marketing_investment>0",
+                (scale, company_id, round_no),
+            )
+            changed = True
+        if not changed:
+            break
+
+
+def _submit_bots(
+    conn: sqlite3.Connection,
+    round_no: int,
+    super_mode: bool,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> int:
     bots = all_rows(
         conn,
         "SELECT * FROM companies WHERE is_bot=1 AND is_super_bot=? ORDER BY id",
@@ -193,6 +495,33 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
     research_goal = setting("research_75", 6000000) * setting("research_hidden_threshold_multiplier", 4 / 3)
     research_goal += setting("research_buffer", 150000)
 
+    human_present = bool(one(conn, "SELECT 1 FROM companies WHERE is_bot=0 LIMIT 1"))
+    previous_leader: dict[str, Any] | None = None
+    if super_mode and human_present and official_round > 1:
+        leader_row = one(
+            conn,
+            "SELECT r.company_id,r.ma_index,r.qi_index FROM results r "
+            "WHERE r.round_no=? ORDER BY r.net_assets DESC,r.company_id LIMIT 1",
+            (official_round - 1,),
+        )
+        if leader_row:
+            previous_leader = {
+                "ma": float(leader_row["ma_index"] or 0),
+                "qi": float(leader_row["qi_index"] or 0),
+                "cities": {
+                    str(row["city"]): {
+                        "marketing": float(row["marketing_investment"] or 0),
+                        "price": float(row["price"] or 0),
+                    }
+                    for row in all_rows(
+                        conn,
+                        "SELECT city,marketing_investment,price FROM city_decisions "
+                        "WHERE company_id=? AND round_no=?",
+                        (leader_row["company_id"], official_round - 1),
+                    )
+                },
+            }
+
     selected_by_bot: dict[int, list[int]] = {}
     for bot in bots:
         wealth_multiple = max(1.0, float(bot["cash"]) / initial_cash)
@@ -222,6 +551,14 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         city_competitors[index] = max(1, len(seller_ids))
 
     submitted = 0
+    pending_total = sum(
+        1 for bot in bots
+        if not one(
+            conn,
+            "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
+            (int(bot["id"]), round_no),
+        )
+    )
     for bot_row in bots:
         bot = dict(bot_row)
         company_id = int(bot["id"])
@@ -408,6 +745,10 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         # MI starts from round three, or earlier only in an already crowded city;
         # whenever it is opened its amount is at least the full large threshold.
         use_qi = market_pressure >= 0.55 or (plan_index >= 1 and profile in (2, 4, 6) and market_pressure >= 0.30)
+        if super_mode:
+            # Super Bots evaluate the full QI range; QI=1 is the effective
+            # "closed" candidate and therefore costs almost nothing per unit.
+            use_qi = True
         use_mi = plan_index >= 2
         mi_city_limit = min(
             len(selected),
@@ -443,12 +784,14 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 max(qi_index_target, qi_line * super_aggression, rival_qi * super_aggression),
             )
         marketing_targets: dict[int, float] = {}
+        mi_thresholds: dict[int, float] = {}
         for index in selected:
             market = markets[index]
             active_agents = agent_plan[index][1]
             size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
             threshold = (float(market["max_price"]) / 50.0) * size * 0.20
             threshold /= max(1.0, 1.0 + active_agents * 0.10) * 1.5 * 2.0
+            mi_thresholds[index] = threshold
             target_mi = threshold * mi_strength
             if super_mode:
                 rival_mi = _upper_typical([item["mi_effective"] for item in rival_metrics[index]])
@@ -588,7 +931,10 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             or old_products + production > demand_target
         )
 
-        def make_city_rows(aggressive: bool = False) -> list[dict[str, float | int | str]]:
+        def make_city_rows(
+            aggressive: bool = False,
+            price_ratio_override: float | None = None,
+        ) -> list[dict[str, float | int | str]]:
             rows: list[dict[str, float | int | str]] = []
             active_sizes = [
                 float(markets[index]["population"]) * float(markets[index]["penetration"])
@@ -609,14 +955,33 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 marketing = budget["marketing"].get(index, 0.0)
                 cap = min(price_max, float(market["max_price"]))
                 city_pressure = max(utilization.get(index, 0.0), current_pressure.get(index, 0.0))
+                previous_price = previous_prices.get(index, float(market["initial_avg_price"]))
+                low_price_unlocked = previous_price >= cap * 0.75
                 reference = cap * high_price_ratio
-                if index in selected and (city_pressure >= 0.60 or aggressive):
-                    reference = previous_prices[index] - price_cut
-                if super_mode and index in selected and (city_pressure >= 0.40 or aggressive):
+                if price_ratio_override is not None and index in selected:
+                    reference = cap * (
+                        price_ratio_override
+                        if low_price_unlocked or price_ratio_override >= 0.75
+                        else high_price_ratio
+                    )
+                if (
+                    price_ratio_override is None
+                    and index in selected
+                    and low_price_unlocked
+                    and (city_pressure >= 0.60 or aggressive)
+                ):
+                    reference = previous_price - price_cut
+                if (
+                    super_mode
+                    and price_ratio_override is None
+                    and index in selected
+                    and low_price_unlocked
+                    and (city_pressure >= 0.40 or aggressive)
+                ):
                     rival_prices = [item["price"] for item in rival_metrics[index] if item["price"] > 0]
-                    rival_floor = min(rival_prices, default=previous_prices[index])
+                    rival_floor = min(rival_prices, default=previous_price)
                     factor = aggressive_price_factor if aggressive else normal_price_factor
-                    reference = min(previous_prices[index] - price_cut, rival_floor * factor)
+                    reference = min(previous_price - price_cut, rival_floor * factor)
                 component_labor = component_need * worker_need * worker_hours / 504.0 * worker_salary * 3
                 product_labor = engineer_need * engineer_hours / 504.0 * engineer_salary * 3
                 direct_unit_cost = (
@@ -675,38 +1040,225 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             return capacity
 
         city_rows = make_city_rows(inventory_heavy)
-        if super_mode and old_products + production > 0:
-            normal_capacity = forecast_super_capacity(city_rows)
-            aggressive_rows = make_city_rows(True)
-            aggressive_capacity = forecast_super_capacity(aggressive_rows)
-            available_now = old_products + production
-            def potential_revenue(rows: list[dict[str, float | int | str]], capacity: float) -> float:
-                active = [row for row in rows if int(row["index"]) in selected and int(row["agents_after"]) > 0]
-                total_weight = sum(
-                    float(markets[int(row["index"])]["population"]) * float(markets[int(row["index"])]["penetration"])
-                    for row in active
-                )
-                average = sum(
-                    float(row["price"]) * float(markets[int(row["index"])]["population"]) * float(markets[int(row["index"])]["penetration"])
-                    for row in active
-                ) / max(1.0, total_weight)
-                return min(float(available_now), capacity * 0.80) * average
+        if super_mode:
+            # Search the permitted strategy space instead of hard-coding a
+            # low-price personality. Every candidate is passed through the same
+            # CPI allocator used by settlement and through the same complete
+            # group-cost formula used by normal Bots.
+            base_group_cost = max(
+                0.0,
+                group_cost
+                - ma_index_target * (group["workers"] + group["engineers"])
+                - qi_index_target * group["products"],
+            )
+            ma_candidates = sorted({
+                1.0, 800.0, 1600.0, 2800.0, 4400.0, 6200.0, 8000.0,
+                min(8000.0, max(1.0, ma_index_target)),
+            })
+            qi_candidates = sorted({
+                1.0, 500.0, 1000.0, 1750.0, 2500.0, 3000.0,
+                min(3000.0, max(1.0, qi_index_target)),
+            })
+            mi_ratio_candidates = {0.0} if not use_mi else {1.0, 1.5, 2.25, 3.0, 4.5, 6.0}
+            price_ratio_candidates = {
+                min(0.98, max(0.75, high_price_ratio)), 0.95, 0.88, 0.81, 0.75,
+            }
+            if previous_leader:
+                ma_candidates = sorted({
+                    *ma_candidates,
+                    min(8000.0, max(1.0, float(previous_leader["ma"]))),
+                })
+                qi_candidates = sorted({
+                    *qi_candidates,
+                    min(3000.0, max(1.0, float(previous_leader["qi"]))),
+                })
+                for index in selected:
+                    leader_city = previous_leader["cities"].get(str(markets[index]["city"]))
+                    if not leader_city:
+                        continue
+                    if use_mi and mi_thresholds.get(index, 0.0) > 0:
+                        mi_ratio_candidates.add(min(
+                            6.0,
+                            max(0.0, float(leader_city["marketing"]) / mi_thresholds[index]),
+                        ))
+                    cap = min(price_max, float(markets[index]["max_price"]))
+                    if cap > 0:
+                        price_ratio_candidates.add(min(
+                            0.98,
+                            max(price_min / cap, float(leader_city["price"]) / cap),
+                        ))
+            if any(
+                previous_prices[index] >= min(price_max, float(markets[index]["max_price"])) * 0.75
+                for index in selected
+            ):
+                price_ratio_candidates.update((0.68, 0.60, 0.52))
 
-            normal_revenue = potential_revenue(city_rows, normal_capacity)
-            aggressive_revenue = potential_revenue(aggressive_rows, aggressive_capacity)
-            chosen_aggressive = inventory_heavy or aggressive_revenue > normal_revenue * 1.03
-            if chosen_aggressive:
-                city_rows, normal_capacity = aggressive_rows, aggressive_capacity
-            # Maintain a 25% capacity buffer. When the calculated CPI cannot
-            # safely absorb the stock, reduce new production instead of gambling
-            # the company on inventory that may not sell.
-            safe_available = int(normal_capacity * 0.80)
-            if safe_available < old_products + production:
-                safe_new_products = max(0, safe_available - old_products)
-                safe_groups = math.floor(safe_new_products / max(group["products"], 1.0))
-                production = int(math.floor(safe_groups * group["products"]))
+            def evaluate_candidate(
+                candidate_ma: float,
+                candidate_qi: float,
+                candidate_mi_ratio: float,
+                candidate_price_ratio: float,
+            ) -> dict[str, Any]:
+                candidate_marketing = {
+                    index: (
+                        mi_thresholds.get(index, 0.0) * candidate_mi_ratio
+                        if index in mi_selected and agent_plan[index][1] > 0 else 0.0
+                    )
+                    for index in selected
+                }
+                candidate_group_cost = (
+                    base_group_cost
+                    + candidate_ma * (group["workers"] + group["engineers"])
+                    + candidate_qi * group["products"]
+                )
+                candidate_fixed = agent_cost + sum(candidate_marketing.values())
+                candidate_groups = _affordable_group_count(
+                    cash_budget,
+                    candidate_fixed,
+                    candidate_group_cost,
+                    demand_groups,
+                )
+                candidate_production = int(math.floor(candidate_groups * group["products"]))
+                candidate_available = old_products + candidate_production
+                if candidate_available <= 0:
+                    return {
+                        "score": (-1, -math.inf, 0.0, candidate_price_ratio),
+                        "ma": candidate_ma, "qi": candidate_qi,
+                        "marketing": candidate_marketing, "groups": candidate_groups,
+                        "price_ratio": candidate_price_ratio,
+                    }
+
+                city_capacities: list[tuple[int, float, float]] = []
+                active_market_count = max(1, sum(1 for index in selected if agent_plan[index][1] > 0))
+                for index in selected:
+                    agents_after = agent_plan[index][1]
+                    if agents_after <= 0:
+                        continue
+                    market = markets[index]
+                    cap = min(price_max, float(market["max_price"]))
+                    low_price_unlocked = previous_prices[index] >= cap * 0.75
+                    effective_ratio = (
+                        candidate_price_ratio
+                        if low_price_unlocked or candidate_price_ratio >= 0.75
+                        else min(0.98, max(0.75, high_price_ratio))
+                    )
+                    candidate_price = cap * effective_ratio
+                    component_labor = component_need * worker_need * worker_hours / 504.0 * worker_salary * 3
+                    product_labor = engineer_need * engineer_hours / 504.0 * engineer_salary * 3
+                    direct_unit_cost = (
+                        component_need * float(home_market["component_material"]) * material_factor
+                        + float(home_market["product_material"]) * material_factor
+                        + component_labor + product_labor
+                        + (transport_cost if str(market["city"]) != home else 0.0)
+                    )
+                    candidate_price = min(cap, max(price_min, candidate_price, direct_unit_cost * 1.08))
+                    entries: list[dict[str, float | int]] = []
+                    weighted_prices: list[tuple[float, float]] = []
+                    for rival_number, rival in enumerate(rival_metrics[index]):
+                        rival_agents = max(1.0, rival.get("agents", 1.0))
+                        entries.append({
+                            "company_id": -(rival_number + 1), "ma_index": rival["ma"],
+                            "qi_index": rival["qi"],
+                            "mi_investment": rival["mi_effective"] / (1.0 + rival_agents * 0.10),
+                            "price": rival["price"], "agents": rival_agents,
+                        })
+                        weighted_prices.append((rival["price"], max(1.0, rival.get("available", 1.0))))
+                    entries.append({
+                        "company_id": company_id, "ma_index": candidate_ma,
+                        "qi_index": candidate_qi,
+                        "mi_investment": candidate_marketing[index],
+                        "price": candidate_price, "agents": agents_after,
+                    })
+                    weighted_prices.append((candidate_price, max(1.0, candidate_available / active_market_count)))
+                    weighted_total = sum(weight for _, weight in weighted_prices)
+                    average_price = sum(price * weight for price, weight in weighted_prices) / max(1.0, weighted_total)
+                    size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
+                    allocations = allocate_city_cpi(
+                        entries,
+                        market_size=size,
+                        max_price=float(market["max_price"]),
+                        ma_large_threshold=ma_threshold,
+                        average_price=average_price,
+                        market_average_price=previous_prices[index],
+                    )
+                    mine = next(item for item in allocations if int(item["company_id"]) == company_id)
+                    city_capacities.append((index, size * float(mine["total_cpi"]) / 100.0, candidate_price))
+
+                total_capacity = sum(capacity for _, capacity, _ in city_capacities)
+                predicted_sold = min(float(candidate_available), total_capacity)
+                sell_ratio = predicted_sold / max(1.0, float(candidate_available))
+                cpi_coverage = total_capacity / max(1.0, float(candidate_available))
+                capacity_weight = sum(capacity for _, capacity, _ in city_capacities)
+                predicted_price = sum(capacity * price for _, capacity, price in city_capacities) / max(1.0, capacity_weight)
+                non_home_capacity = sum(
+                    capacity for index, capacity, _ in city_capacities
+                    if str(markets[index]["city"]) != home
+                )
+                predicted_transport = predicted_sold * transport_cost * non_home_capacity / max(1.0, capacity_weight)
+                predicted_cost = candidate_fixed + candidate_groups * candidate_group_cost + predicted_transport
+                predicted_profit = predicted_sold * predicted_price - predicted_cost
+                # Prefer the narrow band where calculated CPI capacity matches
+                # stock. More CPI than the Bot can consume is wasted even if it
+                # technically guarantees a sell-out.
+                tier = 5 if 0.995 <= cpi_coverage <= 1.02 and predicted_profit > 0 else (
+                    4 if 0.98 <= cpi_coverage <= 1.05 and predicted_profit > 0 else (
+                        3 if 0.90 <= cpi_coverage <= 1.15 and predicted_profit > 0 else (
+                            2 if sell_ratio >= 0.80 and predicted_profit > 0 else (1 if predicted_profit > 0 else 0)
+                        )
+                    )
+                )
+                return {
+                    "score": (
+                        tier,
+                        -abs(cpi_coverage - 1.0),
+                        predicted_profit,
+                        candidate_price_ratio,
+                    ),
+                    "ma": candidate_ma, "qi": candidate_qi,
+                    "marketing": candidate_marketing, "groups": candidate_groups,
+                    "price_ratio": candidate_price_ratio,
+                }
+
+            best_candidate: dict[str, Any] | None = None
+            for candidate_ma in ma_candidates:
+                for candidate_qi in qi_candidates:
+                    for candidate_mi_ratio in sorted(mi_ratio_candidates):
+                        for candidate_price_ratio in sorted(price_ratio_candidates, reverse=True):
+                            candidate = evaluate_candidate(
+                                candidate_ma,
+                                candidate_qi,
+                                candidate_mi_ratio,
+                                candidate_price_ratio,
+                            )
+                            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                                best_candidate = candidate
+
+            if best_candidate is not None:
+                ma_index_target = float(best_candidate["ma"])
+                qi_index_target = float(best_candidate["qi"])
+                marketing_targets = dict(best_candidate["marketing"])
+                chosen_groups = int(best_candidate["groups"])
+                production = int(math.floor(chosen_groups * group["products"]))
                 budget = budget_for(production)
-                city_rows = make_city_rows(chosen_aggressive)
+                while chosen_groups > 0 and float(budget["total"]) > cash_budget + 1e-9:
+                    chosen_groups -= 1
+                    production = int(math.floor(chosen_groups * group["products"]))
+                    budget = budget_for(production)
+                city_rows = make_city_rows(
+                    False,
+                    float(best_candidate["price_ratio"]),
+                )
+
+                # Final safety check uses the exact selected budget. Any cut is
+                # still made in whole groups, preserving F:G:H:I and MA/QI.
+                chosen_capacity = forecast_super_capacity(city_rows)
+                if chosen_capacity < old_products + production:
+                    safe_new_products = max(0, int(chosen_capacity) - old_products)
+                    safe_groups = math.floor(safe_new_products / max(group["products"], 1.0))
+                    if safe_groups < chosen_groups:
+                        production = int(math.floor(safe_groups * group["products"]))
+                        budget = budget_for(production)
+                        city_rows = make_city_rows(False, float(best_candidate["price_ratio"]))
 
         active_rows = [row for row in city_rows if int(row["agents_after"]) > 0 and int(row["index"]) in selected]
         weight_total = sum(
@@ -763,6 +1315,10 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 (company_id, round_no, row["city"], row["agent_delta"], row["marketing"], row["price"]),
             )
         submitted += 1
+        if progress_callback:
+            progress_callback(submitted, max(1, pending_total), str(bot["code"]))
+    if super_mode and submitted:
+        _rebalance_super_bot_production(conn, round_no, markets)
     return submitted
 
 
@@ -771,7 +1327,11 @@ def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
     return _submit_bots(conn, round_no, False)
 
 
-def submit_super_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
+def submit_super_bot_decisions(
+    conn: sqlite3.Connection,
+    round_no: int,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> int:
     """Super bots wait until every non-super team has submitted."""
     missing = one(
         conn,
@@ -791,4 +1351,4 @@ def submit_super_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
         "(SELECT id FROM companies WHERE is_super_bot=1)",
         (round_no,),
     )
-    return _submit_bots(conn, round_no, True)
+    return _submit_bots(conn, round_no, True, progress_callback)

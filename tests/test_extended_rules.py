@@ -183,7 +183,7 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertLessEqual(second["worker_salary"], previous_average * 1.10 + 1e-6)
             self.assertGreater(second["quality_investment"], second["production_volume"] * 500)
             self.assertEqual(city_second["marketing_investment"], 0)
-            self.assertLess(city_second["price"], 12000)
+            self.assertGreaterEqual(city_second["price"], 25_000 * 0.75)
             settle_round(conn, 2)
             conn.execute("INSERT INTO rounds(round_no,status) VALUES(3,'open')")
             submit_bot_decisions(conn, 3)
@@ -252,6 +252,36 @@ class ExtendedRulesTest(unittest.TestCase):
             settle_round(conn, 1)
             result = db.one(conn, "SELECT * FROM results WHERE company_id=? AND round_no=1", (super_id,))
             self.assertGreaterEqual(result["sold"], int(result["produced"] * 0.80))
+
+            # In a human match the next-round Super Bot may inspect the prior
+            # winner as an extra search candidate, and reports calculation
+            # progress back to the administrator.
+            conn.execute("INSERT INTO rounds(round_no,status) VALUES(2,'open')")
+            conn.execute(
+                "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,management_investment,"
+                "quality_investment,submitted_at) VALUES(?,2,3500,6600,200000,150000,?)",
+                (human_id, db.now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,2,'广州',21000)",
+                (human_id,),
+            )
+            progress = []
+            self.assertEqual(
+                submit_super_bot_decisions(
+                    conn,
+                    2,
+                    lambda done, total, code: progress.append((done, total, code)),
+                ),
+                1,
+            )
+            self.assertEqual(progress[-1], (1, 1, "SBOT01"))
+            second = db.one(
+                conn,
+                "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=2",
+                (super_id,),
+            )
+            self.assertIsNotNone(second["submitted_at"])
 
     def test_regular_bots_use_diverse_prices_and_cpi_profiles(self):
         db = self.fresh("bot-diversity.db")
@@ -454,6 +484,18 @@ class ExtendedRulesTest(unittest.TestCase):
                     self.assertGreater(float(result["net_assets"]), 0)
                     if available:
                         self.assertGreaterEqual(int(result["sold"]), int(available * 0.80))
+                        visible_capacity = sum(
+                            float(city["cpi_units"])
+                            for city in db.all_rows(
+                                conn,
+                                "SELECT cpi_units FROM city_results WHERE company_id=? AND round_no=?",
+                                (result["company_id"], round_no),
+                            )
+                        )
+                        # CPI is bought to serve stock, not as an unused score.
+                        # Whole production groups allow a small unavoidable gap.
+                        self.assertGreaterEqual(visible_capacity / available, 0.90)
+                        self.assertLessEqual(visible_capacity / available, 1.15)
 
     def test_failed_research_accumulates_into_next_round(self):
         db = self.fresh("research.db")
