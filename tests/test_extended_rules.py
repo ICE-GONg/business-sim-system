@@ -190,7 +190,7 @@ class ExtendedRulesTest(unittest.TestCase):
             city_third = db.one(conn, "SELECT * FROM city_decisions WHERE company_id=? AND round_no=3 AND city='广州'", (company_id,))
             self.assertGreater(city_third["marketing_investment"], 0)
 
-    def test_bot_lays_off_surplus_staff_when_inventory_covers_plan(self):
+    def test_bot_uses_full_group_budget_even_when_inventory_is_large(self):
         db = self.fresh("bot-layoff.db")
         company_id = self.one_company(db, 40_000_000)
         with db.connect() as conn:
@@ -203,6 +203,40 @@ class ExtendedRulesTest(unittest.TestCase):
             from sim.bots import submit_bot_decisions
             self.assertEqual(submit_bot_decisions(conn, 2), 1)
             decision = db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=2", (company_id,))
+            self.assertGreater(decision["production_volume"], 0)
+            self.assertGreater(decision["worker_delta"], 0)
+            self.assertGreater(decision["engineer_delta"], 0)
+
+    def test_bot_holds_cash_only_when_every_market_is_near_full(self):
+        db = self.fresh("bot-global-saturation.db")
+        company_id = self.one_company(db, 40_000_000)
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE companies SET is_bot=1,bot_profile=1,product_inventory=100000 WHERE id=?",
+                (company_id,),
+            )
+            conn.execute("INSERT INTO employee_cohorts(company_id,role,count,hire_round) VALUES(?,'worker',100,0)", (company_id,))
+            conn.execute("INSERT INTO employee_cohorts(company_id,role,count,hire_round) VALUES(?,'engineer',100,0)", (company_id,))
+            for market in db.all_rows(conn, "SELECT * FROM market_config"):
+                size = float(market["population"]) * float(market["penetration"])
+                conn.execute(
+                    "INSERT INTO market_round_stats(city,round_no,base_average_price,average_price,market_size,player_total_volume) "
+                    "VALUES(?,1,?,?,?,?)",
+                    (
+                        market["city"], market["initial_avg_price"], market["initial_avg_price"],
+                        size, size * 0.96,
+                    ),
+                )
+            conn.execute("INSERT INTO rounds(round_no,status) VALUES(2,'open')")
+            from sim.bots import submit_bot_decisions
+
+            self.assertEqual(submit_bot_decisions(conn, 2), 1)
+            decision = db.one(
+                conn,
+                "SELECT * FROM decisions WHERE company_id=? AND round_no=2",
+                (company_id,),
+            )
+            self.assertEqual(decision["production_volume"], 0)
             self.assertLess(decision["worker_delta"], 0)
             self.assertLess(decision["engineer_delta"], 0)
 
@@ -459,7 +493,7 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreaterEqual(min(ratios), 1.0)
             self.assertGreater(max(ratios) / min(ratios), 2.5)
 
-    def test_all_super_bots_survive_and_sell_through_seven_rounds(self):
+    def test_all_super_bots_use_full_group_budget_seven_rounds(self):
         db = self.fresh("all-super-seven-rounds.db")
         with db.connect() as conn:
             db.set_setting(conn, "total_rounds", 7)
@@ -502,22 +536,27 @@ class ExtendedRulesTest(unittest.TestCase):
                 for result in db.all_rows(conn, "SELECT * FROM results WHERE round_no=?", (round_no,)):
                     report = json.loads(result["report_json"])
                     available = int(result["produced"]) + int(report["production"]["old_products"])
-                    self.assertGreater(float(result["cash"]), 0)
-                    self.assertGreater(float(result["net_assets"]), 0)
-                    if available:
-                        self.assertGreaterEqual(int(result["sold"]), int(available * 0.80))
-                        visible_capacity = sum(
-                            float(city["cpi_units"])
-                            for city in db.all_rows(
-                                conn,
-                                "SELECT cpi_units FROM city_results WHERE company_id=? AND round_no=?",
-                                (result["company_id"], round_no),
-                            )
+                    self.assertGreaterEqual(float(result["cash"]), 0)
+                    finance = report["finance"]
+                    pre_sales_spending = sum(
+                        float(finance[key])
+                        for key in (
+                            "wages", "layoff_cash", "quit_penalty_cash", "training", "materials", "storage",
+                            "agents", "marketing", "quality", "management",
                         )
-                        # CPI is bought to serve stock, not as an unused score.
-                        # Whole production groups allow a small unavoidable gap.
-                        self.assertGreaterEqual(visible_capacity / available, 0.90)
-                        self.assertLessEqual(visible_capacity / available, 1.15)
+                    )
+                    remaining_before_sales = (
+                        float(finance["round_begins"])
+                        + float(finance["loan_change"])
+                        - pre_sales_spending
+                    )
+                    # Under the default KDS a complete group always costs less
+                    # than ¥1m; keeping less than this confirms no second group
+                    # was affordable. Sales/CPI may be lower in a saturated
+                    # market because the organiser explicitly prioritises full
+                    # cash deployment over inventory control.
+                    self.assertGreaterEqual(remaining_before_sales, -1e-6)
+                    self.assertLess(remaining_before_sales, 1_000_000)
 
     def test_failed_research_accumulates_into_next_round(self):
         db = self.fresh("research.db")

@@ -12,7 +12,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 10
+BOT_API_VERSION = 11
 
 BOT_PLANS = (
     {"production": 350, "ma": 1340, "markets": 1, "agents": 2, "research": 1_500_000},
@@ -169,6 +169,30 @@ def _weighted_average(pairs: list[tuple[float, float]], fallback: float) -> floa
     return sum(value * max(0.0, weight) for value, weight in pairs) / total
 
 
+def _all_markets_near_capacity(
+    conn: sqlite3.Connection,
+    round_no: int,
+    markets: list[dict[str, Any]],
+    threshold: float = 0.95,
+) -> bool:
+    """Cash may be held only after every market is effectively sold out."""
+    if round_no <= 1 or not markets:
+        return False
+    for market in markets:
+        stats = one(
+            conn,
+            "SELECT player_total_volume,market_size FROM market_round_stats WHERE city=? "
+            "AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
+            (market["city"], round_no),
+        )
+        if not stats:
+            return False
+        utilization = float(stats["player_total_volume"] or 0) / max(1.0, float(stats["market_size"] or 0))
+        if utilization + 1e-9 < threshold:
+            return False
+    return True
+
+
 def _forecast_submitted_cpi_capacity(
     conn: sqlite3.Connection,
     round_no: int,
@@ -308,7 +332,7 @@ def _rebalance_super_bot_production(
     round_no: int,
     markets: list[dict[str, Any]],
 ) -> None:
-    """Jointly converge Super Bot stock toward final CPI unit capacity."""
+    """Use full-group cash, then taper only genuinely surplus CPI spending."""
     worker_need = float(get_setting(conn, "component_workers", 3))
     worker_hours = float(get_setting(conn, "component_hours", 7))
     engineer_need = float(get_setting(conn, "product_engineers", 4))
@@ -326,17 +350,18 @@ def _rebalance_super_bot_production(
     official_round = 1 if round_no < 0 else round_no
 
     market_by_city = {str(market["city"]): market for market in markets}
+    all_markets_full = _all_markets_near_capacity(conn, round_no, markets)
 
     # Deploy idle capital before the joint CPI/production convergence. Only a
     # fraction of the gap is assigned to indices; the rest stays available to
     # build the complete production groups unlocked by that extra CPI.
-    for row in all_rows(
+    for row in ([] if all_markets_full else all_rows(
         conn,
         "SELECT c.*,d.loan_change,d.worker_salary,d.engineer_salary,d.worker_delta,d.engineer_delta,"
         "d.management_investment,d.production_volume,d.quality_investment FROM companies c "
         "JOIN decisions d ON d.company_id=c.id WHERE c.is_super_bot=1 AND d.round_no=?",
         (round_no,),
-    ):
+    )):
         company_id = int(row["id"])
         home = market_by_city.get(str(row["home_city"]), markets[0])
         production = max(0, int(row["production_volume"] or 0))
@@ -438,7 +463,10 @@ def _rebalance_super_bot_production(
             )
 
     for _ in range(20):
-        capacities = _forecast_submitted_cpi_capacity(conn, round_no, markets)
+        capacities = (
+            _forecast_submitted_cpi_capacity(conn, round_no, markets)
+            if all_markets_full else {}
+        )
         changed = False
         for row in all_rows(
             conn,
@@ -501,14 +529,20 @@ def _rebalance_super_bot_production(
                     "total": fixed_cost + staff + materials + storage + management + quality,
                 }
 
-            target_new = max(0.0, capacities.get(company_id, 0.0) - old_products)
-            target_groups = max(0, int(round(target_new / max(group["products"], 1.0))))
-            low, high = 0, target_groups
+            total_funds = float(row["cash"]) + max(0.0, float(row["loan_change"] or 0))
+            if all_markets_full:
+                target_new = max(0.0, capacities.get(company_id, 0.0) - old_products)
+                target_groups = max(0, int(round(target_new / max(group["products"], 1.0))))
+                low, high = 0, target_groups
+            else:
+                current_groups = max(0, int(round(current_production / max(group["products"], 1.0))))
+                low, high = 0, max(1, current_groups)
+                while float(plan_for(high)["total"]) <= total_funds + 1e-9:
+                    low = high
+                    high *= 2
             while low < high:
                 middle = (low + high + 1) // 2
-                if float(plan_for(middle)["total"]) <= (
-                    float(row["cash"]) + max(0.0, float(row["loan_change"] or 0)) + 1e-9
-                ):
+                if float(plan_for(middle)["total"]) <= total_funds + 1e-9:
                     low = middle
                 else:
                     high = middle - 1
@@ -590,6 +624,7 @@ def _submit_bots(
         return 0
 
     official_round = 1 if round_no < 0 else round_no
+    all_markets_full = _all_markets_near_capacity(conn, round_no, markets)
     plan_index = min(6, max(0, official_round - 1))
     plan = BOT_PLANS[plan_index]
     setting = lambda key, default: float(get_setting(conn, key, default))
@@ -1061,29 +1096,20 @@ def _submit_bots(
             math.ceil(demand_target / max(group["products"], 1.0))
             if demand_target > 0 else 0
         )
-        if (
-            not super_mode
-            and prior_total > 0
-            and prior_sold / prior_total >= 0.95
-            and unsaturated_share >= 0.50
-        ):
-            # A normal Bot that sold out in an unsaturated market uses most of
-            # its available capital on complete groups. If that expansion stops
-            # selling through, the existing surplus branch cuts it next round;
-            # only then is the remaining cash an intentional control strategy.
-            deployment_fraction = rng.uniform(0.84, 0.94)
-            deployable_groups = math.floor(
-                max(0.0, cash_budget * deployment_fraction - fixed_before_groups)
-                / max(group_cost, 1.0)
-            )
-            demand_groups = max(demand_groups, deployable_groups)
-        high_groups = _affordable_group_count(
-            cash_budget,
-            fixed_before_groups,
-            group_cost,
-            demand_groups,
+        # Hard cash rule supplied by the organiser: after Agent and MI, every
+        # Bot buys the maximum number of complete groups. The only exception is
+        # when every market was at least 95% full in the previous round.
+        formula_groups = math.floor(
+            max(0.0, cash_budget - fixed_before_groups) / max(group_cost, 1.0)
         )
         low_groups = 0
+        if all_markets_full:
+            high_groups = max(0, demand_groups)
+        else:
+            high_groups = max(1, demand_groups, formula_groups)
+            while budget_for(int(math.floor(high_groups * group["products"])))["total"] <= cash_budget + 1e-9:
+                low_groups = high_groups
+                high_groups *= 2
         while low_groups < high_groups:
             middle_groups = (low_groups + high_groups + 1) // 2
             middle_products = int(math.floor(middle_groups * group["products"]))
@@ -1159,7 +1185,13 @@ def _submit_bots(
                     + (transport_cost if str(market["city"]) != home else 0.0)
                 )
                 margin = 1.12 if super_mode else 1.06
-                reference = max(reference, direct_unit_cost * 1.12, allocated_operating_cost * margin)
+                if super_mode and price_ratio_override is not None:
+                    # An explicit optimiser candidate may run a pure low-price
+                    # strategy. Candidate scoring already rejects a total-plan
+                    # loss, so only protect the direct unit contribution here.
+                    reference = max(reference, direct_unit_cost * 1.03)
+                else:
+                    reference = max(reference, direct_unit_cost * 1.12, allocated_operating_cost * margin)
                 rows.append({
                     "index": index, "city": str(market["city"]), "agent_delta": delta,
                     "agents_after": agents_after, "marketing": marketing,
@@ -1227,7 +1259,9 @@ def _submit_bots(
                 1.0, 500.0, 1000.0, 1750.0, 2500.0, 3000.0,
                 min(3000.0, max(1.0, qi_index_target)),
             })
-            mi_ratio_candidates = {0.0} if not use_mi else {1.0, 1.5, 2.25, 3.0, 4.5, 6.0}
+            mi_ratio_candidates = (
+                {0.0} if not use_mi else {0.0, 1.0, 1.5, 2.25, 3.0, 4.5, 6.0}
+            )
             price_ratio_candidates = {
                 min(0.98, max(0.75, high_price_ratio)), 0.95, 0.88, 0.81, 0.75,
             }
@@ -1259,7 +1293,27 @@ def _submit_bots(
                 previous_prices[index] >= min(price_max, float(markets[index]["max_price"])) * 0.75
                 for index in selected
             ):
-                price_ratio_candidates.update((0.68, 0.60, 0.52))
+                # Once the low-price condition opens, search continuously down
+                # to the configured floor and include small undercuts of every
+                # visible rival price. MA/QI=1 and MI=0 form the pure-price path.
+                minimum_ratio = max(
+                    price_min / max(1.0, min(price_max, float(markets[index]["max_price"])))
+                    for index in selected
+                )
+                price_ratio_candidates.update(
+                    max(minimum_ratio, ratio)
+                    for ratio in (0.70, 0.64, 0.58, 0.52, 0.46, 0.40, 0.34, 0.28, 0.22, 0.16)
+                )
+                price_ratio_candidates.add(minimum_ratio)
+                for index in selected:
+                    cap = min(price_max, float(markets[index]["max_price"]))
+                    if cap <= 0 or previous_prices[index] < cap * 0.75:
+                        continue
+                    for rival in rival_metrics[index]:
+                        if rival["price"] > 0:
+                            price_ratio_candidates.add(
+                                min(0.98, max(minimum_ratio, rival["price"] / cap - 0.004))
+                            )
 
             def evaluate_candidate(
                 candidate_ma: float,
@@ -1280,11 +1334,14 @@ def _submit_bots(
                     + candidate_qi * group["products"]
                 )
                 candidate_fixed = agent_cost + sum(candidate_marketing.values())
+                candidate_group_limit = math.floor(
+                    max(0.0, cash_budget - candidate_fixed) / max(candidate_group_cost, 1.0)
+                )
                 candidate_groups = _affordable_group_count(
                     cash_budget,
                     candidate_fixed,
                     candidate_group_cost,
-                    demand_groups,
+                    candidate_group_limit,
                 )
                 candidate_production = int(math.floor(candidate_groups * group["products"]))
                 candidate_available = old_products + candidate_production
@@ -1319,7 +1376,7 @@ def _submit_bots(
                         + component_labor + product_labor
                         + (transport_cost if str(market["city"]) != home else 0.0)
                     )
-                    candidate_price = min(cap, max(price_min, candidate_price, direct_unit_cost * 1.08))
+                    candidate_price = min(cap, max(price_min, candidate_price, direct_unit_cost * 1.03))
                     entries: list[dict[str, float | int]] = []
                     weighted_prices: list[tuple[float, float]] = []
                     for rival_number, rival in enumerate(rival_metrics[index]):
@@ -1365,21 +1422,15 @@ def _submit_bots(
                 predicted_transport = predicted_sold * transport_cost * non_home_capacity / max(1.0, capacity_weight)
                 predicted_cost = candidate_fixed + candidate_groups * candidate_group_cost + predicted_transport
                 predicted_profit = predicted_sold * predicted_price - predicted_cost
-                # Prefer the narrow band where calculated CPI capacity matches
-                # stock. More CPI than the Bot can consume is wasted even if it
-                # technically guarantees a sell-out.
-                tier = 5 if 0.995 <= cpi_coverage <= 1.02 and predicted_profit > 0 else (
-                    4 if 0.98 <= cpi_coverage <= 1.05 and predicted_profit > 0 else (
-                        3 if 0.90 <= cpi_coverage <= 1.15 and predicted_profit > 0 else (
-                            2 if sell_ratio >= 0.80 and predicted_profit > 0 else (1 if predicted_profit > 0 else 0)
-                        )
-                    )
-                )
+                # Profit is the primary objective. Sell-through and CPI/stock
+                # fit break ties between similarly profitable strategies, so a
+                # pure low-price plan is selected only when it truly earns more.
                 return {
                     "score": (
-                        tier,
-                        -abs(cpi_coverage - 1.0),
+                        int(predicted_profit > 0),
                         predicted_profit,
+                        sell_ratio,
+                        -abs(cpi_coverage - 1.0),
                         candidate_price_ratio,
                     ),
                     "ma": candidate_ma, "qi": candidate_qi,
@@ -1405,28 +1456,25 @@ def _submit_bots(
                 ma_index_target = float(best_candidate["ma"])
                 qi_index_target = float(best_candidate["qi"])
                 marketing_targets = dict(best_candidate["marketing"])
-                chosen_groups = int(best_candidate["groups"])
+                low_groups = 0
+                high_groups = max(1, int(best_candidate["groups"]))
+                while budget_for(int(math.floor(high_groups * group["products"])))["total"] <= cash_budget + 1e-9:
+                    low_groups = high_groups
+                    high_groups *= 2
+                while low_groups < high_groups:
+                    middle_groups = (low_groups + high_groups + 1) // 2
+                    middle_products = int(math.floor(middle_groups * group["products"]))
+                    if budget_for(middle_products)["total"] <= cash_budget + 1e-9:
+                        low_groups = middle_groups
+                    else:
+                        high_groups = middle_groups - 1
+                chosen_groups = low_groups
                 production = int(math.floor(chosen_groups * group["products"]))
                 budget = budget_for(production)
-                while chosen_groups > 0 and float(budget["total"]) > cash_budget + 1e-9:
-                    chosen_groups -= 1
-                    production = int(math.floor(chosen_groups * group["products"]))
-                    budget = budget_for(production)
                 city_rows = make_city_rows(
                     False,
                     float(best_candidate["price_ratio"]),
                 )
-
-                # Final safety check uses the exact selected budget. Any cut is
-                # still made in whole groups, preserving F:G:H:I and MA/QI.
-                chosen_capacity = forecast_super_capacity(city_rows)
-                if chosen_capacity < old_products + production:
-                    safe_new_products = max(0, int(chosen_capacity) - old_products)
-                    safe_groups = math.floor(safe_new_products / max(group["products"], 1.0))
-                    if safe_groups < chosen_groups:
-                        production = int(math.floor(safe_groups * group["products"]))
-                        budget = budget_for(production)
-                        city_rows = make_city_rows(False, float(best_candidate["price_ratio"]))
 
         active_rows = [row for row in city_rows if int(row["agents_after"]) > 0 and int(row["index"]) in selected]
         weight_total = sum(
