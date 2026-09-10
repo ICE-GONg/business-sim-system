@@ -17,6 +17,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
+DB_API_VERSION = 2
 
 
 def now_iso() -> str:
@@ -118,6 +119,7 @@ def init_db() -> None:
                 component_inventory INTEGER NOT NULL DEFAULT 0,
                 product_inventory INTEGER NOT NULL DEFAULT 0,
                 is_bot INTEGER NOT NULL DEFAULT 0,
+                is_super_bot INTEGER NOT NULL DEFAULT 0,
                 bot_profile INTEGER NOT NULL DEFAULT 0,
                 component_storage_capacity INTEGER NOT NULL DEFAULT 0,
                 product_storage_capacity INTEGER NOT NULL DEFAULT 0,
@@ -265,6 +267,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE companies ADD COLUMN component_inventory INTEGER NOT NULL DEFAULT 0")
         if "is_bot" not in company_columns:
             conn.execute("ALTER TABLE companies ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+        if "is_super_bot" not in company_columns:
+            conn.execute("ALTER TABLE companies ADD COLUMN is_super_bot INTEGER NOT NULL DEFAULT 0")
         if "bot_profile" not in company_columns:
             conn.execute("ALTER TABLE companies ADD COLUMN bot_profile INTEGER NOT NULL DEFAULT 0")
         for key, value in DEFAULT_SETTINGS.items():
@@ -364,7 +368,7 @@ def current_round(conn: sqlite3.Connection) -> sqlite3.Row | None:
 def capture_round_snapshot(conn: sqlite3.Connection, round_no: int) -> None:
     """Store the exact mutable competition state before a round is settled."""
     company_columns = (
-        "id,code,name,home_city,cash,debt,patents,research_balance,component_inventory,product_inventory,is_bot,bot_profile,"
+        "id,code,name,home_city,cash,debt,patents,research_balance,component_inventory,product_inventory,is_bot,is_super_bot,bot_profile,"
         "component_storage_capacity,product_storage_capacity,setup_submitted_at"
     )
     snapshot = {
@@ -415,6 +419,7 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
                 "component_inventory": int(production.get("component_surplus", 0)),
                 "product_inventory": int(previous_result["inventory"]) if previous_result is not None else 0,
                 "is_bot": int(company.get("is_bot", 0)),
+                "is_super_bot": int(company.get("is_super_bot", 0)),
                 "bot_profile": int(company.get("bot_profile", 0)),
                 "component_storage_capacity": int(production.get("component_storage_after", 0)),
                 "product_storage_capacity": int(production.get("product_storage_after", 0)),
@@ -469,7 +474,7 @@ def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) 
     existing_company_ids = {int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies")}
     existing_cities = {str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config")}
     company_fields = (
-        "name=?,home_city=?,cash=?,debt=?,patents=?,research_balance=?,component_inventory=?,product_inventory=?,is_bot=?,bot_profile=?,"
+        "name=?,home_city=?,cash=?,debt=?,patents=?,research_balance=?,component_inventory=?,product_inventory=?,is_bot=?,is_super_bot=?,bot_profile=?,"
         "component_storage_capacity=?,product_storage_capacity=?,setup_submitted_at=?"
     )
     for company in snapshot.get("companies", []):
@@ -484,7 +489,7 @@ def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) 
                 float(company.get("debt", 0)), int(company.get("patents", 0)),
                 float(company.get("research_balance", 0)),
                 int(company.get("component_inventory", 0)), int(company.get("product_inventory", 0)),
-                int(company.get("is_bot", 0)), int(company.get("bot_profile", 0)), int(company.get("component_storage_capacity", 0)),
+                int(company.get("is_bot", 0)), int(company.get("is_super_bot", 0)), int(company.get("bot_profile", 0)), int(company.get("component_storage_capacity", 0)),
                 int(company.get("product_storage_capacity", 0)),
                 company.get("setup_submitted_at") if restored_home else None,
                 company_id,
@@ -585,7 +590,7 @@ def reset_competition(conn: sqlite3.Connection) -> None:
         conn.execute(f"DELETE FROM {table}")
     initial_cash = get_setting(conn, "initial_cash", 15_000_000)
     homes = [str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config WHERE home_enabled=1 ORDER BY city")]
-    for company in all_rows(conn, "SELECT id,code,is_bot,bot_profile FROM companies ORDER BY id"):
+    for company in all_rows(conn, "SELECT id,code,is_bot,is_super_bot,bot_profile FROM companies ORDER BY id"):
         if bool(company["is_bot"]) and homes:
             home = homes[int(company["bot_profile"] or 0) % len(homes)]
             conn.execute(

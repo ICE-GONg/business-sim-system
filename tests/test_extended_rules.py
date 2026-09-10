@@ -171,6 +171,85 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertLess(decision["worker_delta"], 0)
             self.assertLess(decision["engineer_delta"], 0)
 
+    def test_super_bot_waits_reads_rivals_and_never_underfunds_patent(self):
+        db = self.fresh("super-bot.db")
+        human_id = self.one_company(db)
+        with db.connect() as conn:
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (human_id,))
+            cursor = conn.execute(
+                "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,is_super_bot,bot_profile,"
+                "setup_submitted_at,created_at) VALUES('SBOT01','Super',?,'深圳',15000000,1,1,3,?,?)",
+                (db.hash_password("x"), db.now_iso(), db.now_iso()),
+            )
+            super_id = int(cursor.lastrowid)
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'深圳',1)", (super_id,))
+            from sim.bots import submit_bot_decisions, submit_super_bot_decisions
+            self.assertEqual(submit_bot_decisions(conn, 1), 0)
+            with self.assertRaises(ValueError):
+                submit_super_bot_decisions(conn, 1)
+            conn.execute(
+                "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,management_investment,"
+                "quality_investment,submitted_at) VALUES(?,1,3300,6400,100000,100000,?)",
+                (human_id, db.now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,1,'广州',20000)",
+                (human_id,),
+            )
+            self.assertEqual(submit_super_bot_decisions(conn, 1), 1)
+            decision = db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1", (super_id,))
+            self.assertIn(decision["research_investment"], (0, 8_150_000))
+            self.assertGreater(decision["production_volume"], 0)
+            super_prices = db.all_rows(
+                conn,
+                "SELECT price FROM city_decisions WHERE company_id=? AND round_no=1 AND agent_delta>=0",
+                (super_id,),
+            )
+            # It undercuts only when the resulting price still covers its own
+            # full operating cost; otherwise profitability wins.
+            self.assertTrue(all(3_500 <= float(row["price"]) <= 25_000 for row in super_prices))
+            from sim.engine import settle_round
+            conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+            settle_round(conn, 1)
+            result = db.one(conn, "SELECT * FROM results WHERE company_id=? AND round_no=1", (super_id,))
+            self.assertGreaterEqual(result["sold"], int(result["produced"] * 0.80))
+
+    def test_regular_bots_use_diverse_prices_and_cpi_profiles(self):
+        db = self.fresh("bot-diversity.db")
+        first_id = self.one_company(db, 30_000_000)
+        with db.connect() as conn:
+            markets = [row["city"] for row in db.all_rows(conn, "SELECT city FROM market_config ORDER BY city")]
+            for profile in range(7):
+                if profile == 0:
+                    company_id = first_id
+                    conn.execute(
+                        "UPDATE companies SET code='BOT01',name='Bot 1',is_bot=1,bot_profile=0,home_city=?,setup_submitted_at=? WHERE id=?",
+                        (markets[0], db.now_iso(), company_id),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,bot_profile,setup_submitted_at,created_at) "
+                        "VALUES(?,?,?,?,30000000,1,?,?,?)",
+                        (f"BOT{profile + 1:02d}", f"Bot {profile + 1}", db.hash_password("x"), markets[profile], profile, db.now_iso(), db.now_iso()),
+                    )
+                    company_id = int(cursor.lastrowid)
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (company_id, markets[profile]))
+            from sim.bots import submit_bot_decisions
+            self.assertEqual(submit_bot_decisions(conn, 2), 7)
+            decisions = db.all_rows(conn, "SELECT * FROM decisions WHERE round_no=2 ORDER BY company_id")
+            prices = db.all_rows(
+                conn,
+                "SELECT cd.price FROM city_decisions cd JOIN companies c ON c.id=cd.company_id "
+                "WHERE cd.round_no=2 AND cd.city=c.home_city ORDER BY c.id",
+            )
+            ma_indices = {
+                round(float(row["management_investment"]) / max(1, int(row["worker_delta"]) + int(row["engineer_delta"])), 2)
+                for row in decisions
+            }
+            self.assertGreaterEqual(len({round(float(row["price"]), 2) for row in prices}), 5)
+            self.assertGreaterEqual(len(ma_indices), 5)
+            self.assertTrue(all(float(row["research_investment"]) == 8_150_000 for row in decisions))
+
     def test_failed_research_accumulates_into_next_round(self):
         db = self.fresh("research.db")
         company_id = self.one_company(db)

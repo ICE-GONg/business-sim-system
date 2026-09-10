@@ -36,12 +36,13 @@ from sim import bots as _bots_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
+    or getattr(_db_module, "DB_API_VERSION", 0) < 2
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 2
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 3
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -49,7 +50,7 @@ if (
     importlib.reload(_engine_module)
     importlib.reload(_bots_module)
 
-from sim.bots import submit_bot_decisions
+from sim.bots import submit_bot_decisions, submit_super_bot_decisions
 
 from sim.db import (
     all_rows,
@@ -1217,36 +1218,41 @@ def render_admin_companies() -> None:
     setup_editable = bool(round_row and round_row["status"] == "waiting")
     home_options = ["未选择"] + [str(row["city"]) for row in markets]
     with st.form("add_bots"):
-        bot_cols = st.columns([2, 2, 1])
+        bot_cols = st.columns([2, 1, 2, 1])
         bot_count = bot_cols[0].number_input("新增 Bot 数量", min_value=1, max_value=30, value=1, step=1, disabled=not setup_editable)
-        bot_cols[1].caption("Bot 会自动选择主场，并在每轮开启后立即提交；不添加则完全不触发。")
-        add_bots = bot_cols[2].form_submit_button("添加 Bot", type="primary", disabled=not setup_editable, use_container_width=True)
-    if add_bots:
+        add_bots = bot_cols[1].form_submit_button("添加普通 Bot", type="primary", disabled=not setup_editable, use_container_width=True)
+        super_bot_count = bot_cols[2].number_input("新增超级 Bot 数量", min_value=1, max_value=10, value=1, step=1, disabled=not setup_editable)
+        add_super_bots = bot_cols[3].form_submit_button("添加超级 Bot", disabled=not setup_editable, use_container_width=True)
+        st.caption("普通 Bot 开轮立即提交；超级 Bot 等其他队伍全部提交后读取本轮决策，再分析并提交。")
+    if add_bots or add_super_bots:
         if not markets:
             st.error("请先创建至少一个可选主场。")
         else:
             with connect() as conn:
-                existing = int(one(conn, "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1")["n"])
+                is_super = bool(add_super_bots)
+                existing = int(one(conn, "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1 AND is_super_bot=?", (int(is_super),))["n"])
                 initial_cash = get_setting(conn, "initial_cash", 15_000_000.0)
-                for offset in range(int(bot_count)):
+                requested_count = int(super_bot_count if is_super else bot_count)
+                prefix = "SBOT" if is_super else "BOT"
+                for offset in range(requested_count):
                     number_index = existing + offset + 1
-                    code_value = f"BOT{number_index:02d}"
+                    code_value = f"{prefix}{number_index:02d}"
                     while one(conn, "SELECT 1 FROM companies WHERE code=?", (code_value,)):
                         number_index += 1
-                        code_value = f"BOT{number_index:02d}"
+                        code_value = f"{prefix}{number_index:02d}"
                     home = str(markets[(number_index - 1) % len(markets)]["city"])
                     cursor = conn.execute(
-                        "INSERT INTO companies(code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,bot_profile,created_at) VALUES(?,?,?,?,?,?,1,?,?)",
-                        (code_value, f"Auto Company {number_index}", hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(), number_index % 7, now_iso()),
+                        "INSERT INTO companies(code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,is_super_bot,bot_profile,created_at) VALUES(?,?,?,?,?,?,1,?,?,?)",
+                        (code_value, f"{'Super ' if is_super else ''}Auto Company {number_index}", hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(), int(is_super), number_index % 7, now_iso()),
                     )
                     conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cursor.lastrowid, home))
-            flash("success", f"已添加 {int(bot_count)} 支 Bot 队伍。")
+            flash("success", f"已添加 {requested_count} 支{'超级' if is_super else '普通'} Bot 队伍。")
             st.rerun()
     if not setup_editable:
         st.info("比赛已开始：为避免影响结算，赛前资料已锁定。密码仍可重置。")
 
     for company in companies:
-        bot_tag = " · BOT" if bool(company["is_bot"]) else ""
+        bot_tag = (" · 超级 BOT" if bool(company["is_super_bot"]) else " · BOT") if bool(company["is_bot"]) else ""
         with st.expander(f"{company['code']} · {company['name']} · {company['home_city'] or '未选主场'}{bot_tag}"):
             st.markdown("##### 代管赛前资料")
             with st.form(f"admin_company_setup_{company['id']}"):
@@ -1311,6 +1317,24 @@ def render_admin_companies() -> None:
                         st.rerun()
                     except ValueError as exc:
                         st.error(str(exc))
+
+            if bool(company["is_bot"]):
+                with st.form(f"bot_type_{company['id']}"):
+                    current_type = "超级 Bot" if bool(company["is_super_bot"]) else "普通 Bot"
+                    bot_type = st.radio(
+                        "Bot 类型", ["普通 Bot", "超级 Bot"],
+                        index=1 if bool(company["is_super_bot"]) else 0,
+                        horizontal=True, disabled=not setup_editable,
+                    )
+                    save_bot_type = st.form_submit_button("保存 Bot 类型", disabled=not setup_editable)
+                if save_bot_type:
+                    with connect() as conn:
+                        conn.execute(
+                            "UPDATE companies SET is_super_bot=? WHERE id=?",
+                            (int(bot_type == "超级 Bot"), company["id"]),
+                        )
+                    flash("success", f"{company['code']} 已切换为{bot_type}。")
+                    st.rerun()
 
             st.markdown("##### 登录权限")
             with st.form(f"admin_company_password_{company['id']}"):
@@ -1594,15 +1618,27 @@ def render_admin_rounds() -> None:
         total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
         default_minutes = max(1, get_setting(conn, "round_duration_minutes", 30, int))
         default_test_round = bool(get_setting(conn, "test_round_enabled", 0, int))
-        companies_for_bonus = all_rows(conn, "SELECT id,code,name,is_bot FROM companies ORDER BY id")
+        companies_for_bonus = all_rows(conn, "SELECT id,code,name,is_bot,is_super_bot FROM companies ORDER BY id")
         setup = setup_status(conn)
         submission = submission_status(conn, int(round_row["round_no"])) if round_row and round_row["status"] in ("open", "paused") else None
         decisions = all_rows(
             conn,
-            "SELECT c.code,c.name,c.home_city,c.setup_submitted_at,d.submitted_at,d.production_volume,d.management_investment,d.quality_investment,d.research_investment "
+            "SELECT c.code,c.name,c.home_city,c.setup_submitted_at,c.is_bot,c.is_super_bot,d.submitted_at,d.production_volume,d.management_investment,d.quality_investment,d.research_investment "
             "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=? ORDER BY c.id",
             (int(round_row["round_no"]),),
         ) if round_row else []
+        regular_status = one(
+            conn,
+            "SELECT COUNT(*) AS total,SUM(CASE WHEN d.submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted "
+            "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=? WHERE c.is_super_bot=0",
+            (int(round_row["round_no"]),),
+        ) if round_row else None
+        super_status = one(
+            conn,
+            "SELECT COUNT(*) AS total,SUM(CASE WHEN d.submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted "
+            "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=? WHERE c.is_super_bot=1",
+            (int(round_row["round_no"]),),
+        ) if round_row else None
         history = all_rows(conn, "SELECT * FROM rounds ORDER BY round_no DESC")
     round_banner(round_row)
     current_round_no = int(round_row["round_no"]) if round_row else 1
@@ -1640,6 +1676,29 @@ def render_admin_rounds() -> None:
             flash("success", "测试轮已开始。" if started_round < 0 else "第一轮已开始。")
             st.rerun()
     elif round_row and round_row["status"] in ("open", "paused"):
+        regular_total = int(regular_status["total"] or 0) if regular_status else 0
+        regular_submitted = int(regular_status["submitted"] or 0) if regular_status else 0
+        super_total = int(super_status["total"] or 0) if super_status else 0
+        super_submitted = int(super_status["submitted"] or 0) if super_status else 0
+        if super_total:
+            st.markdown("#### 超级 Bot 决策")
+            st.caption(
+                f"真人玩家与普通 Bot：{regular_submitted}/{regular_total} · 超级 Bot：{super_submitted}/{super_total}。"
+                "超级 Bot 只会在其他队伍全部提交后读取本轮决策。"
+            )
+            if st.button(
+                "超级 Bot 分析并提交" if super_submitted < super_total else "重新分析并覆盖超级 Bot 决策",
+                type="primary",
+                disabled=regular_submitted < regular_total,
+                use_container_width=True,
+            ):
+                try:
+                    with connect() as conn:
+                        submit_super_bot_decisions(conn, int(round_row["round_no"]))
+                    flash("success", f"{super_total} 支超级 Bot 已读取全部对手决策并完成提交。")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
         cols = st.columns(4)
         if round_row["status"] == "open":
             if cols[0].button("暂停", use_container_width=True):
@@ -1658,9 +1717,13 @@ def render_admin_rounds() -> None:
                 conn.execute("UPDATE rounds SET ends_at=? WHERE round_no=?", ((old_end + timedelta(minutes=int(extend_minutes))).isoformat(), round_row["round_no"]))
             flash("success", f"已延长 {extend_minutes} 分钟。")
             st.rerun()
-        if cols[3].button("结算本轮", type="primary", use_container_width=True, disabled=not bool(submission and submission["all_submitted"])):
+        non_super_ready = regular_submitted >= regular_total
+        settlement_label = "超级 Bot 分析并结算" if super_total and super_submitted < super_total else "结算本轮"
+        if cols[3].button(settlement_label, type="primary", use_container_width=True, disabled=not non_super_ready):
             try:
                 with connect() as conn:
+                    if super_total and super_submitted < super_total:
+                        submit_super_bot_decisions(conn, int(round_row["round_no"]))
                     settle_round(conn, int(round_row["round_no"]))
                 completed_label = "测试轮" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
                 flash("success", f"{completed_label}结算完成。")
@@ -1719,7 +1782,7 @@ def render_admin_rounds() -> None:
     if decisions:
         st.subheader("队伍状态")
         status_frame = pd.DataFrame(
-            [{"队伍": row["code"], "公司": row["name"], "主场": row["home_city"] or "—", "赛前就绪": bool(row["setup_submitted_at"]), "本轮提交": bool(row["submitted_at"]), "计划产量": (row["production_volume"] or 0) if row["submitted_at"] else 0, "MA": (row["management_investment"] or 0) if row["submitted_at"] else 0, "QI": (row["quality_investment"] or 0) if row["submitted_at"] else 0, "专利": (row["research_investment"] or 0) if row["submitted_at"] else 0} for row in decisions]
+            [{"队伍": row["code"], "公司": row["name"], "类型": "超级 Bot" if row["is_super_bot"] else ("普通 Bot" if row["is_bot"] else "玩家"), "主场": row["home_city"] or "—", "赛前就绪": bool(row["setup_submitted_at"]), "本轮提交": bool(row["submitted_at"]), "计划产量": (row["production_volume"] or 0) if row["submitted_at"] else 0, "MA": (row["management_investment"] or 0) if row["submitted_at"] else 0, "QI": (row["quality_investment"] or 0) if row["submitted_at"] else 0, "专利": (row["research_investment"] or 0) if row["submitted_at"] else 0} for row in decisions]
         )
         st.dataframe(status_frame, hide_index=True, use_container_width=True)
     st.subheader("回合历史")
