@@ -250,6 +250,74 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreaterEqual(len(ma_indices), 5)
             self.assertTrue(all(float(row["research_investment"]) == 8_150_000 for row in decisions))
 
+    def test_round_three_mi_is_above_large_threshold_and_varied(self):
+        db = self.fresh("bot-mi-range.db")
+        first_id = self.one_company(db, 30_000_000)
+        with db.connect() as conn:
+            markets = [row["city"] for row in db.all_rows(conn, "SELECT city FROM market_config ORDER BY city")]
+            for profile in range(7):
+                if profile == 0:
+                    company_id = first_id
+                    conn.execute(
+                        "UPDATE companies SET code='BOT01',name='Bot 1',is_bot=1,bot_profile=0,home_city=?,setup_submitted_at=? WHERE id=?",
+                        (markets[0], db.now_iso(), company_id),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,bot_profile,setup_submitted_at,created_at) "
+                        "VALUES(?,?,?,?,30000000,1,?,?,?)",
+                        (f"BOT{profile + 1:02d}", f"Bot {profile + 1}", db.hash_password("x"), markets[profile], profile, db.now_iso(), db.now_iso()),
+                    )
+                    company_id = int(cursor.lastrowid)
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (company_id, markets[profile]))
+            from sim.bots import submit_bot_decisions
+            self.assertEqual(submit_bot_decisions(conn, 3), 7)
+            ratios = []
+            for row in db.all_rows(
+                conn,
+                "SELECT cd.marketing_investment,m.population,m.penetration,m.max_price,"
+                "COALESCE(a.count,0)+cd.agent_delta AS agents FROM city_decisions cd "
+                "JOIN market_config m ON m.city=cd.city LEFT JOIN agents a "
+                "ON a.company_id=cd.company_id AND a.city=cd.city "
+                "WHERE cd.round_no=3 AND cd.marketing_investment>0",
+            ):
+                size = float(row["population"]) * float(row["penetration"]) * 1.10 ** 2
+                large = (float(row["max_price"]) / 50.0) * size * 0.20
+                large /= (1.0 + int(row["agents"]) * 0.10) * 1.5 * 2.0
+                ratios.append(float(row["marketing_investment"]) / large)
+            self.assertEqual(len(ratios), 7)
+            self.assertGreaterEqual(min(ratios), 1.0)
+            self.assertGreater(max(ratios) / min(ratios), 2.5)
+
+    def test_all_super_bots_survive_and_sell_through_seven_rounds(self):
+        db = self.fresh("all-super-seven-rounds.db")
+        with db.connect() as conn:
+            db.set_setting(conn, "total_rounds", 7)
+            conn.execute("DELETE FROM companies")
+            markets = [row["city"] for row in db.all_rows(conn, "SELECT city FROM market_config ORDER BY city")]
+            for profile in range(7):
+                cursor = conn.execute(
+                    "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,is_super_bot,bot_profile,setup_submitted_at,created_at) "
+                    "VALUES(?,?,?,?,15000000,1,1,?,?,?)",
+                    (f"SBOT{profile + 1:02d}", f"Super {profile + 1}", db.hash_password("x"), markets[profile], profile, db.now_iso(), db.now_iso()),
+                )
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cursor.lastrowid, markets[profile]))
+            conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+            from sim.bots import submit_super_bot_decisions
+            from sim.engine import settle_round
+            for round_no in range(1, 8):
+                if round_no > 1:
+                    conn.execute("INSERT INTO rounds(round_no,status) VALUES(?,'open')", (round_no,))
+                self.assertEqual(submit_super_bot_decisions(conn, round_no), 7)
+                settle_round(conn, round_no)
+                for result in db.all_rows(conn, "SELECT * FROM results WHERE round_no=?", (round_no,)):
+                    report = json.loads(result["report_json"])
+                    available = int(result["produced"]) + int(report["production"]["old_products"])
+                    self.assertGreater(float(result["cash"]), 0)
+                    self.assertGreater(float(result["net_assets"]), 0)
+                    if available:
+                        self.assertGreaterEqual(int(result["sold"]), int(available * 0.80))
+
     def test_failed_research_accumulates_into_next_round(self):
         db = self.fresh("research.db")
         company_id = self.one_company(db)
