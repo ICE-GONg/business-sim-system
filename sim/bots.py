@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import random
 import sqlite3
 from typing import Any
 
@@ -9,7 +11,7 @@ from .cpi import allocate_city_cpi
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 
 
-BOT_API_VERSION = 4
+BOT_API_VERSION = 5
 
 BOT_PLANS = (
     {"production": 350, "ma": 1340, "markets": 1, "agents": 2, "research": 1_500_000},
@@ -90,14 +92,18 @@ def _selected_markets(bot: sqlite3.Row | dict[str, Any], markets: list[dict[str,
     profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else bot["id"]) % 7
     home = str(bot["home_city"] or markets[profile % len(markets)]["city"])
     home_index = next((i for i, market in enumerate(markets) if market["city"] == home), 0)
-    selected = [home_index]
-    cursor = home_index + profile + 1
-    while len(selected) < min(len(markets), count):
-        candidate = cursor % len(markets)
-        if candidate not in selected:
-            selected.append(candidate)
-        cursor += 1
-    return selected
+    candidates = [index for index in range(len(markets)) if index != home_index]
+    seed_text = f"markets:{bot['id']}:{bot['code']}:{bot['bot_profile']}"
+    seed = int.from_bytes(hashlib.sha256(seed_text.encode("utf-8")).digest()[:8], "big")
+    random.Random(seed).shuffle(candidates)
+    return [home_index, *candidates[:max(0, min(len(markets), count) - 1)]]
+
+
+def _bot_rng(bot: sqlite3.Row | dict[str, Any], round_no: int, super_mode: bool) -> random.Random:
+    """Stable per-team/per-round randomness, including after a Streamlit rerun."""
+    seed_text = f"decision:{bot['id']}:{bot['code']}:{round_no}:{int(super_mode)}"
+    seed = int.from_bytes(hashlib.sha256(seed_text.encode("utf-8")).digest()[:8], "big")
+    return random.Random(seed)
 
 
 def _upper_typical(values: list[float]) -> float:
@@ -176,7 +182,18 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             continue
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
         style = BOT_STYLES[profile]
-        variation = 0.94 + profile * 0.02
+        rng = _bot_rng(bot, round_no, super_mode)
+        variation = rng.uniform(0.88, 1.14)
+        ma_strength = min(4.25, max(0.62, float(style["ma"]) * rng.uniform(0.84, 1.20)))
+        qi_strength = min(3.40, max(0.78, float(style["qi"]) * rng.uniform(0.86, 1.18)))
+        mi_strength = min(3.60, max(1.03, float(style["mi"]) * rng.uniform(0.88, 1.16)))
+        high_price_ratio = min(0.982, max(0.925, float(style["high"]) + rng.uniform(-0.014, 0.014)))
+        price_cut = max(50.0, float(style["cut"]) * rng.uniform(0.72, 1.32))
+        ma_round_buffer = rng.uniform(0.96, 1.10)
+        super_aggression = rng.uniform(1.12, 1.34)
+        super_mi_cap = rng.uniform(2.80, 3.60)
+        normal_price_factor = rng.uniform(0.978, 0.994)
+        aggressive_price_factor = rng.uniform(0.935, 0.968)
         home = str(bot["home_city"] or markets[profile % len(markets)]["city"])
         home_market = next((market for market in markets if market["city"] == home), markets[0])
         report = _previous_report(conn, company_id, round_no)
@@ -191,11 +208,11 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         previous_engineer = float(previous["engineer_salary"]) if previous else float(home_market["engineer_initial_salary"])
         worker_salary, worker_multiplier = _bot_salary(
             report, "worker", float(home_market["worker_initial_salary"]), previous_worker,
-            profile, salary_min, salary_max, salary_change,
+            rng.uniform(0.0, 6.0), salary_min, salary_max, salary_change,
         )
         engineer_salary, engineer_multiplier = _bot_salary(
             report, "engineer", float(home_market["engineer_initial_salary"]), previous_engineer,
-            profile, salary_min, salary_max, salary_change,
+            rng.uniform(0.0, 6.0), salary_min, salary_max, salary_change,
         )
 
         selected = selected_by_bot[company_id]
@@ -205,7 +222,8 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         for index, market in enumerate(markets):
             row = one(conn, "SELECT count FROM agents WHERE company_id=? AND city=?", (company_id, market["city"]))
             current = int(row["count"] if row else 0)
-            desired = int(plan["agents"]) if index in selected else current
+            agent_variation = rng.choice((-1, 0, 0, 0, 1))
+            desired = max(1, int(plan["agents"]) + agent_variation) if index in selected else current
             delta = max(-current, min(3, desired - current))
             agent_plan[index] = (delta, current + delta)
             if delta > 0:
@@ -239,6 +257,8 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         old_components = int(bot["component_inventory"] or 0)
         desired_available = int(float(plan["production"]) * variation)
         prior_production = report.get("production", {})
+        prior_sold = 0
+        prior_total = 0
         if prior_production:
             prior_sold = int(prior_production.get("sold", 0) or 0)
             prior_total = int(prior_production.get("old_products", 0) or 0) + int(prior_production.get("produced", 0) or 0)
@@ -342,7 +362,10 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         # whenever it is opened its amount is at least the full large threshold.
         use_qi = market_pressure >= 0.55 or (plan_index >= 1 and profile in (2, 4, 6) and market_pressure >= 0.30)
         use_mi = plan_index >= 2
-        mi_city_limit = min(len(selected), 1 + max(0, plan_index - 2) // 2)
+        mi_city_limit = min(
+            len(selected),
+            1 + max(0, plan_index - 2) // 2 + (1 if plan_index >= 4 and rng.random() > 0.55 else 0),
+        )
         mi_priority = sorted(
             selected,
             key=lambda index: (
@@ -353,6 +376,16 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             reverse=True,
         )
         mi_selected = set(mi_priority[:mi_city_limit]) if use_mi else set()
+        # Per-company weights keep even bots sharing the same base style from
+        # choosing the same way to exhaust their cash.
+        extra_mi_share = rng.uniform(0.52, 0.74) if super_mode else rng.uniform(0.42, 0.68)
+        extra_qi_share = rng.uniform(0.16, 0.30)
+        extra_mi_weights = {
+            index: rng.uniform(0.65, 1.35)
+            * float(markets[index]["population"])
+            * float(markets[index]["penetration"])
+            for index in mi_selected
+        }
 
         def budget_for(production: int) -> dict[str, Any]:
             components_to_make = max(0, production * component_need - old_components)
@@ -376,17 +409,17 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             material_cost += production * float(home_market["product_material"]) * material_factor
             storage_cost = max(0, old_components + new_components - int(bot["component_storage_capacity"] or 0)) * float(home_market["component_storage"])
             storage_cost += max(0, old_products + production - int(bot["product_storage_capacity"] or 0)) * float(home_market["product_storage"])
-            ma_index = max(ma_threshold * 1.02, float(plan["ma"]) * variation) * float(style["ma"])
+            ma_index = max(ma_threshold * ma_round_buffer, float(plan["ma"]) * variation) * ma_strength
             if super_mode:
                 rival_ma = _upper_typical([item["ma"] for index in selected for item in rival_metrics[index]])
-                ma_index = min(5000.0, max(ma_index, ma_threshold * 1.12, rival_ma * 1.18))
+                ma_index = min(5000.0, max(ma_index, ma_threshold * super_aggression, rival_ma * super_aggression))
             management = ma_index * max(1, workers + engineers)
             denominator = old_products * 1.2 + production
             qi_line = max(float(markets[i]["max_price"]) / 50.0 for i in selected)
-            qi_index = qi_line * max(1.03, float(style["qi"]))
+            qi_index = qi_line * max(1.03, qi_strength)
             if super_mode:
                 rival_qi = _upper_typical([item["qi"] for index in selected for item in rival_metrics[index]])
-                qi_index = min(qi_line * 5.0, max(qi_index, qi_line * 1.12, rival_qi * 1.18))
+                qi_index = min(qi_line * 5.0, max(qi_index, qi_line * super_aggression, rival_qi * super_aggression))
             quality = qi_index * max(1.0, denominator) if use_qi else 0.0
             marketing: dict[int, float] = {}
             for index in selected:
@@ -395,12 +428,16 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
                 threshold = (float(market["max_price"]) / 50.0) * size * 0.20
                 threshold /= max(1.0, 1.0 + active_agents * 0.10) * 1.5 * 2.0
-                target_mi = threshold * float(style["mi"])
+                target_mi = threshold * mi_strength
                 if super_mode:
                     rival_mi = _upper_typical([item["mi_effective"] for item in rival_metrics[index]])
                     target_mi = min(
-                        threshold * 3.2,
-                        max(target_mi, threshold * 1.20, rival_mi * 1.18 / (1.0 + active_agents * 0.10)),
+                        threshold * super_mi_cap,
+                        max(
+                            target_mi,
+                            threshold * super_aggression,
+                            rival_mi * super_aggression / (1.0 + active_agents * 0.10),
+                        ),
                     )
                 marketing[index] = target_mi if index in mi_selected and active_agents else 0.0
             total = staff_cost + material_cost + storage_cost + agent_cost + management + quality + sum(marketing.values())
@@ -408,22 +445,17 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 "worker_delta": worker_delta, "engineer_delta": engineer_delta,
                 "workers": workers, "engineers": engineers, "management": management,
                 "quality": quality, "marketing": marketing, "staff_cost": staff_cost,
-                "agent_cost": agent_cost, "total": total,
+                "agent_cost": agent_cost,
+                "core_total": staff_cost + material_cost + storage_cost + agent_cost,
+                "total": total,
             }
 
         last_round = official_round >= total_rounds
-        if last_round:
-            cash_use_ratio = 0.99
-        elif market_pressure < 0.45:
-            cash_use_ratio = 0.965 if super_mode else 0.985
-        elif market_pressure < 0.60:
-            cash_use_ratio = 0.84 if super_mode else 0.90
-        else:
-            # Once the market is crowded, cash is deliberately retained instead
-            # of being converted into risky inventory. This is the Bot's basic
-            # hold-production analysis, not an arbitrary fixed cash reserve.
-            cash_use_ratio = 0.70 if super_mode else 0.74
-        cash_budget = max(0.0, float(bot["cash"])) * cash_use_ratio
+        # The latest game rule requires every Bot to commit all cash available
+        # before sales. Production remains demand-aware; any cash that should
+        # not create more stock is moved into its independently weighted CPI
+        # investments instead of being left idle.
+        cash_budget = max(0.0, float(bot["cash"]))
 
         # Never submit an MI plan that consumes the whole company before a
         # single product can be made. Postpone that line until the large
@@ -434,11 +466,14 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
 
         opened_investment_pools = 1 + int(use_qi) + int(use_mi)
         if market_pressure < 0.45:
-            target_fraction = 0.60
+            target_fraction = rng.uniform(0.54, 0.66)
         elif market_pressure < 0.60:
-            target_fraction = min(0.66, 0.16 * opened_investment_pools + 0.10)
+            target_fraction = min(0.68, (0.16 * opened_investment_pools + 0.10) * rng.uniform(0.90, 1.10))
         else:
-            target_fraction = min(0.68, 0.18 * opened_investment_pools + (0.18 if super_mode else 0.10))
+            target_fraction = min(
+                0.70,
+                (0.18 * opened_investment_pools + (0.18 if super_mode else 0.10)) * rng.uniform(0.88, 1.08),
+            )
         safe_market_units = 0.0
         for index in selected:
             market = markets[index]
@@ -458,7 +493,7 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 # The market grew only one step; forecast that other competent
                 # teams also expand after a sell-out instead of treating last
                 # round's empty capacity as ours alone.
-                expansion_factor = 1.65 + profile * 0.07
+                expansion_factor = rng.uniform(1.55, 2.12)
                 target_available = min(
                     target_available,
                     max(desired_available, int(prior_sold * expansion_factor + old_products)),
@@ -474,6 +509,38 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         production = low
         budget = budget_for(production)
 
+        def spend_remaining_cash(current: dict[str, Any]) -> dict[str, Any]:
+            remaining = max(0.0, cash_budget - float(current["total"]))
+            if remaining <= 1e-6:
+                return current
+            mi_amount = 0.0
+            qi_amount = 0.0
+            if use_mi and mi_selected:
+                mi_amount = remaining * extra_mi_share
+            if use_qi:
+                qi_amount = remaining * extra_qi_share
+            if mi_amount + qi_amount > remaining * 0.88:
+                scale = remaining * 0.88 / max(1.0, mi_amount + qi_amount)
+                mi_amount *= scale
+                qi_amount *= scale
+            if mi_amount > 0:
+                total_weight = sum(extra_mi_weights.values())
+                for index in mi_selected:
+                    current["marketing"][index] = float(current["marketing"].get(index, 0.0)) + (
+                        mi_amount * extra_mi_weights[index] / max(1.0, total_weight)
+                    )
+            current["quality"] = float(current["quality"]) + qi_amount
+            current["management"] = float(current["management"]) + remaining - mi_amount - qi_amount
+            current["total"] = cash_budget
+            return current
+
+        budget = spend_remaining_cash(budget)
+        inventory_heavy = (
+            old_products > max(20, prior_sold * 0.20)
+            or (prior_production and prior_total > 0 and prior_sold / prior_total < 0.90)
+            or production_limit < production_goal
+        )
+
         def make_city_rows(aggressive: bool = False) -> list[dict[str, float | int | str]]:
             rows: list[dict[str, float | int | str]] = []
             active_sizes = [
@@ -488,21 +555,21 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 ) / sum(active_sizes)
             available_units = max(1, old_products + production)
             allocated_operating_cost = (
-                float(budget["total"]) + available_units * transport_cost * non_home_share
+                float(budget["core_total"]) + available_units * transport_cost * non_home_share
             ) / available_units
             for index, market in enumerate(markets):
                 delta, agents_after = agent_plan[index]
                 marketing = budget["marketing"].get(index, 0.0)
                 cap = min(price_max, float(market["max_price"]))
                 city_pressure = max(utilization.get(index, 0.0), current_pressure.get(index, 0.0))
-                reference = cap * float(style["high"])
+                reference = cap * high_price_ratio
                 if index in selected and (city_pressure >= 0.60 or aggressive):
-                    reference = previous_prices[index] - float(style["cut"])
+                    reference = previous_prices[index] - price_cut
                 if super_mode and index in selected and (city_pressure >= 0.40 or aggressive):
                     rival_prices = [item["price"] for item in rival_metrics[index] if item["price"] > 0]
                     rival_floor = min(rival_prices, default=previous_prices[index])
-                    factor = 0.955 - profile * 0.002 if aggressive else 0.988 - profile * 0.001
-                    reference = min(previous_prices[index] - float(style["cut"]), rival_floor * factor)
+                    factor = aggressive_price_factor if aggressive else normal_price_factor
+                    reference = min(previous_prices[index] - price_cut, rival_floor * factor)
                 component_labor = component_need * worker_need * worker_hours / 504.0 * worker_salary * 3
                 product_labor = engineer_need * engineer_hours / 504.0 * engineer_salary * 3
                 direct_unit_cost = (
@@ -560,7 +627,7 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                 capacity += size * float(mine["total_cpi"]) / 100.0
             return capacity
 
-        city_rows = make_city_rows(False)
+        city_rows = make_city_rows(inventory_heavy)
         if super_mode and old_products + production > 0:
             normal_capacity = forecast_super_capacity(city_rows)
             aggressive_rows = make_city_rows(True)
@@ -580,7 +647,7 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
 
             normal_revenue = potential_revenue(city_rows, normal_capacity)
             aggressive_revenue = potential_revenue(aggressive_rows, aggressive_capacity)
-            chosen_aggressive = aggressive_revenue > normal_revenue * 1.03
+            chosen_aggressive = inventory_heavy or aggressive_revenue > normal_revenue * 1.03
             if chosen_aggressive:
                 city_rows, normal_capacity = aggressive_rows, aggressive_capacity
             # Maintain a 25% capacity buffer. When the calculated CPI cannot
@@ -590,6 +657,7 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             if safe_available < old_products + production:
                 production = max(0, safe_available - old_products)
                 budget = budget_for(production)
+                budget = spend_remaining_cash(budget)
                 city_rows = make_city_rows(chosen_aggressive)
 
         active_rows = [row for row in city_rows if int(row["agents_after"]) > 0 and int(row["index"]) in selected]

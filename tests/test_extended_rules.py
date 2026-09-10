@@ -115,6 +115,26 @@ class ExtendedRulesTest(unittest.TestCase):
             reports = db.one(conn, "SELECT SUM(order_report) AS n FROM city_decisions WHERE company_id=? AND round_no=1", (company_id,))
             self.assertEqual(reports["n"], 0)
 
+            from sim.engine import settle_round
+
+            settle_round(conn, 1)
+            report = json.loads(
+                db.one(
+                    conn,
+                    "SELECT report_json FROM results WHERE company_id=? AND round_no=1",
+                    (company_id,),
+                )["report_json"]
+            )
+            finance = report["finance"]
+            pre_sales_spending = sum(
+                float(finance[key])
+                for key in (
+                    "wages", "layoff", "quit_penalty", "training", "materials", "storage",
+                    "agents", "marketing", "quality", "management",
+                )
+            )
+            self.assertAlmostEqual(pre_sales_spending, float(finance["round_begins"]), places=2)
+
     def test_bot_opens_threshold_investments_in_order_and_prices_by_saturation(self):
         db = self.fresh("bot-strategy.db")
         company_id = self.one_company(db)
@@ -249,6 +269,85 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreaterEqual(len({round(float(row["price"]), 2) for row in prices}), 5)
             self.assertGreaterEqual(len(ma_indices), 5)
             self.assertTrue(all(float(row["research_investment"]) == 8_150_000 for row in decisions))
+
+    def test_bots_with_repeated_profiles_still_choose_distinct_numbers(self):
+        db = self.fresh("bot-repeated-profiles.db")
+        first_id = self.one_company(db, 30_000_000)
+        with db.connect() as conn:
+            market = db.one(conn, "SELECT city FROM market_config ORDER BY city LIMIT 1")["city"]
+            bot_ids = []
+            for number in range(14):
+                if number == 0:
+                    company_id = first_id
+                    conn.execute(
+                        "UPDATE companies SET code='BOT01',name='Bot 1',is_bot=1,bot_profile=0,home_city=?,setup_submitted_at=? WHERE id=?",
+                        (market, db.now_iso(), company_id),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,bot_profile,setup_submitted_at,created_at) "
+                        "VALUES(?,?,?,?,30000000,1,?,?,?)",
+                        (
+                            f"BOT{number + 1:02d}",
+                            f"Bot {number + 1}",
+                            db.hash_password("x"),
+                            market,
+                            number % 7,
+                            db.now_iso(),
+                            db.now_iso(),
+                        ),
+                    )
+                    company_id = int(cursor.lastrowid)
+                bot_ids.append(company_id)
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (company_id, market))
+
+            from sim.bots import submit_bot_decisions
+
+            self.assertEqual(submit_bot_decisions(conn, 3), 14)
+            signatures = {}
+            for company_id in bot_ids:
+                decision = db.one(
+                    conn,
+                    "SELECT management_investment,quality_investment,production_volume FROM decisions "
+                    "WHERE company_id=? AND round_no=3",
+                    (company_id,),
+                )
+                city = db.one(
+                    conn,
+                    "SELECT marketing_investment,price FROM city_decisions "
+                    "WHERE company_id=? AND round_no=3 AND city=?",
+                    (company_id, market),
+                )
+                signatures[company_id] = (
+                    round(float(decision["management_investment"]), 2),
+                    round(float(decision["quality_investment"]), 2),
+                    int(decision["production_volume"]),
+                    round(float(city["marketing_investment"]), 2),
+                    round(float(city["price"]), 2),
+                )
+
+            self.assertGreaterEqual(len(set(signatures.values())), 12)
+            for profile in range(7):
+                self.assertNotEqual(signatures[bot_ids[profile]], signatures[bot_ids[profile + 7]])
+
+    def test_bulk_delete_is_atomic_and_keeps_one_company(self):
+        db = self.fresh("bulk-delete.db")
+        with db.connect() as conn:
+            companies = db.all_rows(conn, "SELECT id FROM companies ORDER BY id")
+            self.assertGreaterEqual(len(companies), 2)
+            first_two = [int(row["id"]) for row in companies[:2]]
+            deleted = db.delete_companies(conn, first_two)
+            self.assertEqual(deleted, 2)
+            remaining = db.all_rows(conn, "SELECT id FROM companies ORDER BY id")
+            self.assertEqual(len(remaining), len(companies) - 2)
+
+            remaining_ids = [int(row["id"]) for row in remaining]
+            with self.assertRaises(ValueError):
+                db.delete_companies(conn, remaining_ids)
+            self.assertEqual(
+                int(db.one(conn, "SELECT COUNT(*) AS n FROM companies")["n"]),
+                len(remaining_ids),
+            )
 
     def test_round_three_mi_is_above_large_threshold_and_varied(self):
         db = self.fresh("bot-mi-range.db")

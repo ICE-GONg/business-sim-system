@@ -36,13 +36,13 @@ from sim import bots as _bots_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 2
+    or getattr(_db_module, "DB_API_VERSION", 0) < 4
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 4
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 5
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -59,6 +59,7 @@ from sim.db import (
     database_bytes,
     delete_city,
     delete_company,
+    delete_companies,
     employee_count,
     get_setting,
     hash_password,
@@ -1243,13 +1244,43 @@ def render_admin_companies() -> None:
                     home = str(markets[(number_index - 1) % len(markets)]["city"])
                     cursor = conn.execute(
                         "INSERT INTO companies(code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,is_super_bot,bot_profile,created_at) VALUES(?,?,?,?,?,?,1,?,?,?)",
-                        (code_value, f"{'Super ' if is_super else ''}Auto Company {number_index}", hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(), int(is_super), number_index % 7, now_iso()),
+                        (code_value, f"{'Super ' if is_super else ''}Auto Company {number_index}", hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(), int(is_super), number_index, now_iso()),
                     )
                     conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cursor.lastrowid, home))
             flash("success", f"已添加 {requested_count} 支{'超级' if is_super else '普通'} Bot 队伍。")
             st.rerun()
     if not setup_editable:
         st.info("比赛已开始：为避免影响结算，赛前资料已锁定。密码仍可重置。")
+
+    st.markdown("#### 批量删除玩家与 Bot")
+    company_labels = {
+        int(company["id"]): (
+            f"{company['code']} · {company['name']} · "
+            f"{'超级 Bot' if company['is_super_bot'] else ('普通 Bot' if company['is_bot'] else '玩家')}"
+        )
+        for company in companies
+    }
+    with st.form("bulk_delete_companies"):
+        selected_company_ids = st.multiselect(
+            "选择要删除的队伍",
+            options=list(company_labels),
+            format_func=lambda company_id: company_labels[company_id],
+            placeholder="可一次选择多个玩家、普通 Bot 或超级 Bot",
+        )
+        confirm_bulk_delete = st.checkbox("我确认永久删除所选队伍及其全部比赛数据")
+        bulk_delete = st.form_submit_button(
+            f"批量删除所选队伍",
+            disabled=not confirm_bulk_delete or not selected_company_ids,
+            use_container_width=True,
+        )
+    if bulk_delete:
+        try:
+            with connect() as conn:
+                deleted_count = delete_companies(conn, [int(company_id) for company_id in selected_company_ids])
+            flash("success", f"已批量删除 {deleted_count} 支队伍。")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
 
     for company in companies:
         bot_tag = (" · 超级 BOT" if bool(company["is_super_bot"]) else " · BOT") if bool(company["is_bot"]) else ""
@@ -1794,7 +1825,7 @@ def render_admin_rounds() -> None:
         rollback_target = max(settled_round_numbers)
         st.markdown(
             f'<div class="danger">将撤销第 {rollback_target} 轮结算，恢复该轮结算前的现金、负债、库存、专利、员工和 Agent；'
-            '更晚回合会被删除；该轮原决策保留为草稿，玩家需重新提交。</div>',
+            '更晚回合会被删除；真人玩家的原决策保留为草稿，普通 Bot 会立即重新决策并提交。</div>',
             unsafe_allow_html=True,
         )
         rollback_cols = st.columns([1, 2])
@@ -1813,7 +1844,24 @@ def render_admin_rounds() -> None:
             try:
                 with connect() as conn:
                     reopened_round = rollback_latest_settled_round(conn, int(rollback_minutes))
-                flash("success", f"已撤销第 {reopened_round} 轮结算并重新开放，玩家可以修改后重新提交。")
+                    normal_bot_count = submit_bot_decisions(conn, reopened_round)
+                    missing_non_super = one(
+                        conn,
+                        "SELECT COUNT(*) AS n FROM companies c WHERE c.is_super_bot=0 AND NOT EXISTS "
+                        "(SELECT 1 FROM decisions d WHERE d.company_id=c.id AND d.round_no=? "
+                        "AND d.submitted_at IS NOT NULL)",
+                        (reopened_round,),
+                    )
+                    super_bot_count = 0
+                    if not missing_non_super or int(missing_non_super["n"] or 0) == 0:
+                        super_bot_count = submit_super_bot_decisions(conn, reopened_round)
+                bot_message = f"普通 Bot 已重新提交 {normal_bot_count} 支"
+                if super_bot_count:
+                    bot_message += f"，超级 Bot 已重新提交 {super_bot_count} 支"
+                flash(
+                    "success",
+                    f"已撤销第 {reopened_round} 轮结算并重新开放；{bot_message}。真人玩家可修改草稿后重新提交。",
+                )
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))

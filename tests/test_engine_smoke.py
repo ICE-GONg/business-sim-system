@@ -402,6 +402,11 @@ class SettlementSmokeTest(unittest.TestCase):
             db.init_db()
             with db.connect() as conn:
                 companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
+                bot_company_id = int(companies[1]["id"])
+                conn.execute(
+                    "UPDATE companies SET is_bot=1,bot_profile=8 WHERE id=?",
+                    (bot_company_id,),
+                )
                 conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
                 for company in companies:
                     conn.execute(
@@ -448,6 +453,22 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertIsNone(db.one(conn, "SELECT round_no FROM rounds WHERE round_no=2"))
                 self.assertEqual(db.one(conn, "SELECT COUNT(*) AS n FROM results")["n"], 0)
                 self.assertIsNone(db.one(conn, "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=1", (first_company_id,))["submitted_at"])
+                self.assertIsNone(
+                    db.one(
+                        conn,
+                        "SELECT company_id FROM decisions WHERE company_id=? AND round_no=1",
+                        (bot_company_id,),
+                    )
+                )
+                from sim.bots import submit_bot_decisions
+                self.assertEqual(submit_bot_decisions(conn, 1), 1)
+                self.assertIsNotNone(
+                    db.one(
+                        conn,
+                        "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=1",
+                        (bot_company_id,),
+                    )["submitted_at"]
+                )
                 self.assertIsNone(db.one(conn, "SELECT round_no FROM decisions WHERE company_id=? AND round_no=2", (first_company_id,)))
 
                 # Existing cloud databases may contain settled rounds created

@@ -17,7 +17,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 2
+DB_API_VERSION = 4
 
 
 def now_iso() -> str:
@@ -573,6 +573,19 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
     conn.execute("DELETE FROM city_decisions WHERE round_no>?", (target_round,))
     conn.execute("DELETE FROM decisions WHERE round_no>?", (target_round,))
     conn.execute("UPDATE decisions SET submitted_at=NULL WHERE round_no=?", (target_round,))
+    # Human decisions remain as editable drafts. Bot decisions must be removed:
+    # the bot submitter deliberately skips an existing row, so merely clearing
+    # submitted_at would leave every bot stuck as "not submitted" after rollback.
+    conn.execute(
+        "DELETE FROM city_decisions WHERE round_no=? AND company_id IN "
+        "(SELECT id FROM companies WHERE is_bot=1)",
+        (target_round,),
+    )
+    conn.execute(
+        "DELETE FROM decisions WHERE round_no=? AND company_id IN "
+        "(SELECT id FROM companies WHERE is_bot=1)",
+        (target_round,),
+    )
     conn.execute("DELETE FROM rounds WHERE round_no>=?", (target_round,))
     conn.execute("DELETE FROM round_snapshots WHERE round_no>=?", (target_round,))
     conn.execute("DELETE FROM round_bonuses WHERE round_no>?", (target_round,))
@@ -618,6 +631,24 @@ def delete_company(conn: sqlite3.Connection, company_id: int) -> None:
     if total and int(total["n"]) <= 1:
         raise ValueError("至少需要保留一个玩家。")
     conn.execute("DELETE FROM companies WHERE id=?", (company_id,))
+
+
+def delete_companies(conn: sqlite3.Connection, company_ids: list[int]) -> int:
+    """Atomically delete multiple teams while keeping at least one team."""
+    ids = sorted({int(company_id) for company_id in company_ids})
+    if not ids:
+        raise ValueError("请至少选择一个要删除的玩家或 Bot。")
+    placeholders = ",".join("?" for _ in ids)
+    existing = all_rows(conn, f"SELECT id FROM companies WHERE id IN ({placeholders})", tuple(ids))
+    existing_ids = [int(row["id"]) for row in existing]
+    if not existing_ids:
+        raise ValueError("所选玩家不存在或已经被删除。")
+    total = one(conn, "SELECT COUNT(*) AS n FROM companies")
+    if total and int(total["n"]) - len(existing_ids) < 1:
+        raise ValueError("至少需要保留一个玩家。")
+    delete_placeholders = ",".join("?" for _ in existing_ids)
+    conn.execute(f"DELETE FROM companies WHERE id IN ({delete_placeholders})", tuple(existing_ids))
+    return len(existing_ids)
 
 
 def delete_city(conn: sqlite3.Connection, city: str) -> None:
