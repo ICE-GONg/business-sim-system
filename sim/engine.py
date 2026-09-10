@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 8
+ENGINE_API_VERSION = 9
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -511,7 +511,11 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         product_storage_before = int(company["product_storage_capacity"])
 
         component_requirement = max(1, int(round(components_per_product)))
-        component_target = min(max(0, math.floor(component_capacity)), planned * component_requirement)
+        # Existing component inventory must be consumed first.  Producing the
+        # full plan again here made bots (and players) buy thousands of
+        # unnecessary components even when enough old components were on hand.
+        components_still_needed = max(0, planned * component_requirement - old_components)
+        component_target = min(max(0, math.floor(component_capacity)), components_still_needed)
 
         def component_cost(quantity: int) -> tuple[float, float, int]:
             storage_increase = max(0, old_components + quantity - component_storage_before)
@@ -559,6 +563,16 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         cash, product_storage_cost = spend(cash, requested_product_storage)
         component_used = produced * component_requirement
         component_surplus = total_components - component_used
+        engineer_capacity_units = max(0, math.floor(engineer_product_capacity))
+        component_capacity_units = max(0, total_components // component_requirement)
+        if produced >= planned:
+            production_bottleneck = "已完成计划"
+        elif produced < product_capacity:
+            production_bottleneck = "现金不足以支付产品材料或新增仓储"
+        elif engineer_capacity_units <= component_capacity_units:
+            production_bottleneck = f"工程师产能上限：{engineer_capacity_units} 件"
+        else:
+            production_bottleneck = f"可用零件上限：{component_capacity_units} 件产品"
         storage_cost = component_storage_cost + product_storage_cost
         conn.execute(
             "UPDATE companies SET component_storage_capacity=MAX(component_storage_capacity,?),product_storage_capacity=MAX(product_storage_capacity,?) WHERE id=?",
@@ -629,6 +643,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "average_worker_wage": average_worker_wage, "average_engineer_wage": average_engineer_wage,
             "produced": produced, "components": components, "old_components": old_components,
             "component_used": component_used, "component_surplus": component_surplus,
+            "engineer_capacity_units": engineer_capacity_units,
+            "component_capacity_units": component_capacity_units,
+            "production_bottleneck": production_bottleneck,
             "available": old_products + produced, "old_products": old_products,
             "cash_pre_sales": cash, "debt_before_interest": debt, "loan_base_net_assets": loan_base_net_assets,
             "loan_ceiling": loan_ceiling, "loan_limit": loan_limit, "loan_change": actual_loan_change,
@@ -925,6 +942,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "planned": state["decision"]["production_volume"], "produced": state["produced"], "components": state["components"],
                 "old_components": state["old_components"], "component_used": state["component_used"], "component_surplus": state["component_surplus"],
                 "components_per_product": component_requirement,
+                "engineer_capacity_units": state["engineer_capacity_units"],
+                "component_capacity_units": state["component_capacity_units"],
+                "bottleneck": state["production_bottleneck"],
                 "old_products": state["old_products"],
                 "sold": sold, "surplus": inventory, "ma_index": state["ma_index"], "qi_index": state["qi_index"],
                 "component_storage_before": state["component_storage_before"], "component_storage_after": state["component_storage_before"] + state["component_storage_increase"], "component_storage_increase": state["component_storage_increase"],

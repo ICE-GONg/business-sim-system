@@ -40,8 +40,8 @@ if (
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 8
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 1
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 2
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -964,6 +964,13 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         {"项目": "产品 Products", "计划": production.get("planned", 0), "期初": production.get("old_products", 0), "本轮生产": production.get("produced", 0), "总量": production.get("old_products", 0) + production.get("produced", 0), "使用/售出": production.get("sold", 0), "结余": production.get("surplus", 0)},
     ])
     st.dataframe(product_frame, hide_index=True, use_container_width=True)
+    if production.get("bottleneck"):
+        st.markdown(
+            f'<div class="report-note">生产结果：{html.escape(str(production["bottleneck"]))}。'
+            f'工程师最多可合成 {int(production.get("engineer_capacity_units", 0))} 件，'
+            f'现有零件最多可合成 {int(production.get("component_capacity_units", 0))} 件。</div>',
+            unsafe_allow_html=True,
+        )
     if "component_storage_before" in production:
         storage_frame = pd.DataFrame([
             {"仓储": "零件", "扩容前": production["component_storage_before"], "扩容后": production["component_storage_after"], "新增容量": production["component_storage_increase"]},
