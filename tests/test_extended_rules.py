@@ -233,6 +233,8 @@ class ExtendedRulesTest(unittest.TestCase):
             )
             self.assertEqual(submit_super_bot_decisions(conn, 1), 1)
             decision = db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1", (super_id,))
+            self.assertGreaterEqual(decision["loan_change"], 0)
+            self.assertGreaterEqual(decision["loan_change"], 3_500_000)
             self.assertIn(decision["research_investment"], (0, 8_150_000))
             self.assertGreater(decision["production_volume"], 0)
             self.assertEqual(int(decision["production_volume"]) % 72, 0)
@@ -275,13 +277,33 @@ class ExtendedRulesTest(unittest.TestCase):
                 ),
                 1,
             )
-            self.assertEqual(progress[-1], (1, 1, "SBOT01"))
+            self.assertEqual(progress[-1], (2, 2, "联合复算"))
             second = db.one(
                 conn,
                 "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=2",
                 (super_id,),
             )
             self.assertIsNotNone(second["submitted_at"])
+
+    def test_super_bot_uses_round_loan_floor_as_additional_capital(self):
+        db = self.fresh("super-bot-minimum-loan.db")
+        company_id = self.one_company(db, 0)
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE companies SET is_bot=1,is_super_bot=1,bot_profile=0,home_city='广州' WHERE id=?",
+                (company_id,),
+            )
+            conn.execute("UPDATE market_config SET min_loan=2000000,max_loan=3500000 WHERE city='广州'")
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company_id,))
+            from sim.bots import submit_super_bot_decisions
+
+            self.assertEqual(submit_super_bot_decisions(conn, 1), 1)
+            decision = db.one(
+                conn,
+                "SELECT loan_change FROM decisions WHERE company_id=? AND round_no=1",
+                (company_id,),
+            )
+            self.assertEqual(float(decision["loan_change"]), 2_000_000)
 
     def test_regular_bots_use_diverse_prices_and_cpi_profiles(self):
         db = self.fresh("bot-diversity.db")
