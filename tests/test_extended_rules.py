@@ -128,6 +128,7 @@ class ExtendedRulesTest(unittest.TestCase):
             city_first = db.one(conn, "SELECT * FROM city_decisions WHERE company_id=? AND round_no=1 AND city='广州'", (company_id,))
             headcount = first["worker_delta"] + first["engineer_delta"]
             self.assertGreater(first["management_investment"] / max(1, headcount), 1300)
+            self.assertEqual(first["quality_investment"], 0)
             self.assertEqual(city_first["marketing_investment"], 0)
             self.assertGreaterEqual(city_first["price"], 25_000 * 0.94)
             settle_round(conn, 1)

@@ -207,7 +207,7 @@ def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
             management = ma_index * max(1, workers + engineers)
             denominator = old_products * 1.2 + production
             qi_line = max(float(markets[i]["max_price"]) / 50.0 for i in selected)
-            quality = qi_line * (1.03 + profile * 0.01) * max(1.0, denominator) if use_qi else max(1.0, denominator)
+            quality = qi_line * (1.03 + profile * 0.01) * max(1.0, denominator) if use_qi else 0.0
             marketing: dict[int, float] = {}
             for index in selected:
                 market = markets[index]
