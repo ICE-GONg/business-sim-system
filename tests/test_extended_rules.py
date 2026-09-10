@@ -160,7 +160,7 @@ class ExtendedRulesTest(unittest.TestCase):
         company_id = self.one_company(db, 40_000_000)
         with db.connect() as conn:
             conn.execute(
-                "UPDATE companies SET is_bot=1,bot_profile=1,product_inventory=10000 WHERE id=?",
+                "UPDATE companies SET is_bot=1,bot_profile=1,product_inventory=100000 WHERE id=?",
                 (company_id,),
             )
             conn.execute("INSERT INTO employee_cohorts(company_id,role,count,hire_round) VALUES(?,'worker',100,0)", (company_id,))

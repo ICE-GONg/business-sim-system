@@ -73,6 +73,20 @@ def _staff_delta(
     return -min(current, removable)
 
 
+def _selected_markets(bot: sqlite3.Row | dict[str, Any], markets: list[dict[str, Any]], count: int) -> list[int]:
+    profile = int(bot["bot_profile"] or bot["id"]) % 7
+    home = str(bot["home_city"] or markets[profile % len(markets)]["city"])
+    home_index = next((i for i, market in enumerate(markets) if market["city"] == home), 0)
+    selected = [home_index]
+    cursor = home_index + profile + 1
+    while len(selected) < min(len(markets), count):
+        candidate = cursor % len(markets)
+        if candidate not in selected:
+            selected.append(candidate)
+        cursor += 1
+    return selected
+
+
 def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
     bots = all_rows(conn, "SELECT * FROM companies WHERE is_bot=1 ORDER BY id")
     markets = [dict(row) for row in all_rows(conn, "SELECT * FROM market_config ORDER BY city")]
@@ -97,6 +111,20 @@ def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
     ma_threshold = setting("cpi_ma_large_threshold", 1300)
     research_goal = setting("research_75", 6000000) * setting("research_hidden_threshold_multiplier", 4 / 3)
     research_goal += setting("research_buffer", 150000)
+
+    selected_by_bot = {
+        int(bot["id"]): _selected_markets(bot, markets, int(plan["markets"])) for bot in bots
+    }
+    city_competitors: dict[int, int] = {}
+    for index, market in enumerate(markets):
+        human_sellers = one(
+            conn,
+            "SELECT COUNT(*) AS n FROM agents a JOIN companies c ON c.id=a.company_id "
+            "WHERE c.is_bot=0 AND a.city=? AND a.count>0",
+            (market["city"],),
+        )
+        planned_bots = sum(index in indices for indices in selected_by_bot.values())
+        city_competitors[index] = max(1, int(human_sellers["n"] if human_sellers else 0) + planned_bots)
 
     submitted = 0
     for bot_row in bots:
@@ -127,14 +155,7 @@ def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
             profile, salary_min, salary_max, salary_change,
         )
 
-        home_index = next((i for i, market in enumerate(markets) if market["city"] == home), 0)
-        selected = [home_index]
-        cursor = home_index + profile + 1
-        while len(selected) < min(len(markets), int(plan["markets"])):
-            candidate = cursor % len(markets)
-            if candidate not in selected:
-                selected.append(candidate)
-            cursor += 1
+        selected = selected_by_bot[company_id]
 
         agent_plan: dict[int, tuple[int, int]] = {}
         agent_cost = 0.0
@@ -227,7 +248,12 @@ def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
         # Empty markets reward converting available cash into saleable output.
         # Four times the round rhythm is only a search ceiling; affordability
         # and existing inventory decide the actual submitted production.
-        expansion_ceiling = max(0, int(float(plan["production"]) * variation * 4.0) - old_products)
+        safe_market_units = 0.0
+        for index in selected:
+            market = markets[index]
+            city_size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
+            safe_market_units += city_size * 0.60 / city_competitors[index]
+        expansion_ceiling = max(0, int(safe_market_units * variation) - old_products)
         production_goal = min(production_goal, expansion_ceiling)
         low, high = 0, max(production_goal, expansion_ceiling)
         while low < high:
