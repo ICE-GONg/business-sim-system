@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import random
 import unittest
 
-from sim.cpi import agent_mi_benefit, allocate_city_cpi, allocate_index_cpi, minimum_threshold
+from sim.cpi import (
+    agent_mi_benefit,
+    allocate_city_cpi,
+    allocate_city_cpi_for_company,
+    allocate_index_cpi,
+    minimum_threshold,
+)
 
 
 class CPIGeneratorPortTests(unittest.TestCase):
@@ -89,6 +96,46 @@ class CPIGeneratorPortTests(unittest.TestCase):
         self.assertAlmostEqual(agent_mi_benefit(3), 1.3)
         self.assertLess(results[1]["thresholds"]["mi_large"], results[0]["thresholds"]["mi_large"])
         self.assertGreater(results[1]["mi_cpi"], results[0]["mi_cpi"])
+
+    def test_target_only_allocator_is_equivalent_to_full_allocator(self) -> None:
+        rng = random.Random(20260910)
+        for player_count in (1, 2, 7, 25, 510):
+            entries = [
+                {
+                    "company_id": index + 1,
+                    "qi_index": rng.uniform(0, 5000),
+                    "ma_index": rng.uniform(0, 13000),
+                    "mi_investment": rng.uniform(0, 30_000_000),
+                    "price": rng.uniform(3500, 25000),
+                    "agents": rng.randint(0, 8),
+                }
+                for index in range(player_count)
+            ]
+            average_price = rng.uniform(7000, 22000)
+            market_average = rng.uniform(7000, 22000)
+            full = allocate_city_cpi(
+                entries,
+                market_size=88_000,
+                max_price=25_000,
+                ma_large_threshold=1300,
+                average_price=average_price,
+                market_average_price=market_average,
+            )
+            for target in (entries[0], entries[-1]):
+                target_only = allocate_city_cpi_for_company(
+                    entries,
+                    target_company_id=int(target["company_id"]),
+                    market_size=88_000,
+                    max_price=25_000,
+                    ma_large_threshold=1300,
+                    average_price=average_price,
+                    market_average_price=market_average,
+                )
+                expected = next(
+                    row["total_cpi"] for row in full
+                    if row["company_id"] == target["company_id"]
+                )
+                self.assertAlmostEqual(target_only, expected, places=10)
 
 
 if __name__ == "__main__":

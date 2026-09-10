@@ -40,9 +40,9 @@ if (
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
-    or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
+    or getattr(_cpi_module, "CPI_API_VERSION", 0) < 3
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 11
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 12
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -1741,6 +1741,9 @@ def render_admin_rounds() -> None:
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
+                except sqlite3.OperationalError:
+                    LOGGER.exception("Super Bot submission database operation failed")
+                    st.error("数据库当前正忙，系统没有结算本轮。请稍等几秒后再次点击超级 Bot 分析。")
         cols = st.columns(4)
         if round_row["status"] == "open":
             if cols[0].button("暂停", use_container_width=True):

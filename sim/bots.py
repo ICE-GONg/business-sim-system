@@ -5,14 +5,17 @@ import hashlib
 import math
 import random
 import sqlite3
+import threading
+import time
 from typing import Any, Callable
 
-from .cpi import allocate_city_cpi
+from .cpi import allocate_city_cpi, allocate_city_cpi_for_company
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 11
+BOT_API_VERSION = 12
+_SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
     {"production": 350, "ma": 1340, "markets": 1, "agents": 2, "research": 1_500_000},
@@ -461,6 +464,7 @@ def _rebalance_super_bot_production(
                 "WHERE company_id=? AND round_no=? AND city=?",
                 (deployed * headroom / total_headroom, company_id, round_no, city),
             )
+        conn.commit()
 
     for _ in range(20):
         capacities = (
@@ -558,6 +562,7 @@ def _rebalance_super_bot_production(
                     selected_plan["quality"], company_id, round_no,
                 ),
             )
+            conn.commit()
             changed = True
         # Recalculate against the production changes above. If a Super Bot is
         # still buying materially more CPI units than it can stock, taper all
@@ -603,6 +608,7 @@ def _rebalance_super_bot_production(
                 "WHERE company_id=? AND round_no=? AND marketing_investment>0",
                 (scale, company_id, round_no),
             )
+            conn.commit()
             changed = True
         if not changed:
             break
@@ -1230,13 +1236,13 @@ def _submit_bots(
                 average_price = sum(price * weight for price, weight in weighted_prices) / max(1.0, weighted_total)
                 market = markets[index]
                 size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
-                allocations = allocate_city_cpi(
+                own_cpi = allocate_city_cpi_for_company(
                     entries, market_size=size, max_price=float(market["max_price"]),
                     ma_large_threshold=ma_threshold, average_price=average_price,
                     market_average_price=previous_prices[index],
+                    target_company_id=company_id,
                 )
-                mine = next(item for item in allocations if int(item["company_id"]) == company_id)
-                capacity += size * float(mine["total_cpi"]) / 100.0
+                capacity += size * own_cpi / 100.0
             return capacity
 
         city_rows = make_city_rows(inventory_heavy)
@@ -1398,16 +1404,16 @@ def _submit_bots(
                     weighted_total = sum(weight for _, weight in weighted_prices)
                     average_price = sum(price * weight for price, weight in weighted_prices) / max(1.0, weighted_total)
                     size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
-                    allocations = allocate_city_cpi(
+                    own_cpi = allocate_city_cpi_for_company(
                         entries,
+                        target_company_id=company_id,
                         market_size=size,
                         max_price=float(market["max_price"]),
                         ma_large_threshold=ma_threshold,
                         average_price=average_price,
                         market_average_price=previous_prices[index],
                     )
-                    mine = next(item for item in allocations if int(item["company_id"]) == company_id)
-                    city_capacities.append((index, size * float(mine["total_cpi"]) / 100.0, candidate_price))
+                    city_capacities.append((index, size * own_cpi / 100.0, candidate_price))
 
                 total_capacity = sum(capacity for _, capacity, _ in city_capacities)
                 predicted_sold = min(float(candidate_available), total_capacity)
@@ -1530,6 +1536,11 @@ def _submit_bots(
                 "VALUES(?,?,?,?,?,?,0)",
                 (company_id, round_no, row["city"], row["agent_delta"], row["marketing"], row["price"]),
             )
+        # Release the SQLite writer lock between expensive Super Bot searches.
+        # A rerun is safe because submit_super_bot_decisions clears and rebuilds
+        # the complete Super Bot submission set before starting again.
+        if super_mode:
+            conn.commit()
         submitted += 1
         if progress_callback:
             progress_callback(submitted, max(1, progress_total), str(bot["code"]))
@@ -1545,7 +1556,7 @@ def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
     return _submit_bots(conn, round_no, False)
 
 
-def submit_super_bot_decisions(
+def _submit_super_bot_decisions_locked(
     conn: sqlite3.Connection,
     round_no: int,
     progress_callback: Callable[[int, int, str], None] | None = None,
@@ -1559,14 +1570,42 @@ def submit_super_bot_decisions(
     )
     if missing and int(missing["n"]) > 0:
         raise ValueError("仍有真人玩家或普通 Bot 未提交，超级 Bot 暂不能读取本轮数据。")
-    conn.execute(
-        "DELETE FROM city_decisions WHERE round_no=? AND company_id IN "
-        "(SELECT id FROM companies WHERE is_super_bot=1)",
-        (round_no,),
-    )
-    conn.execute(
-        "DELETE FROM decisions WHERE round_no=? AND company_id IN "
-        "(SELECT id FROM companies WHERE is_super_bot=1)",
-        (round_no,),
-    )
+    # End the preceding read snapshot, then perform cleanup as one short write
+    # transaction. Streamlit can rerun a session while another request is
+    # finishing, so retry SQLITE_BUSY/locked instead of crashing the app.
+    conn.commit()
+    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        for attempt in range(4):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM city_decisions WHERE round_no=? AND company_id IN "
+                    "(SELECT id FROM companies WHERE is_super_bot=1)",
+                    (round_no,),
+                )
+                conn.execute(
+                    "DELETE FROM decisions WHERE round_no=? AND company_id IN "
+                    "(SELECT id FROM companies WHERE is_super_bot=1)",
+                    (round_no,),
+                )
+                conn.commit()
+                break
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                if not any(word in str(exc).lower() for word in ("locked", "busy")) or attempt == 3:
+                    raise
+                time.sleep(0.15 * (2 ** attempt))
+    finally:
+        conn.execute("PRAGMA busy_timeout=30000")
     return _submit_bots(conn, round_no, True, progress_callback)
+
+
+def submit_super_bot_decisions(
+    conn: sqlite3.Connection,
+    round_no: int,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> int:
+    """Serialize expensive submissions inside one Streamlit worker process."""
+    with _SUPER_BOT_SUBMISSION_LOCK:
+        return _submit_super_bot_decisions_locked(conn, round_no, progress_callback)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-CPI_API_VERSION = 2
+CPI_API_VERSION = 3
 GIFT_CPI = 0.01
 LAYER1_TOTAL_CPI = 5.0
 LAYER2_TOTAL_CPI = 10.0
@@ -180,6 +180,171 @@ def allocate_index_cpi(
             }
             result["cpi"] = sum(result["breakdown"].values())
     return results
+
+
+def _allocate_index_cpi_for_target(
+    min_threshold: float,
+    large_threshold: float,
+    investments: list[float],
+    prices: list[float],
+    average_price: float,
+    target_index: int,
+) -> float:
+    """Return one player's index CPI without building every breakdown.
+
+    This follows :func:`allocate_index_cpi` operation-for-operation. It is
+    used by the Super Bot search, where complete rival breakdown dictionaries
+    were previously created thousands of times and immediately discarded.
+    """
+    originals = [max(0.0, float(value)) for value in investments]
+    resolved_prices = [
+        float(prices[index]) if index < len(prices) else 0.0
+        for index in range(len(originals))
+    ]
+    factors = [
+        average_price / price if average_price > 0 and price > 0 else 1.0
+        for price in resolved_prices
+    ]
+    adjusted = [value * factors[index] for index, value in enumerate(originals)]
+    max_price_factor = max([1.0, *factors])
+    adjusted_min = min_threshold * max_price_factor
+    adjusted_large = large_threshold * max_price_factor
+
+    below_min_adjusted = [value < adjusted_min for value in adjusted]
+    above_large_adjusted = [value >= large_threshold for value in adjusted]
+    below_min_original = [value < min_threshold for value in originals]
+    above_large_original = [value >= large_threshold for value in originals]
+    gifts = [
+        GIFT_CPI if originals[index] > 0 and below_min_adjusted[index] else 0.0
+        for index in range(len(originals))
+    ]
+    gift_total = sum(gifts)
+
+    layer1_adjusted = [
+        adjusted[index]
+        if below_min_adjusted[index]
+        else min(adjusted[index], adjusted_large)
+        for index in range(len(originals))
+    ]
+    layer1_total_adjusted = sum(layer1_adjusted)
+    layer1_original = [
+        0.0 if below_min_original[index] else min(originals[index], large_threshold)
+        for index in range(len(originals))
+    ]
+    layer1_total_original = sum(layer1_original)
+    layer1_max_original = max(layer1_original, default=0.0)
+    layer1_max_adjusted = max(layer1_adjusted, default=0.0)
+    layer1_available = LAYER1_TOTAL_CPI
+    if not any(above_large_adjusted) and adjusted_large > 0 and layer1_max_adjusted > 0:
+        layer1_available *= layer1_max_adjusted / adjusted_large
+
+    layer2_adjusted: list[float] = []
+    layer2_original: list[float] = []
+    for index in range(len(originals)):
+        adjusted_value = 0.0
+        if not below_min_adjusted[index] and above_large_adjusted[index]:
+            remaining = max(adjusted[index] - large_threshold, 0.0)
+            base_cap = min(remaining, large_threshold * 3.0)
+            adjusted_value = base_cap + max(remaining - base_cap, 0.0) * 0.1
+        layer2_adjusted.append(adjusted_value)
+
+        original_value = 0.0
+        if not below_min_original[index] and above_large_original[index]:
+            remaining = max(originals[index] - large_threshold, 0.0)
+            base_cap = min(remaining, large_threshold * 3.0)
+            original_value = base_cap + max(remaining - base_cap, 0.0) * 0.1
+        layer2_original.append(original_value)
+    layer2_total_adjusted = sum(layer2_adjusted)
+    layer2_total_original = sum(layer2_original)
+
+    welfare_total = WELFARE_PART1_BASE + WELFARE_PART2_BASE
+    welfare_ratio = max(0.0, welfare_total - gift_total) / welfare_total if welfare_total else 0.0
+    welfare1_available = (
+        WELFARE_PART1_BASE * welfare_ratio * layer1_max_original / large_threshold
+        if large_threshold > 0 and layer1_max_original > 0 else 0.0
+    )
+    welfare2_available = WELFARE_PART2_BASE * welfare_ratio
+
+    target = target_index
+    target_total = gifts[target]
+    if layer1_total_adjusted > 0 and layer1_adjusted[target] > 0:
+        target_total += layer1_adjusted[target] / layer1_total_adjusted * layer1_available
+    if layer2_total_adjusted > 0 and layer2_adjusted[target] > 0:
+        target_total += layer2_adjusted[target] / layer2_total_adjusted * LAYER2_TOTAL_CPI
+    if not below_min_original[target] and layer1_total_original > 0 and welfare1_available > 0:
+        target_total += layer1_original[target] / layer1_total_original * welfare1_available
+    if above_large_original[target] and layer2_total_original > 0 and welfare2_available > 0:
+        target_total += layer2_original[target] / layer2_total_original * welfare2_available
+
+    allocated_total = gift_total
+    if layer1_total_adjusted > 0:
+        allocated_total += layer1_available
+    if layer2_total_adjusted > 0:
+        allocated_total += LAYER2_TOTAL_CPI
+    if layer1_total_original > 0 and welfare1_available > 0:
+        allocated_total += welfare1_available
+    if layer2_total_original > 0 and welfare2_available > 0:
+        allocated_total += welfare2_available
+    if allocated_total > INDEX_CPI_TOTAL:
+        target_total *= INDEX_CPI_TOTAL / allocated_total
+    return target_total
+
+
+def allocate_city_cpi_for_company(
+    entries: list[dict[str, Any]],
+    *,
+    target_company_id: int,
+    market_size: float,
+    max_price: float,
+    ma_large_threshold: float,
+    price_power: int = 8,
+    average_price: float | None = None,
+    market_average_price: float | None = None,
+) -> float:
+    """Return only one company's total CPI using the canonical city formula."""
+    if not entries:
+        return 0.0
+    target_index = next(
+        (index for index, entry in enumerate(entries) if int(entry["company_id"]) == target_company_id),
+        None,
+    )
+    if target_index is None:
+        return 0.0
+
+    prices = [max(0.0, float(entry["price"])) for entry in entries]
+    current_average = sum(prices) / len(prices) if prices else 0.0
+    average_price = current_average if average_price is None else float(average_price)
+    market_average_price = current_average if market_average_price is None else float(market_average_price)
+    qi_large = max(0.0, max_price / 50.0)
+    ma_large = max(0.0, float(ma_large_threshold))
+    mi_large = qi_large * market_size * 0.20 / 1.5 / 2.0
+
+    qi_cpi = _allocate_index_cpi_for_target(
+        minimum_threshold(qi_large), qi_large,
+        [float(entry["qi_index"]) for entry in entries], prices, average_price, target_index,
+    )
+    ma_cpi = _allocate_index_cpi_for_target(
+        minimum_threshold(ma_large), ma_large,
+        [float(entry["ma_index"]) for entry in entries], prices, average_price, target_index,
+    )
+    effective_mi = [
+        float(entry["mi_investment"]) * agent_mi_benefit(entry.get("agents", 0))
+        for entry in entries
+    ]
+    mi_cpi = _allocate_index_cpi_for_target(
+        minimum_threshold(mi_large), mi_large, effective_mi, prices, average_price, target_index,
+    )
+
+    price_weights = [0.0] * len(entries)
+    for index, price in enumerate(prices):
+        if price > 0 and price <= market_average_price:
+            price_weights[index] = (market_average_price - price) ** max(1, int(price_power))
+    price_denominator = sum(price_weights)
+    price_cpi = (
+        PRICE_CPI_TOTAL * price_weights[target_index] / price_denominator
+        if price_denominator > 0 else 0.0
+    )
+    return qi_cpi + ma_cpi + mi_cpi + price_cpi
 
 
 def allocate_city_cpi(
