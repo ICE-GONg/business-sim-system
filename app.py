@@ -42,7 +42,7 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 3
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 13
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 14
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -1270,17 +1270,21 @@ def render_admin_companies() -> None:
         confirm_bulk_delete = st.checkbox("我确认永久删除所选队伍及其全部比赛数据")
         bulk_delete = st.form_submit_button(
             f"批量删除所选队伍",
-            disabled=not confirm_bulk_delete or not selected_company_ids,
             use_container_width=True,
         )
     if bulk_delete:
-        try:
-            with connect() as conn:
-                deleted_count = delete_companies(conn, [int(company_id) for company_id in selected_company_ids])
-            flash("success", f"已批量删除 {deleted_count} 支队伍。")
-            st.rerun()
-        except ValueError as exc:
-            st.error(str(exc))
+        if not selected_company_ids:
+            st.error("请至少选择一个要删除的玩家或 Bot。")
+        elif not confirm_bulk_delete:
+            st.error("请先勾选删除确认。")
+        else:
+            try:
+                with connect() as conn:
+                    deleted_count = delete_companies(conn, [int(company_id) for company_id in selected_company_ids])
+                flash("success", f"已批量删除 {deleted_count} 支队伍。")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
 
     for company in companies:
         bot_tag = (" · 超级 BOT" if bool(company["is_super_bot"]) else " · BOT") if bool(company["is_bot"]) else ""
@@ -1717,8 +1721,15 @@ def render_admin_rounds() -> None:
                 f"真人玩家与普通 Bot：{regular_submitted}/{regular_total} · 超级 Bot：{super_submitted}/{super_total}。"
                 "超级 Bot 只会在其他队伍全部提交后读取本轮决策。"
             )
+            super_action_label = (
+                "重新分析并逐个覆盖超级 Bot 决策"
+                if super_submitted >= super_total
+                else "继续分析未完成的超级 Bot"
+                if super_submitted > 0
+                else "超级 Bot 分析并提交"
+            )
             if st.button(
-                "超级 Bot 分析并提交" if super_submitted < super_total else "重新分析并覆盖超级 Bot 决策",
+                super_action_label,
                 type="primary",
                 disabled=regular_submitted < regular_total,
                 use_container_width=True,
@@ -1736,6 +1747,7 @@ def render_admin_rounds() -> None:
                             conn,
                             int(round_row["round_no"]),
                             update_super_progress,
+                            replace_existing=super_submitted >= super_total,
                         )
                     super_progress.empty()
                     flash("success", f"{super_total} 支超级 Bot 已读取全部对手决策并完成提交。")

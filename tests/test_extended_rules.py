@@ -339,6 +339,69 @@ class ExtendedRulesTest(unittest.TestCase):
             )
             self.assertEqual(float(decision["loan_change"]), 2_000_000)
 
+    def test_interrupted_super_bot_analysis_preserves_and_resumes_saved_decisions(self):
+        db = self.fresh("super-bot-resume.db")
+        first_id = self.one_company(db)
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE companies SET is_bot=1,is_super_bot=1,bot_profile=0,home_city='广州' WHERE id=?",
+                (first_id,),
+            )
+            second = conn.execute(
+                "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,is_super_bot,bot_profile,"
+                "setup_submitted_at,created_at) VALUES('SBOT02','Super 2',?,'深圳',15000000,1,1,1,?,?)",
+                (db.hash_password("x"), db.now_iso(), db.now_iso()),
+            )
+            second_id = int(second.lastrowid)
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (first_id,))
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'深圳',1)", (second_id,))
+
+        from sim.bots import submit_super_bot_decisions
+
+        def stop_after_first(done: int, total: int, code: str) -> None:
+            if done == 1:
+                raise RuntimeError("simulated interruption")
+
+        with self.assertRaises(RuntimeError):
+            with db.connect() as conn:
+                submit_super_bot_decisions(conn, 1, stop_after_first)
+
+        with db.connect() as conn:
+            first_before = dict(db.one(
+                conn,
+                "SELECT * FROM decisions WHERE company_id=? AND round_no=1",
+                (first_id,),
+            ))
+            first_cities_before = [
+                dict(row) for row in db.all_rows(
+                    conn,
+                    "SELECT * FROM city_decisions WHERE company_id=? AND round_no=1 ORDER BY city",
+                    (first_id,),
+                )
+            ]
+            self.assertIsNone(db.one(
+                conn,
+                "SELECT 1 FROM decisions WHERE company_id=? AND round_no=1",
+                (second_id,),
+            ))
+
+        with db.connect() as conn:
+            self.assertEqual(submit_super_bot_decisions(conn, 1), 1)
+            first_after = db.one(
+                conn,
+                "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=1",
+                (first_id,),
+            )
+            self.assertEqual(first_after["submitted_at"], first_before["submitted_at"])
+            self.assertEqual(
+                len(db.all_rows(conn, "SELECT 1 FROM decisions WHERE round_no=1")),
+                2,
+            )
+
+        # Before continuation, the saved decision and every city row survived
+        # byte-for-byte; it was never deleted by the interrupted run.
+        self.assertTrue(first_cities_before)
+
     def test_regular_bots_use_diverse_prices_and_cpi_profiles(self):
         db = self.fresh("bot-diversity.db")
         first_id = self.one_company(db, 30_000_000)

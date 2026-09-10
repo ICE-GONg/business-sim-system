@@ -6,7 +6,6 @@ import math
 import random
 import sqlite3
 import threading
-import time
 from typing import Any, Callable
 
 from .cpi import allocate_city_cpi, allocate_city_cpi_for_company
@@ -14,7 +13,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 13
+BOT_API_VERSION = 14
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -464,7 +463,6 @@ def _rebalance_super_bot_production(
                 "WHERE company_id=? AND round_no=? AND city=?",
                 (deployed * headroom / total_headroom, company_id, round_no, city),
             )
-        conn.commit()
 
     for _ in range(20):
         capacities = (
@@ -562,7 +560,6 @@ def _rebalance_super_bot_production(
                     selected_plan["quality"], company_id, round_no,
                 ),
             )
-            conn.commit()
             changed = True
         # Recalculate against the production changes above. If a Super Bot is
         # still buying materially more CPI units than it can stock, taper all
@@ -608,7 +605,6 @@ def _rebalance_super_bot_production(
                 "WHERE company_id=? AND round_no=? AND marketing_investment>0",
                 (scale, company_id, round_no),
             )
-            conn.commit()
             changed = True
         if not changed:
             break
@@ -619,6 +615,7 @@ def _submit_bots(
     round_no: int,
     super_mode: bool,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    replace_existing: bool = False,
 ) -> int:
     bots = all_rows(
         conn,
@@ -718,7 +715,7 @@ def _submit_bots(
     submitted = 0
     pending_total = sum(
         1 for bot in bots
-        if not one(
+        if replace_existing or not one(
             conn,
             "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
             (int(bot["id"]), round_no),
@@ -737,7 +734,12 @@ def _submit_bots(
     for bot_row in bots:
         bot = dict(bot_row)
         company_id = int(bot["id"])
-        if one(conn, "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?", (company_id, round_no)):
+        existing_decision = one(
+            conn,
+            "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
+            (company_id, round_no),
+        )
+        if existing_decision and not replace_existing:
             continue
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
         style = BOT_STYLES[profile]
@@ -1531,6 +1533,18 @@ def _submit_bots(
         )
         research = research_needed if research_ready else 0.0
 
+        # Replace only this Bot, and only after its complete candidate search
+        # has succeeded. If analysis stops before this point, its old decision
+        # and every previously saved Bot remain untouched.
+        if super_mode and existing_decision:
+            conn.execute(
+                "DELETE FROM city_decisions WHERE company_id=? AND round_no=?",
+                (company_id, round_no),
+            )
+            conn.execute(
+                "DELETE FROM decisions WHERE company_id=? AND round_no=?",
+                (company_id, round_no),
+            )
         conn.execute(
             "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,"
             "engineer_salary,management_investment,production_volume,quality_investment,research_investment,submitted_at) "
@@ -1545,8 +1559,7 @@ def _submit_bots(
                 (company_id, round_no, row["city"], row["agent_delta"], row["marketing"], row["price"]),
             )
         # Release the SQLite writer lock between expensive Super Bot searches.
-        # A rerun is safe because submit_super_bot_decisions clears and rebuilds
-        # the complete Super Bot submission set before starting again.
+        # A rerun resumes after this saved Bot instead of rebuilding it.
         if super_mode:
             conn.commit()
             submitted_super_ids.add(company_id)
@@ -1569,6 +1582,7 @@ def _submit_super_bot_decisions_locked(
     conn: sqlite3.Connection,
     round_no: int,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    replace_existing: bool = False,
 ) -> int:
     """Super bots wait until every non-super team has submitted."""
     missing = one(
@@ -1579,42 +1593,30 @@ def _submit_super_bot_decisions_locked(
     )
     if missing and int(missing["n"]) > 0:
         raise ValueError("仍有真人玩家或普通 Bot 未提交，超级 Bot 暂不能读取本轮数据。")
-    # End the preceding read snapshot, then perform cleanup as one short write
-    # transaction. Streamlit can rerun a session while another request is
-    # finishing, so retry SQLITE_BUSY/locked instead of crashing the app.
+    # Existing decisions remain in place during analysis. A normal call resumes
+    # only missing Bots; explicit reanalysis replaces each Bot individually
+    # after its new decision is ready.
     conn.commit()
-    conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        for attempt in range(4):
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "DELETE FROM city_decisions WHERE round_no=? AND company_id IN "
-                    "(SELECT id FROM companies WHERE is_super_bot=1)",
-                    (round_no,),
-                )
-                conn.execute(
-                    "DELETE FROM decisions WHERE round_no=? AND company_id IN "
-                    "(SELECT id FROM companies WHERE is_super_bot=1)",
-                    (round_no,),
-                )
-                conn.commit()
-                break
-            except sqlite3.OperationalError as exc:
-                conn.rollback()
-                if not any(word in str(exc).lower() for word in ("locked", "busy")) or attempt == 3:
-                    raise
-                time.sleep(0.15 * (2 ** attempt))
-    finally:
-        conn.execute("PRAGMA busy_timeout=30000")
-    return _submit_bots(conn, round_no, True, progress_callback)
+    return _submit_bots(
+        conn,
+        round_no,
+        True,
+        progress_callback,
+        replace_existing=replace_existing,
+    )
 
 
 def submit_super_bot_decisions(
     conn: sqlite3.Connection,
     round_no: int,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    replace_existing: bool = False,
 ) -> int:
     """Serialize expensive submissions inside one Streamlit worker process."""
     with _SUPER_BOT_SUBMISSION_LOCK:
-        return _submit_super_bot_decisions_locked(conn, round_no, progress_callback)
+        return _submit_super_bot_decisions_locked(
+            conn,
+            round_no,
+            progress_callback,
+            replace_existing,
+        )
