@@ -235,6 +235,10 @@ class ExtendedRulesTest(unittest.TestCase):
             decision = db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1", (super_id,))
             self.assertIn(decision["research_investment"], (0, 8_150_000))
             self.assertGreater(decision["production_volume"], 0)
+            self.assertEqual(int(decision["production_volume"]) % 72, 0)
+            super_group_count = int(decision["production_volume"]) // 72
+            self.assertEqual(int(decision["worker_delta"]), super_group_count * 21)
+            self.assertEqual(int(decision["engineer_delta"]), super_group_count * 8)
             super_prices = db.all_rows(
                 conn,
                 "SELECT price FROM city_decisions WHERE company_id=? AND round_no=1 AND agent_delta>=0",
@@ -423,6 +427,25 @@ class ExtendedRulesTest(unittest.TestCase):
                 if round_no > 1:
                     conn.execute("INSERT INTO rounds(round_no,status) VALUES(?,'open')", (round_no,))
                 self.assertEqual(submit_super_bot_decisions(conn, round_no), 7)
+                if round_no == 1:
+                    super_decisions = db.all_rows(
+                        conn,
+                        "SELECT d.production_volume,d.management_investment,cd.price FROM decisions d "
+                        "JOIN companies c ON c.id=d.company_id JOIN city_decisions cd "
+                        "ON cd.company_id=c.id AND cd.round_no=d.round_no AND cd.city=c.home_city "
+                        "WHERE d.round_no=1 AND c.is_super_bot=1 ORDER BY c.id",
+                    )
+                    self.assertGreaterEqual(
+                        len({
+                            (
+                                int(row["production_volume"]),
+                                round(float(row["management_investment"]), 2),
+                                round(float(row["price"]), 2),
+                            )
+                            for row in super_decisions
+                        }),
+                        6,
+                    )
                 settle_round(conn, round_no)
                 for result in db.all_rows(conn, "SELECT * FROM results WHERE round_no=?", (round_no,)):
                     report = json.loads(result["report_json"])

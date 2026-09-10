@@ -11,7 +11,7 @@ from .cpi import allocate_city_cpi
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 
 
-BOT_API_VERSION = 6
+BOT_API_VERSION = 7
 
 BOT_PLANS = (
     {"production": 350, "ma": 1340, "markets": 1, "agents": 2, "research": 1_500_000},
@@ -147,6 +147,18 @@ def _balanced_production_group(
         "components": components,
         "products": products,
     }
+
+
+def _affordable_group_count(
+    available_cash: float,
+    fixed_agent_and_mi: float,
+    complete_group_cost: float,
+    demand_groups: int,
+) -> int:
+    """Shared normal/super Bot group formula: floor((cash-fixed)/group cost)."""
+    cash_after_fixed = max(0.0, float(available_cash) - max(0.0, float(fixed_agent_and_mi)))
+    affordable = math.floor(cash_after_fixed / max(float(complete_group_cost), 1.0))
+    return max(0, min(int(affordable), max(0, int(demand_groups))))
 
 
 def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> int:
@@ -509,6 +521,7 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         if use_mi and float(budget_for(0)["total"]) > cash_budget * 0.72:
             use_mi = False
             mi_selected = set()
+            marketing_targets = {index: 0.0 for index in marketing_targets}
 
         opened_investment_pools = 1 + int(use_qi) + int(use_mi)
         if market_pressure < 0.45:
@@ -549,14 +562,17 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
         # b = floor((cash - Agent - MI) / complete group cost).  A group
         # already contains payroll, component/product costs, MA and QI, so all
         # five outputs stay in the exact F:G:H:I ratio supplied by the KDS.
-        affordable_groups = math.floor(
-            max(0.0, cash_budget - fixed_before_groups) / max(group_cost, 1.0)
-        )
         demand_groups = (
             math.ceil(demand_target / max(group["products"], 1.0))
             if demand_target > 0 else 0
         )
-        low_groups, high_groups = 0, min(max(0, int(affordable_groups)), demand_groups)
+        high_groups = _affordable_group_count(
+            cash_budget,
+            fixed_before_groups,
+            group_cost,
+            demand_groups,
+        )
+        low_groups = 0
         while low_groups < high_groups:
             middle_groups = (low_groups + high_groups + 1) // 2
             middle_products = int(math.floor(middle_groups * group["products"]))

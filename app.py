@@ -42,7 +42,7 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 2
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 6
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 7
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
