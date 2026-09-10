@@ -36,6 +36,15 @@ class ExtendedRulesTest(unittest.TestCase):
                 (company_id, round_no, worker_salary, engineer_salary, production, research, db.now_iso()),
             )
 
+    def test_balanced_group_matches_supplied_five_to_three_example(self):
+        from sim.bots import _balanced_production_group
+
+        group = _balanced_production_group(6, 4, 3, 24, 5)
+        self.assertEqual(group["workers"], 5)
+        self.assertEqual(group["engineers"], 3)
+        self.assertEqual(group["components"], 105)
+        self.assertEqual(group["products"], 21)
+
     def test_hidden_patent_cap_and_threshold(self):
         from sim.engine import effective_research_probability
 
@@ -112,6 +121,10 @@ class ExtendedRulesTest(unittest.TestCase):
             decision = db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1", (company_id,))
             self.assertEqual(decision["loan_change"], 0)
             self.assertIsNotNone(decision["submitted_at"])
+            self.assertEqual(int(decision["production_volume"]) % 72, 0)
+            group_count = int(decision["production_volume"]) // 72
+            self.assertEqual(int(decision["worker_delta"]), group_count * 21)
+            self.assertEqual(int(decision["engineer_delta"]), group_count * 8)
             reports = db.one(conn, "SELECT SUM(order_report) AS n FROM city_decisions WHERE company_id=? AND round_no=1", (company_id,))
             self.assertEqual(reports["n"], 0)
 
@@ -133,7 +146,9 @@ class ExtendedRulesTest(unittest.TestCase):
                     "agents", "marketing", "quality", "management",
                 )
             )
-            self.assertAlmostEqual(pre_sales_spending, float(finance["round_begins"]), places=2)
+            self.assertLessEqual(pre_sales_spending, float(finance["round_begins"]) + 1e-6)
+            self.assertGreater(pre_sales_spending, float(finance["round_begins"]) * 0.75)
+            self.assertGreater(report["production"]["produced"], 0)
 
     def test_bot_opens_threshold_investments_in_order_and_prices_by_saturation(self):
         db = self.fresh("bot-strategy.db")

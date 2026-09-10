@@ -11,7 +11,7 @@ from .cpi import allocate_city_cpi
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 
 
-BOT_API_VERSION = 5
+BOT_API_VERSION = 6
 
 BOT_PLANS = (
     {"production": 350, "ma": 1340, "markets": 1, "agents": 2, "research": 1_500_000},
@@ -112,6 +112,41 @@ def _upper_typical(values: list[float]) -> float:
     if not clean:
         return 0.0
     return clean[min(len(clean) - 1, math.floor((len(clean) - 1) * 0.80))]
+
+
+def _balanced_production_group(
+    component_workers: float,
+    component_hours: float,
+    product_engineers: float,
+    product_hours: float,
+    components_per_product: float,
+) -> dict[str, float]:
+    """Build the F/G/H/I production group defined in the strategy guide."""
+    a = max(float(component_workers), 1e-9)
+    b = max(float(component_hours), 1e-9)
+    c = max(float(product_engineers), 1e-9)
+    d = max(float(product_hours), 1e-9)
+    e = max(float(components_per_product), 1e-9)
+    worker_side = a * b * e
+    engineer_side = c * d
+    if all(abs(value - round(value)) < 1e-9 for value in (worker_side, engineer_side)):
+        divisor = math.gcd(max(1, round(worker_side)), max(1, round(engineer_side)))
+        workers = worker_side / divisor
+        engineers = engineer_side / divisor
+        components = 504.0 / b * workers / a
+        products = components / e
+    else:
+        # A one-product normalized group keeps the same F:G ratio for decimal KDS values.
+        products = 1.0
+        components = e
+        workers = a * b * components / 504.0
+        engineers = c * d * products / 504.0
+    return {
+        "workers": workers,
+        "engineers": engineers,
+        "components": components,
+        "products": products,
+    }
 
 
 def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> int:
@@ -376,16 +411,58 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             reverse=True,
         )
         mi_selected = set(mi_priority[:mi_city_limit]) if use_mi else set()
-        # Per-company weights keep even bots sharing the same base style from
-        # choosing the same way to exhaust their cash.
-        extra_mi_share = rng.uniform(0.52, 0.74) if super_mode else rng.uniform(0.42, 0.68)
-        extra_qi_share = rng.uniform(0.16, 0.30)
-        extra_mi_weights = {
-            index: rng.uniform(0.65, 1.35)
-            * float(markets[index]["population"])
-            * float(markets[index]["penetration"])
-            for index in mi_selected
-        }
+
+        # Choose the CPI indices first. The affordable production count is then
+        # derived from the strategy guide's complete group cost; investment is
+        # never used as a blind cash sink after production has been calculated.
+        ma_index_target = max(ma_threshold * ma_round_buffer, float(plan["ma"]) * variation) * ma_strength
+        if super_mode:
+            rival_ma = _upper_typical([item["ma"] for index in selected for item in rival_metrics[index]])
+            ma_index_target = min(
+                5000.0,
+                max(ma_index_target, ma_threshold * super_aggression, rival_ma * super_aggression),
+            )
+        qi_line = max(float(markets[index]["max_price"]) / 50.0 for index in selected)
+        qi_index_target = qi_line * max(1.03, qi_strength)
+        if super_mode:
+            rival_qi = _upper_typical([item["qi"] for index in selected for item in rival_metrics[index]])
+            qi_index_target = min(
+                qi_line * 5.0,
+                max(qi_index_target, qi_line * super_aggression, rival_qi * super_aggression),
+            )
+        marketing_targets: dict[int, float] = {}
+        for index in selected:
+            market = markets[index]
+            active_agents = agent_plan[index][1]
+            size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
+            threshold = (float(market["max_price"]) / 50.0) * size * 0.20
+            threshold /= max(1.0, 1.0 + active_agents * 0.10) * 1.5 * 2.0
+            target_mi = threshold * mi_strength
+            if super_mode:
+                rival_mi = _upper_typical([item["mi_effective"] for item in rival_metrics[index]])
+                target_mi = min(
+                    threshold * super_mi_cap,
+                    max(
+                        target_mi,
+                        threshold * super_aggression,
+                        rival_mi * super_aggression / (1.0 + active_agents * 0.10),
+                    ),
+                )
+            marketing_targets[index] = target_mi if index in mi_selected and active_agents else 0.0
+
+        group = _balanced_production_group(worker_need, worker_hours, engineer_need, engineer_hours, component_need)
+        group_cost = (
+            group["workers"] * worker_salary * 3
+            + group["engineers"] * engineer_salary * 3
+            + group["workers"] * worker_training
+            + group["engineers"] * engineer_training
+            + group["components"]
+            * (float(home_market["component_material"]) * material_factor + float(home_market["component_storage"]))
+            + group["products"]
+            * (float(home_market["product_material"]) * material_factor + float(home_market["product_storage"]))
+            + ma_index_target * (group["workers"] + group["engineers"])
+            + (qi_index_target * group["products"] if use_qi else 0.0)
+        )
 
         def budget_for(production: int) -> dict[str, Any]:
             components_to_make = max(0, production * component_need - old_components)
@@ -409,37 +486,10 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             material_cost += production * float(home_market["product_material"]) * material_factor
             storage_cost = max(0, old_components + new_components - int(bot["component_storage_capacity"] or 0)) * float(home_market["component_storage"])
             storage_cost += max(0, old_products + production - int(bot["product_storage_capacity"] or 0)) * float(home_market["product_storage"])
-            ma_index = max(ma_threshold * ma_round_buffer, float(plan["ma"]) * variation) * ma_strength
-            if super_mode:
-                rival_ma = _upper_typical([item["ma"] for index in selected for item in rival_metrics[index]])
-                ma_index = min(5000.0, max(ma_index, ma_threshold * super_aggression, rival_ma * super_aggression))
-            management = ma_index * max(1, workers + engineers)
+            management = ma_index_target * max(1, workers + engineers)
             denominator = old_products * 1.2 + production
-            qi_line = max(float(markets[i]["max_price"]) / 50.0 for i in selected)
-            qi_index = qi_line * max(1.03, qi_strength)
-            if super_mode:
-                rival_qi = _upper_typical([item["qi"] for index in selected for item in rival_metrics[index]])
-                qi_index = min(qi_line * 5.0, max(qi_index, qi_line * super_aggression, rival_qi * super_aggression))
-            quality = qi_index * max(1.0, denominator) if use_qi else 0.0
-            marketing: dict[int, float] = {}
-            for index in selected:
-                market = markets[index]
-                active_agents = agent_plan[index][1]
-                size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
-                threshold = (float(market["max_price"]) / 50.0) * size * 0.20
-                threshold /= max(1.0, 1.0 + active_agents * 0.10) * 1.5 * 2.0
-                target_mi = threshold * mi_strength
-                if super_mode:
-                    rival_mi = _upper_typical([item["mi_effective"] for item in rival_metrics[index]])
-                    target_mi = min(
-                        threshold * super_mi_cap,
-                        max(
-                            target_mi,
-                            threshold * super_aggression,
-                            rival_mi * super_aggression / (1.0 + active_agents * 0.10),
-                        ),
-                    )
-                marketing[index] = target_mi if index in mi_selected and active_agents else 0.0
+            quality = qi_index_target * max(1.0, denominator) if use_qi else 0.0
+            marketing = dict(marketing_targets)
             total = staff_cost + material_cost + storage_cost + agent_cost + management + quality + sum(marketing.values())
             return {
                 "worker_delta": worker_delta, "engineer_delta": engineer_delta,
@@ -451,10 +501,6 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             }
 
         last_round = official_round >= total_rounds
-        # The latest game rule requires every Bot to commit all cash available
-        # before sales. Production remains demand-aware; any cash that should
-        # not create more stock is moved into its independently weighted CPI
-        # investments instead of being left idle.
         cash_budget = max(0.0, float(bot["cash"]))
 
         # Never submit an MI plan that consumes the whole company before a
@@ -498,47 +544,32 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
                     target_available,
                     max(desired_available, int(prior_sold * expansion_factor + old_products)),
                 )
-        production_limit = max(0, target_available - old_products)
-        low, high = 0, production_limit
-        while low < high:
-            middle = (low + high + 1) // 2
-            if budget_for(middle)["total"] <= cash_budget + 1e-9:
-                low = middle
+        demand_target = max(0, target_available - old_products)
+        fixed_before_groups = agent_cost + sum(marketing_targets.values())
+        # b = floor((cash - Agent - MI) / complete group cost).  A group
+        # already contains payroll, component/product costs, MA and QI, so all
+        # five outputs stay in the exact F:G:H:I ratio supplied by the KDS.
+        affordable_groups = math.floor(
+            max(0.0, cash_budget - fixed_before_groups) / max(group_cost, 1.0)
+        )
+        demand_groups = (
+            math.ceil(demand_target / max(group["products"], 1.0))
+            if demand_target > 0 else 0
+        )
+        low_groups, high_groups = 0, min(max(0, int(affordable_groups)), demand_groups)
+        while low_groups < high_groups:
+            middle_groups = (low_groups + high_groups + 1) // 2
+            middle_products = int(math.floor(middle_groups * group["products"]))
+            if budget_for(middle_products)["total"] <= cash_budget + 1e-9:
+                low_groups = middle_groups
             else:
-                high = middle - 1
-        production = low
+                high_groups = middle_groups - 1
+        production = int(math.floor(low_groups * group["products"]))
         budget = budget_for(production)
-
-        def spend_remaining_cash(current: dict[str, Any]) -> dict[str, Any]:
-            remaining = max(0.0, cash_budget - float(current["total"]))
-            if remaining <= 1e-6:
-                return current
-            mi_amount = 0.0
-            qi_amount = 0.0
-            if use_mi and mi_selected:
-                mi_amount = remaining * extra_mi_share
-            if use_qi:
-                qi_amount = remaining * extra_qi_share
-            if mi_amount + qi_amount > remaining * 0.88:
-                scale = remaining * 0.88 / max(1.0, mi_amount + qi_amount)
-                mi_amount *= scale
-                qi_amount *= scale
-            if mi_amount > 0:
-                total_weight = sum(extra_mi_weights.values())
-                for index in mi_selected:
-                    current["marketing"][index] = float(current["marketing"].get(index, 0.0)) + (
-                        mi_amount * extra_mi_weights[index] / max(1.0, total_weight)
-                    )
-            current["quality"] = float(current["quality"]) + qi_amount
-            current["management"] = float(current["management"]) + remaining - mi_amount - qi_amount
-            current["total"] = cash_budget
-            return current
-
-        budget = spend_remaining_cash(budget)
         inventory_heavy = (
             old_products > max(20, prior_sold * 0.20)
             or (prior_production and prior_total > 0 and prior_sold / prior_total < 0.90)
-            or production_limit < production_goal
+            or old_products + production > demand_target
         )
 
         def make_city_rows(aggressive: bool = False) -> list[dict[str, float | int | str]]:
@@ -655,9 +686,10 @@ def _submit_bots(conn: sqlite3.Connection, round_no: int, super_mode: bool) -> i
             # the company on inventory that may not sell.
             safe_available = int(normal_capacity * 0.80)
             if safe_available < old_products + production:
-                production = max(0, safe_available - old_products)
+                safe_new_products = max(0, safe_available - old_products)
+                safe_groups = math.floor(safe_new_products / max(group["products"], 1.0))
+                production = int(math.floor(safe_groups * group["products"]))
                 budget = budget_for(production)
-                budget = spend_remaining_cash(budget)
                 city_rows = make_city_rows(chosen_aggressive)
 
         active_rows = [row for row in city_rows if int(row["agents_after"]) > 0 and int(row["index"]) in selected]
