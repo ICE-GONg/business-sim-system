@@ -13,7 +13,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 16
+BOT_API_VERSION = 17
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -872,13 +872,13 @@ def _submit_bots(
                 desired_available = min(desired_available, int(prior_sold * 1.12 + old_products))
         prior_surplus_ratio = prior_surplus / max(1, prior_total)
         cash_ratio = float(bot["cash"]) / initial_cash
-        # Emergency inventory mode is deliberately narrow. It does not make a
-        # healthy Bot hoard cash; it helps a cash-starved Bot turn last round's
-        # unsold stock back into working capital at a profitable low price.
+        # Start recovery when stock itself becomes dangerous, not only after a
+        # former leader has already burned down to its initial cash. Waiting
+        # for the latter made wealthy first-place Bots react one round too late.
         distress_liquidation = bool(
             not super_mode
-            and prior_surplus > max(10, prior_total * 0.05)
-            and cash_ratio < 0.90
+            and prior_surplus > max(10, prior_total * 0.06)
+            and prior_sold < prior_total * 0.94
         )
         if distress_liquidation:
             # Do not pay to expand the network while rescuing existing stock.
@@ -1299,19 +1299,15 @@ def _submit_bots(
                     # Flexible liquidation price: move from the last market
                     # average toward cost as inventory/cash pressure rises.
                     # Never deliberately sell below the real per-unit cost.
-                    cost_floor = max(
-                        price_min,
-                        direct_unit_cost * 1.03,
-                        allocated_operating_cost * 1.01,
-                    )
+                    cost_floor = max(price_min, direct_unit_cost * 1.03)
                     average_ceiling = min(cap, max(price_min, previous_price))
                     pressure_depth = (
-                        0.20
-                        + min(0.48, prior_surplus_ratio * 0.75)
-                        + min(0.22, max(0.0, 0.90 - cash_ratio) * 0.50)
-                        + rng.uniform(-0.05, 0.06)
+                        0.48
+                        + min(0.30, prior_surplus_ratio * 0.70)
+                        + min(0.14, max(0.0, 0.90 - cash_ratio) * 0.40)
+                        + rng.uniform(-0.06, 0.07)
                     )
-                    pressure_depth = min(0.92, max(0.14, pressure_depth))
+                    pressure_depth = min(0.94, max(0.42, pressure_depth))
                     reference = (
                         average_ceiling - (average_ceiling - cost_floor) * pressure_depth
                         if average_ceiling >= cost_floor else cost_floor

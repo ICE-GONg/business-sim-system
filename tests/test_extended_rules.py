@@ -498,7 +498,7 @@ class ExtendedRulesTest(unittest.TestCase):
             for profile in range(7):
                 self.assertNotEqual(signatures[bot_ids[profile]], signatures[bot_ids[profile + 7]])
 
-    def test_cash_stressed_bot_liquidates_surplus_without_extra_cpi_spending(self):
+    def test_bot_liquidates_dangerous_surplus_before_cash_runs_out(self):
         db = self.fresh("bot-liquidation.db")
         company_id = self.one_company(db)
         from sim.bots import submit_bot_decisions
@@ -526,7 +526,7 @@ class ExtendedRulesTest(unittest.TestCase):
                 (json.dumps(report), company_id),
             )
             conn.execute(
-                "UPDATE companies SET cash=2000000,product_inventory=500 WHERE id=?",
+                "UPDATE companies SET cash=30000000,product_inventory=500 WHERE id=?",
                 (company_id,),
             )
             conn.execute("UPDATE market_round_stats SET average_price=20000 WHERE round_no=1")
@@ -553,7 +553,16 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertTrue(active)
             self.assertTrue(all(int(row["agent_delta"]) <= 0 for row in active))
             self.assertTrue(all(float(row["marketing_investment"]) == 0 for row in active))
-            self.assertTrue(all(3500 <= float(row["price"]) <= 20000 for row in active))
+            self.assertTrue(all(3500 <= float(row["price"]) <= 15000 for row in active))
+            settle_round(conn, 2)
+            city_result = db.one(
+                conn,
+                "SELECT sold,breakdown_json FROM city_results "
+                "WHERE company_id=? AND round_no=2 AND city='广州'",
+                (company_id,),
+            )
+            self.assertGreater(int(city_result["sold"]), 0)
+            self.assertGreater(float(json.loads(city_result["breakdown_json"])["price_cpi"]), 0.0)
 
     def test_bulk_delete_is_atomic_and_keeps_one_company(self):
         db = self.fresh("bulk-delete.db")
