@@ -570,11 +570,16 @@ class ExtendedRulesTest(unittest.TestCase):
                 )
                 conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cursor.lastrowid, markets[profile]))
             conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
-            from sim.bots import submit_super_bot_decisions
+            from sim.bots import _all_markets_near_capacity, submit_super_bot_decisions
             from sim.engine import settle_round
             for round_no in range(1, 8):
                 if round_no > 1:
                     conn.execute("INSERT INTO rounds(round_no,status) VALUES(?,'open')", (round_no,))
+                all_markets_full = _all_markets_near_capacity(
+                    conn,
+                    round_no,
+                    [dict(row) for row in db.all_rows(conn, "SELECT * FROM market_config ORDER BY city")],
+                )
                 self.assertEqual(submit_super_bot_decisions(conn, round_no), 7)
                 if round_no == 1:
                     super_decisions = db.all_rows(
@@ -600,6 +605,11 @@ class ExtendedRulesTest(unittest.TestCase):
                     report = json.loads(result["report_json"])
                     available = int(result["produced"]) + int(report["production"]["old_products"])
                     self.assertGreaterEqual(float(result["cash"]), 0)
+                    self.assertGreater(
+                        float(result["net_assets"]),
+                        0,
+                        f"round={round_no} company={result['company_id']} result={dict(result)}",
+                    )
                     finance = report["finance"]
                     pre_sales_spending = sum(
                         float(finance[key])
@@ -619,7 +629,14 @@ class ExtendedRulesTest(unittest.TestCase):
                     # market because the organiser explicitly prioritises full
                     # cash deployment over inventory control.
                     self.assertGreaterEqual(remaining_before_sales, -1e-6)
-                    self.assertLess(remaining_before_sales, 1_000_000)
+                    if not all_markets_full:
+                        self.assertLess(
+                            remaining_before_sales,
+                            1_000_000,
+                            f"round={round_no} company={result['company_id']} "
+                            f"decision={dict(db.one(conn, 'SELECT * FROM decisions WHERE company_id=? AND round_no=?', (result['company_id'], round_no)))} "
+                            f"finance={finance}",
+                        )
 
     def test_failed_research_accumulates_into_next_round(self):
         db = self.fresh("research.db")

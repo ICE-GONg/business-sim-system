@@ -13,7 +13,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 14
+BOT_API_VERSION = 15
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -464,7 +464,10 @@ def _rebalance_super_bot_production(
                 (deployed * headroom / total_headroom, company_id, round_no, city),
             )
 
-    for _ in range(20):
+    # Binary candidate selection can start farther from the final joint CPI
+    # equilibrium than the former dense grid. Allow enough damped passes for
+    # production and investment to converge without leaving affordable groups.
+    for _ in range(40):
         capacities = (
             _forecast_submitted_cpi_capacity(conn, round_no, markets)
             if all_markets_full else {}
@@ -918,11 +921,26 @@ def _submit_bots(
                     size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
                     qi_large = float(market["max_price"]) / 50.0
                     mi_large = qi_large * size * 0.20 / 1.5 / 2.0
+                    cap = min(price_max, float(market["max_price"]))
+                    prior_average = previous_prices.get(index, float(market["initial_avg_price"]))
+                    if prior_average >= cap * 0.75:
+                        # Unresolved Super Bots must be modelled as possible
+                        # low-price competitors once that strategy is unlocked.
+                        # Otherwise every sequential Bot falsely believes it can
+                        # monopolise the 40-CPI price pool at exactly 75%.
+                        expected_low_ratios = (0.72, 0.68, 0.64, 0.60, 0.56, 0.52, 0.48)
+                        expected_ratio = max(
+                            price_min / max(1.0, cap),
+                            expected_low_ratios[other_profile],
+                        )
+                        expected_price = cap * expected_ratio
+                    else:
+                        expected_price = cap * float(other_style["high"])
                     rival_metrics[index].append({
                         "ma": max(ma_threshold * 1.02, float(plan["ma"]) * other_variation) * float(other_style["ma"]),
                         "qi": qi_large * float(other_style["qi"]) if plan_index >= 1 else 0.0,
                         "mi_effective": mi_large * float(other_style["mi"]) if plan_index >= 2 else 0.0,
-                        "price": min(price_max, float(market["max_price"])) * float(other_style["high"]),
+                        "price": expected_price,
                         "agents": float(other_agents),
                         "available": float(plan["production"]) * other_variation / max(1, len(other_selected)),
                     })
@@ -1267,38 +1285,41 @@ def _submit_bots(
                 - ma_index_target * (group["workers"] + group["engineers"])
                 - qi_index_target * group["products"],
             )
-            ma_candidates = sorted({
-                1.0, 800.0, 1600.0, 2800.0, 4400.0, 6200.0, 8000.0,
-                min(8000.0, max(1.0, ma_index_target)),
-            })
-            qi_candidates = sorted({
-                1.0, 500.0, 1000.0, 1750.0, 2500.0, 3000.0,
-                min(3000.0, max(1.0, qi_index_target)),
-            })
-            mi_ratio_candidates = (
-                {0.0} if not use_mi else {0.0, 1.0, 1.5, 2.25, 3.0, 4.5, 6.0}
+            ma_ceiling = 8000.0
+            qi_ceiling = 3000.0
+            mi_ratio_ceiling = 6.0 if use_mi else 0.0
+            field_ma = min(ma_ceiling, max(1.0, ma_index_target))
+            field_qi = min(qi_ceiling, max(1.0, qi_index_target))
+            field_mi_ratio = max(
+                (
+                    marketing_targets.get(index, 0.0) / mi_thresholds[index]
+                    for index in selected
+                    if index in mi_selected and mi_thresholds.get(index, 0.0) > 0
+                ),
+                default=0.0,
             )
+            field_mi_ratio = min(mi_ratio_ceiling, max(0.0, field_mi_ratio))
+            leader_ma = field_ma
+            leader_qi = field_qi
+            leader_mi_ratio = field_mi_ratio
             price_ratio_candidates = {
                 min(0.98, max(0.75, high_price_ratio)), 0.95, 0.88, 0.81, 0.75,
             }
             if previous_leader:
-                ma_candidates = sorted({
-                    *ma_candidates,
-                    min(8000.0, max(1.0, float(previous_leader["ma"]))),
-                })
-                qi_candidates = sorted({
-                    *qi_candidates,
-                    min(3000.0, max(1.0, float(previous_leader["qi"]))),
-                })
+                leader_ma = min(ma_ceiling, max(1.0, float(previous_leader["ma"])))
+                leader_qi = min(qi_ceiling, max(1.0, float(previous_leader["qi"])))
                 for index in selected:
                     leader_city = previous_leader["cities"].get(str(markets[index]["city"]))
                     if not leader_city:
                         continue
                     if use_mi and mi_thresholds.get(index, 0.0) > 0:
-                        mi_ratio_candidates.add(min(
-                            6.0,
-                            max(0.0, float(leader_city["marketing"]) / mi_thresholds[index]),
-                        ))
+                        leader_mi_ratio = max(
+                            leader_mi_ratio,
+                            min(
+                                mi_ratio_ceiling,
+                                max(0.0, float(leader_city["marketing"]) / mi_thresholds[index]),
+                            ),
+                        )
                     cap = min(price_max, float(markets[index]["max_price"]))
                     if cap > 0:
                         price_ratio_candidates.add(min(
@@ -1363,10 +1384,11 @@ def _submit_bots(
                 candidate_available = old_products + candidate_production
                 if candidate_available <= 0:
                     return {
-                        "score": (-1, -math.inf, 0.0, candidate_price_ratio),
+                        "score": (-1, -math.inf, 0.0, -math.inf, candidate_price_ratio),
                         "ma": candidate_ma, "qi": candidate_qi,
                         "marketing": candidate_marketing, "groups": candidate_groups,
-                        "price_ratio": candidate_price_ratio,
+                        "price_ratio": candidate_price_ratio, "coverage": 0.0,
+                        "predicted_profit": -math.inf, "sell_ratio": 0.0,
                     }
 
                 city_capacities: list[tuple[int, float, float]] = []
@@ -1452,21 +1474,78 @@ def _submit_bots(
                     "ma": candidate_ma, "qi": candidate_qi,
                     "marketing": candidate_marketing, "groups": candidate_groups,
                     "price_ratio": candidate_price_ratio,
+                    "coverage": cpi_coverage,
+                    "predicted_profit": predicted_profit,
+                    "sell_ratio": sell_ratio,
                 }
 
+            # Use field-informed upper bounds plus deliberately high legal
+            # bounds. For each strategy family, binary-search the point where
+            # CPI capacity reaches stock. Every visited point still competes on
+            # predicted profit, so the search does not blindly maximise CPI.
+            strategy_upper_bounds = {
+                (ma_ceiling, qi_ceiling, mi_ratio_ceiling),
+                (ma_ceiling, 1.0, 0.0),
+                (1.0, qi_ceiling, 0.0),
+                (1.0, 1.0, mi_ratio_ceiling),
+                (ma_ceiling, qi_ceiling, 0.0),
+                (ma_ceiling, 1.0, mi_ratio_ceiling),
+                (1.0, qi_ceiling, mi_ratio_ceiling),
+                (ma_ceiling, field_qi, field_mi_ratio),
+                (field_ma, qi_ceiling, field_mi_ratio),
+                (field_ma, field_qi, mi_ratio_ceiling),
+                (ma_ceiling, qi_ceiling, field_mi_ratio),
+                (ma_ceiling, field_qi, mi_ratio_ceiling),
+                (field_ma, qi_ceiling, mi_ratio_ceiling),
+                (field_ma, field_qi, field_mi_ratio),
+                (leader_ma, leader_qi, leader_mi_ratio),
+            }
             best_candidate: dict[str, Any] | None = None
-            for candidate_ma in ma_candidates:
-                for candidate_qi in qi_candidates:
-                    for candidate_mi_ratio in sorted(mi_ratio_candidates):
-                        for candidate_price_ratio in sorted(price_ratio_candidates, reverse=True):
-                            candidate = evaluate_candidate(
-                                candidate_ma,
-                                candidate_qi,
-                                candidate_mi_ratio,
-                                candidate_price_ratio,
-                            )
-                            if best_candidate is None or candidate["score"] > best_candidate["score"]:
-                                best_candidate = candidate
+            candidate_cache: dict[tuple[float, float, float, float], dict[str, Any]] = {}
+
+            def test_candidate(
+                candidate_ma: float,
+                candidate_qi: float,
+                candidate_mi_ratio: float,
+                candidate_price_ratio: float,
+            ) -> dict[str, Any]:
+                nonlocal best_candidate
+                key = (
+                    round(candidate_ma, 8), round(candidate_qi, 8),
+                    round(candidate_mi_ratio, 8), round(candidate_price_ratio, 8),
+                )
+                candidate = candidate_cache.get(key)
+                if candidate is None:
+                    candidate = evaluate_candidate(
+                        candidate_ma,
+                        candidate_qi,
+                        candidate_mi_ratio,
+                        candidate_price_ratio,
+                    )
+                    candidate_cache[key] = candidate
+                if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                    best_candidate = candidate
+                return candidate
+
+            for candidate_price_ratio in sorted(price_ratio_candidates, reverse=True):
+                # Pure-price path is always retained.
+                test_candidate(1.0, 1.0, 0.0, candidate_price_ratio)
+                for upper_ma, upper_qi, upper_mi_ratio in strategy_upper_bounds:
+                    low_scale = 0.0
+                    high_scale = 1.0
+                    test_candidate(upper_ma, upper_qi, upper_mi_ratio, candidate_price_ratio)
+                    for _ in range(7):
+                        scale = (low_scale + high_scale) / 2.0
+                        candidate = test_candidate(
+                            1.0 + (upper_ma - 1.0) * scale,
+                            1.0 + (upper_qi - 1.0) * scale,
+                            upper_mi_ratio * scale,
+                            candidate_price_ratio,
+                        )
+                        if float(candidate["coverage"]) >= 1.0:
+                            high_scale = scale
+                        else:
+                            low_scale = scale
 
             if best_candidate is not None:
                 ma_index_target = float(best_candidate["ma"])
