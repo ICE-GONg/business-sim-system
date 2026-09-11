@@ -13,7 +13,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 18
+BOT_API_VERSION = 19
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -845,6 +845,11 @@ def _submit_bots(
             )
             previous_prices[index] = float(stats["average_price"]) if stats else float(market["initial_avg_price"])
 
+        late_game_low_price = official_round >= max(1, total_rounds - 1)
+        saturated_low_price_indices = {
+            index for index in selected if utilization.get(index, 0.0) >= 0.95
+        }
+
         old_products = int(bot["product_inventory"] or 0)
         old_components = int(bot["component_inventory"] or 0)
         wealth_multiple = max(1.0, float(bot["cash"]) / initial_cash)
@@ -964,7 +969,11 @@ def _submit_bots(
                     mi_large = qi_large * size * 0.20 / 1.5 / 2.0
                     cap = min(price_max, float(market["max_price"]))
                     prior_average = previous_prices.get(index, float(market["initial_avg_price"]))
-                    if prior_average >= cap * 0.75:
+                    if (
+                        prior_average >= cap * 0.75
+                        or late_game_low_price
+                        or index in saturated_low_price_indices
+                    ):
                         # Unresolved Super Bots must be modelled as possible
                         # low-price competitors once that strategy is unlocked.
                         # Otherwise every sequential Bot falsely believes it can
@@ -1260,7 +1269,11 @@ def _submit_bots(
                 cap = min(price_max, float(market["max_price"]))
                 city_pressure = max(utilization.get(index, 0.0), current_pressure.get(index, 0.0))
                 previous_price = previous_prices.get(index, float(market["initial_avg_price"]))
-                low_price_unlocked = previous_price >= cap * 0.75
+                low_price_unlocked = (
+                    previous_price >= cap * 0.75
+                    or late_game_low_price
+                    or index in saturated_low_price_indices
+                )
                 reference = cap * high_price_ratio
                 if price_ratio_override is not None and index in selected:
                     reference = cap * (
@@ -1295,19 +1308,37 @@ def _submit_bots(
                     + (transport_cost if str(market["city"]) != home else 0.0)
                 )
                 margin = 1.12 if super_mode else 1.06
-                if distress_liquidation and index in selected and agents_after > 0:
+                ordinary_strategic_low_price = bool(
+                    not super_mode
+                    and index in selected
+                    and agents_after > 0
+                    and (late_game_low_price or index in saturated_low_price_indices)
+                )
+                if (distress_liquidation or ordinary_strategic_low_price) and index in selected and agents_after > 0:
                     # Flexible liquidation price: move from the last market
                     # average toward cost as inventory/cash pressure rises.
                     # Never deliberately sell below the real per-unit cost.
                     cost_floor = max(price_min, direct_unit_cost * 1.03)
                     average_ceiling = min(cap, max(price_min, previous_price))
-                    pressure_depth = (
-                        0.48
-                        + min(0.30, prior_surplus_ratio * 0.70)
-                        + min(0.14, max(0.0, 0.90 - cash_ratio) * 0.40)
-                        + rng.uniform(-0.06, 0.07)
-                    )
-                    pressure_depth = min(0.94, max(0.42, pressure_depth))
+                    if distress_liquidation:
+                        pressure_depth = (
+                            0.48
+                            + min(0.30, prior_surplus_ratio * 0.70)
+                            + min(0.14, max(0.0, 0.90 - cash_ratio) * 0.40)
+                            + rng.uniform(-0.06, 0.07)
+                        )
+                        pressure_depth = min(0.94, max(0.42, pressure_depth))
+                    else:
+                        # Late/saturated markets undercut more gently than an
+                        # emergency liquidation, preserving positive margin.
+                        pressure_depth = (
+                            0.22
+                            + (0.10 if official_round >= total_rounds else 0.0)
+                            + (0.12 if index in saturated_low_price_indices else 0.0)
+                            + min(0.16, prior_surplus_ratio * 0.45)
+                            + rng.uniform(-0.05, 0.07)
+                        )
+                        pressure_depth = min(0.72, max(0.16, pressure_depth))
                     reference = (
                         average_ceiling - (average_ceiling - cost_floor) * pressure_depth
                         if average_ceiling >= cost_floor else cost_floor
@@ -1419,7 +1450,7 @@ def _submit_bots(
                             0.98,
                             max(price_min / cap, float(leader_city["price"]) / cap),
                         ))
-            if any(
+            if late_game_low_price or saturated_low_price_indices or any(
                 previous_prices[index] >= min(price_max, float(markets[index]["max_price"])) * 0.75
                 for index in selected
             ):
@@ -1437,7 +1468,11 @@ def _submit_bots(
                 price_ratio_candidates.add(minimum_ratio)
                 for index in selected:
                     cap = min(price_max, float(markets[index]["max_price"]))
-                    if cap <= 0 or previous_prices[index] < cap * 0.75:
+                    if cap <= 0 or not (
+                        previous_prices[index] >= cap * 0.75
+                        or late_game_low_price
+                        or index in saturated_low_price_indices
+                    ):
                         continue
                     for rival in rival_metrics[index]:
                         if rival["price"] > 0:
@@ -1492,7 +1527,11 @@ def _submit_bots(
                         continue
                     market = markets[index]
                     cap = min(price_max, float(market["max_price"]))
-                    low_price_unlocked = previous_prices[index] >= cap * 0.75
+                    low_price_unlocked = (
+                        previous_prices[index] >= cap * 0.75
+                        or late_game_low_price
+                        or index in saturated_low_price_indices
+                    )
                     effective_ratio = (
                         candidate_price_ratio
                         if low_price_unlocked or candidate_price_ratio >= 0.75

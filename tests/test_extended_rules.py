@@ -564,6 +564,46 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreater(int(city_result["sold"]), 0)
             self.assertGreater(float(json.loads(city_result["breakdown_json"])["price_cpi"]), 0.0)
 
+    def test_regular_bot_prefers_low_price_in_saturated_market_and_last_two_rounds(self):
+        db = self.fresh("bot-strategic-low-price.db")
+        company_id = self.one_company(db, 30_000_000)
+        from sim.bots import submit_bot_decisions
+        with db.connect() as conn:
+            db.set_setting(conn, "total_rounds", 5)
+            conn.execute(
+                "UPDATE companies SET is_bot=1,bot_profile=1,home_city='广州' WHERE id=?",
+                (company_id,),
+            )
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company_id,))
+            market = db.one(conn, "SELECT population,penetration FROM market_config WHERE city='广州'")
+            size = float(market["population"]) * float(market["penetration"])
+            conn.execute(
+                "INSERT INTO market_round_stats(city,round_no,base_average_price,average_price,market_size,player_total_volume) "
+                "VALUES('广州',1,20000,20000,?,?)",
+                (size, size * 0.95),
+            )
+            conn.execute("INSERT INTO rounds(round_no,status) VALUES(2,'open')")
+            self.assertEqual(submit_bot_decisions(conn, 2), 1)
+            saturated_price = float(db.one(
+                conn,
+                "SELECT price FROM city_decisions WHERE company_id=? AND round_no=2 AND city='广州'",
+                (company_id,),
+            )["price"])
+            self.assertLess(saturated_price, 20000)
+
+            conn.execute("DELETE FROM city_decisions WHERE company_id=? AND round_no=2", (company_id,))
+            conn.execute("DELETE FROM decisions WHERE company_id=? AND round_no=2", (company_id,))
+            conn.execute("UPDATE market_round_stats SET player_total_volume=0 WHERE city='广州' AND round_no=1")
+            conn.execute("INSERT INTO rounds(round_no,status) VALUES(4,'open')")
+            self.assertEqual(submit_bot_decisions(conn, 4), 1)
+            late_price = float(db.one(
+                conn,
+                "SELECT price FROM city_decisions WHERE company_id=? AND round_no=4 AND city='广州'",
+                (company_id,),
+            )["price"])
+            self.assertLess(late_price, 20000)
+            self.assertGreaterEqual(late_price, 3500)
+
     def test_bulk_delete_is_atomic_and_keeps_one_company(self):
         db = self.fresh("bulk-delete.db")
         with db.connect() as conn:
