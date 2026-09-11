@@ -498,6 +498,63 @@ class ExtendedRulesTest(unittest.TestCase):
             for profile in range(7):
                 self.assertNotEqual(signatures[bot_ids[profile]], signatures[bot_ids[profile + 7]])
 
+    def test_cash_stressed_bot_liquidates_surplus_without_extra_cpi_spending(self):
+        db = self.fresh("bot-liquidation.db")
+        company_id = self.one_company(db)
+        from sim.bots import submit_bot_decisions
+        from sim.engine import settle_round
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE companies SET is_bot=1,bot_profile=3,home_city='广州' WHERE id=?",
+                (company_id,),
+            )
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company_id,))
+            submit_bot_decisions(conn, 1)
+            settle_round(conn, 1)
+
+            result = db.one(
+                conn,
+                "SELECT report_json FROM results WHERE company_id=? AND round_no=1",
+                (company_id,),
+            )
+            report = json.loads(result["report_json"])
+            report["production"].update({
+                "old_products": 0, "produced": 500, "sold": 0, "surplus": 500,
+            })
+            conn.execute(
+                "UPDATE results SET report_json=? WHERE company_id=? AND round_no=1",
+                (json.dumps(report), company_id),
+            )
+            conn.execute(
+                "UPDATE companies SET cash=2000000,product_inventory=500 WHERE id=?",
+                (company_id,),
+            )
+            conn.execute("UPDATE market_round_stats SET average_price=20000 WHERE round_no=1")
+            conn.execute("INSERT INTO rounds(round_no,status) VALUES(2,'open')")
+
+            self.assertEqual(submit_bot_decisions(conn, 2), 1)
+            decision = db.one(
+                conn,
+                "SELECT * FROM decisions WHERE company_id=? AND round_no=2",
+                (company_id,),
+            )
+            self.assertEqual(float(decision["quality_investment"]), 0.0)
+            self.assertEqual(float(decision["research_investment"]), 0.0)
+            active = db.all_rows(
+                conn,
+                "SELECT cd.price,cd.agent_delta,cd.marketing_investment,"
+                "COALESCE(a.count,0)+cd.agent_delta AS agents_after "
+                "FROM city_decisions cd LEFT JOIN agents a "
+                "ON a.company_id=cd.company_id AND a.city=cd.city "
+                "WHERE cd.company_id=? AND cd.round_no=2",
+                (company_id,),
+            )
+            active = [row for row in active if int(row["agents_after"] or 0) > 0]
+            self.assertTrue(active)
+            self.assertTrue(all(int(row["agent_delta"]) <= 0 for row in active))
+            self.assertTrue(all(float(row["marketing_investment"]) == 0 for row in active))
+            self.assertTrue(all(3500 <= float(row["price"]) <= 20000 for row in active))
+
     def test_bulk_delete_is_atomic_and_keeps_one_company(self):
         db = self.fresh("bulk-delete.db")
         with db.connect() as conn:

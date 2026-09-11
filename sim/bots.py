@@ -13,7 +13,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 15
+BOT_API_VERSION = 16
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -36,6 +36,25 @@ BOT_STYLES = (
     {"ma": 2.30, "qi": 2.25, "mi": 2.25, "high": 0.960, "cut": 340},
     {"ma": 2.85, "qi": 1.45, "mi": 2.70, "high": 0.965, "cut": 440},
     {"ma": 3.55, "qi": 2.90, "mi": 3.20, "high": 0.970, "cut": 560},
+)
+
+# Ordinary Bots rotate through inexpensive strategy mixes instead of carrying
+# one exaggerated personality through all seven rounds.  These are threshold
+# multipliers (not cash amounts), so they continue to work with a custom KDS.
+# The rotation is O(1): unlike Super Bots, ordinary Bots do not run a search.
+NORMAL_INVESTMENT_MIXES = (
+    {"ma": 1.05, "qi": 1.04, "mi": 1.03},  # lean balanced
+    {"ma": 1.22, "qi": 1.04, "mi": 1.12},  # MA focus
+    {"ma": 1.05, "qi": 1.28, "mi": 1.08},  # QI focus
+    {"ma": 1.07, "qi": 1.05, "mi": 2.90},  # MI focus
+    {"ma": 1.20, "qi": 1.22, "mi": 1.04},  # MA + QI
+    {"ma": 1.24, "qi": 1.05, "mi": 1.80},  # MA + MI
+    {"ma": 1.05, "qi": 1.22, "mi": 2.30},  # QI + MI
+    {"ma": 1.16, "qi": 1.16, "mi": 1.45},  # broad balanced
+    {"ma": 1.31, "qi": 1.09, "mi": 1.15},
+    {"ma": 1.09, "qi": 1.34, "mi": 1.25},
+    {"ma": 1.11, "qi": 1.11, "mi": 2.65},
+    {"ma": 1.27, "qi": 1.25, "mi": 2.00},
 )
 
 
@@ -842,13 +861,35 @@ def _submit_bots(
         prior_production = report.get("production", {})
         prior_sold = 0
         prior_total = 0
+        prior_surplus = 0
         if prior_production:
             prior_sold = int(prior_production.get("sold", 0) or 0)
             prior_total = int(prior_production.get("old_products", 0) or 0) + int(prior_production.get("produced", 0) or 0)
+            prior_surplus = int(prior_production.get("surplus", 0) or 0)
             if prior_total and prior_sold >= prior_total * 0.95 and not any(saturated.values()):
                 desired_available = max(desired_available, int(prior_sold * 1.35))
-            elif int(prior_production.get("surplus", 0) or 0) > max(20, prior_sold * 0.30):
+            elif prior_surplus > max(20, prior_sold * 0.30):
                 desired_available = min(desired_available, int(prior_sold * 1.12 + old_products))
+        prior_surplus_ratio = prior_surplus / max(1, prior_total)
+        cash_ratio = float(bot["cash"]) / initial_cash
+        # Emergency inventory mode is deliberately narrow. It does not make a
+        # healthy Bot hoard cash; it helps a cash-starved Bot turn last round's
+        # unsold stock back into working capital at a profitable low price.
+        distress_liquidation = bool(
+            not super_mode
+            and prior_surplus > max(10, prior_total * 0.05)
+            and cash_ratio < 0.90
+        )
+        if distress_liquidation:
+            # Do not pay to expand the network while rescuing existing stock.
+            # Existing agents remain in place and can sell the inventory.
+            for index, (delta, agents_after) in tuple(agent_plan.items()):
+                if delta > 0:
+                    agent_plan[index] = (0, agents_after - delta)
+            agent_cost = sum(
+                max(0, delta) * add_agent_cost
+                for delta, _ in agent_plan.values()
+            )
         production_goal = max(0, desired_available - old_products)
         material_factor = patent_factor ** int(bot["patents"] or 0)
         research_balance = max(0.0, float(bot["research_balance"] or 0))
@@ -982,6 +1023,18 @@ def _submit_bots(
         # derived from the strategy guide's complete group cost; investment is
         # never used as a blind cash sink after production has been calculated.
         ma_index_target = max(ma_threshold * ma_round_buffer, float(plan["ma"]) * variation) * ma_strength
+        normal_mix = NORMAL_INVESTMENT_MIXES[(profile + plan_index * 5) % len(NORMAL_INVESTMENT_MIXES)]
+        normal_phase = (1.00, 1.08, 1.20, 1.38, 1.58, 1.82, 2.08)[plan_index]
+        if not super_mode:
+            # Early rounds buy just enough of an opened CPI pool to compete;
+            # later rounds widen naturally. Profiles rotate, so the field has
+            # MA-, QI-, MI- and balanced plans without an expensive optimiser.
+            ma_index_target = ma_threshold * max(
+                1.02,
+                float(normal_mix["ma"]) * normal_phase * rng.uniform(0.96, 1.05),
+            )
+            if distress_liquidation:
+                ma_index_target = ma_threshold * rng.uniform(1.02, 1.10)
         if super_mode:
             rival_ma = _upper_typical([item["ma"] for index in selected for item in rival_metrics[index]])
             ma_index_target = min(
@@ -990,6 +1043,14 @@ def _submit_bots(
             )
         qi_line = max(float(markets[index]["max_price"]) / 50.0 for index in selected)
         qi_index_target = qi_line * max(1.03, qi_strength)
+        if not super_mode:
+            qi_index_target = qi_line * max(
+                1.02,
+                float(normal_mix["qi"]) * normal_phase * rng.uniform(0.95, 1.06),
+            )
+            if distress_liquidation:
+                use_qi = False
+                qi_index_target = 0.0
         if super_mode:
             rival_qi = _upper_typical([item["qi"] for index in selected for item in rival_metrics[index]])
             qi_index_target = min(
@@ -1006,6 +1067,13 @@ def _submit_bots(
             threshold /= max(1.0, 1.0 + active_agents * 0.10) * 1.5 * 2.0
             mi_thresholds[index] = threshold
             target_mi = threshold * mi_strength
+            if not super_mode:
+                target_mi = threshold * max(
+                    1.02,
+                    float(normal_mix["mi"]) * normal_phase * rng.uniform(0.95, 1.06),
+                )
+                if distress_liquidation:
+                    target_mi = 0.0
             if super_mode:
                 rival_mi = _upper_typical([item["mi_effective"] for item in rival_metrics[index]])
                 target_mi = min(
@@ -1017,6 +1085,14 @@ def _submit_bots(
                     ),
                 )
             marketing_targets[index] = target_mi if index in mi_selected and active_agents else 0.0
+
+        if distress_liquidation:
+            # Low-price CPI is the recovery tool. Do not compound the problem
+            # by opening QI/MI pools or research while operating cash is tight.
+            use_qi = False
+            use_mi = False
+            mi_selected = set()
+            marketing_targets = {index: 0.0 for index in marketing_targets}
 
         group = _balanced_production_group(worker_need, worker_hours, engineer_need, engineer_hours, component_need)
         group_cost = (
@@ -1219,7 +1295,28 @@ def _submit_bots(
                     + (transport_cost if str(market["city"]) != home else 0.0)
                 )
                 margin = 1.12 if super_mode else 1.06
-                if super_mode and price_ratio_override is not None:
+                if distress_liquidation and index in selected and agents_after > 0:
+                    # Flexible liquidation price: move from the last market
+                    # average toward cost as inventory/cash pressure rises.
+                    # Never deliberately sell below the real per-unit cost.
+                    cost_floor = max(
+                        price_min,
+                        direct_unit_cost * 1.03,
+                        allocated_operating_cost * 1.01,
+                    )
+                    average_ceiling = min(cap, max(price_min, previous_price))
+                    pressure_depth = (
+                        0.20
+                        + min(0.48, prior_surplus_ratio * 0.75)
+                        + min(0.22, max(0.0, 0.90 - cash_ratio) * 0.50)
+                        + rng.uniform(-0.05, 0.06)
+                    )
+                    pressure_depth = min(0.92, max(0.14, pressure_depth))
+                    reference = (
+                        average_ceiling - (average_ceiling - cost_floor) * pressure_depth
+                        if average_ceiling >= cost_floor else cost_floor
+                    )
+                elif super_mode and price_ratio_override is not None:
                     # An explicit optimiser candidate may run a pure low-price
                     # strategy. Candidate scoring already rejects a total-plan
                     # loss, so only protect the direct unit contribution here.
@@ -1600,6 +1697,7 @@ def _submit_bots(
         operating_reserve = max(float(bot["cash"]) * 0.06, float(budget["staff_cost"]) * 0.50)
         research_ready = (
             not last_round and research_needed > 0
+            and not distress_liquidation
             and projected_cash - research_needed >= operating_reserve
             and (
                 not super_mode
