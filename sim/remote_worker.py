@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import math
@@ -14,18 +15,80 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from .defaults import DEFAULT_SETTINGS
 
 PROTOCOL = 2
+REMOTE_API_VERSION = 2
 TABLES = ("settings", "companies", "employee_cohorts", "market_config", "rounds",
           "decisions", "city_decisions", "agents", "results", "city_results", "market_round_stats")
 _LOCK = threading.Lock()
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+_RETRYABLE_HTTP_STATUSES = {408, 429, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530}
 
 
 class RemoteWorkerError(ValueError):
     pass
+
+
+class RemoteTransportError(RemoteWorkerError):
+    """Only connection failures or a temporarily unavailable worker may retry."""
+
+
+def resolve_remote_endpoints(primary: str = "", *, urls: Any = None, fallback: str = "") -> list[str]:
+    """Keep configured priority; accept a Secrets array or comma/JSON string."""
+    values = urls
+    if isinstance(values, str):
+        values = values.strip()
+        if values.startswith("["):
+            try:
+                values = json.loads(values)
+            except json.JSONDecodeError as exc:
+                raise RemoteWorkerError("超级 Bot 计算地址列表格式不正确") from exc
+        else:
+            values = values.split(",") if values else []
+    if values is None:
+        values = []
+    if not isinstance(values, (list, tuple)) or any(not isinstance(value, str) for value in values):
+        raise RemoteWorkerError("超级 Bot 计算地址列表必须是字符串数组或逗号分隔地址")
+    endpoints = [value.strip() for value in values if value.strip()]
+    if not endpoints and primary.strip():
+        endpoints.append(primary.strip())
+    if fallback.strip():
+        endpoints.append(fallback.strip())
+    return list(dict.fromkeys(endpoints))
+
+
+def remote_health(endpoints: str | list[str] | tuple[str, ...], timeout: float = 4.0) -> list[dict]:
+    """Read public health only; never send an auth token or competition data."""
+    urls = resolve_remote_endpoints(urls=endpoints)
+
+    def check(item: tuple[int, str]) -> dict:
+        index, url = item
+        started = time.perf_counter()
+        status = {"line": index + 1, "ok": False, "message": "连接失败或超时"}
+        try:
+            if not url.startswith("https://"):
+                raise ValueError("HTTPS required")
+            request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read(8192))
+            if isinstance(result, dict) and "statusCode" in result and "body" in result:
+                result = json.loads(result["body"]) if isinstance(result["body"], str) else result["body"]
+            if isinstance(result, dict) and result.get("ok") and result.get("protocol") == PROTOCOL:
+                status.update(ok=True, message="已连通")
+            else:
+                status["message"] = "响应不是兼容的计算服务"
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError, http.client.HTTPException):
+            pass
+        status["seconds"] = time.perf_counter() - started
+        return status
+
+    if not urls:
+        return []
+    with ThreadPoolExecutor(max_workers=min(4, len(urls))) as pool:
+        return list(pool.map(check, enumerate(urls)))
 
 
 def _json(value: Any) -> bytes:
@@ -206,22 +269,39 @@ def _post(endpoint: str, token: str, payload: dict) -> dict:
     request = urllib.request.Request(endpoint, data=_json(dict(payload, token=token)),
         headers={"Content-Type": "application/json", "X-Super-Bot-Token": token}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=860) as response:
+        # Each request computes one Bot only. A half-open local tunnel should
+        # not hold the whole round for the old 14-minute batch timeout.
+        with urllib.request.urlopen(request, timeout=120) as response:
             result = json.load(response)
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RemoteWorkerError("远程计算连接中断；已保存的 Bot 决策不受影响，请继续未完成的分析。") from exc
+    except urllib.error.HTTPError as exc:
+        if exc.code in _RETRYABLE_HTTP_STATUSES:
+            raise RemoteTransportError("计算节点暂不可用或忙碌，请继续未完成的分析。") from exc
+        # Authentication, input and computation errors are not a reason to
+        # send the same business request to a second worker.
+        raise RemoteWorkerError(f"远程计算返回 HTTP {exc.code}，请检查计算节点；已保存的决策不受影响。") from exc
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
+        raise RemoteTransportError("远程计算连接中断；已保存的 Bot 决策不受影响，请继续未完成的分析。") from exc
+    if not isinstance(result, dict):
+        raise RemoteWorkerError("远程计算返回格式不正确，未写入决策。")
     if "statusCode" in result and "body" in result:
+        if int(result["statusCode"]) in _RETRYABLE_HTTP_STATUSES:
+            raise RemoteTransportError("计算节点暂不可用或忙碌，请继续未完成的分析。")
+        if int(result["statusCode"]) >= 400:
+            raise RemoteWorkerError(f"远程计算返回 HTTP {result['statusCode']}，未写入决策。")
         result = json.loads(result["body"]) if isinstance(result["body"], str) else result["body"]
+    if not isinstance(result, dict):
+        raise RemoteWorkerError("远程计算返回格式不正确，未写入决策。")
     return result
 
 
-def remote_submit(conn: sqlite3.Connection, endpoint: str, token: str, round_no: int,
+def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[str, ...], token: str, round_no: int,
                   replace_existing: bool = False,
                   progress_callback: Callable[[int, int, str], None] | None = None,
                   timing_callback: Callable[[dict], None] | None = None) -> int:
     if not token:
         raise RemoteWorkerError("未配置超级 Bot 远程鉴权令牌")
-    if not endpoint.startswith("https://"):
+    endpoints = resolve_remote_endpoints(urls=endpoint)
+    if not endpoints or any(not url.startswith("https://") for url in endpoints):
         raise RemoteWorkerError("远程计算地址必须使用 HTTPS")
     if not _LOCK.acquire(blocking=False):
         raise RemoteWorkerError("已有超级 Bot 分析正在进行，请等待当前任务完成。")
@@ -248,6 +328,7 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str, token: str, round_no:
             conn.execute("UPDATE super_bot_remote_jobs SET pending_json=?,total=? WHERE round_no=?", (json.dumps(pending), total, round_no))
             conn.commit()
         submitted = 0
+        active_endpoint = 0
         while True:
             phase = "bot" if pending else "rebalance"
             if progress_callback:
@@ -260,7 +341,20 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str, token: str, round_no:
             payload = create_remote_request(conn, round_no, phase=phase,
                 company_id=pending[0] if pending else None, replace_existing=replace)
             sent = time.perf_counter()
-            result = _post(endpoint, token, payload)
+            # Retry only this uncommitted Bot/stage, using the identical
+            # request id and snapshot. Previously saved Bots stay untouched.
+            for attempt in range(len(endpoints)):
+                selected_endpoint = (active_endpoint + attempt) % len(endpoints)
+                try:
+                    result = _post(endpoints[selected_endpoint], token, payload)
+                except RemoteTransportError:
+                    if attempt + 1 >= len(endpoints):
+                        raise
+                    if progress_callback:
+                        progress_callback(total - len(pending), max(1, total), "计算线路暂不可用，备用线路连接中")
+                else:
+                    active_endpoint = selected_endpoint
+                    break
             received = time.perf_counter()
             submitted += apply_remote_result(conn, payload, result, commit=False)
             try:
@@ -275,6 +369,7 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str, token: str, round_no:
                 conn.rollback()
                 raise
             timings = dict(result.get("timings", {}), phase=phase, company_id=payload["company_id"],
+                endpoint=endpoints[active_endpoint],
                 request_bytes=len(payload["snapshot_b64"]), snapshot_seconds=sent-started,
                 http_seconds=received-sent, save_seconds=time.perf_counter()-received,
                 total_seconds=time.perf_counter()-started)

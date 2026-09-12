@@ -18,6 +18,8 @@ class RemoteRollbackAppTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {
             "SIM_DB_PATH": str(Path(self.temp.name) / "ui.db"),
             "SUPER_BOT_REMOTE_URL": "https://worker.test",
+            "SUPER_BOT_REMOTE_URLS": "",
+            "SUPER_BOT_FALLBACK_URL": "",
             "SUPER_BOT_REMOTE_TOKEN": "test-token",
         })
         self.environment.start()
@@ -122,3 +124,21 @@ class RemoteRollbackAppTests(unittest.TestCase):
         self.assertTrue(any("已撤销第 1 轮" in item.value for item in self.at.success))
         with self.db.connect() as conn:
             self.assertIsNone(self.db.one(conn, "SELECT submitted_at FROM decisions WHERE company_id=?", (self.super_id,)))
+
+    def test_health_button_accepts_native_secrets_array_without_computing(self):
+        self.prepare(super_bot=False)
+        endpoints = ["https://local.test", "https://cloud.test"]
+        self.at.secrets["SUPER_BOT_REMOTE_URLS"] = endpoints
+        self.at.run()
+        statuses = [
+            {"line": 1, "ok": True, "message": "已连通", "seconds": 0.01},
+            {"line": 2, "ok": False, "message": "连接失败或超时", "seconds": 4.0},
+        ]
+        with patch("sim.remote_worker.remote_health", return_value=statuses) as health, patch(
+            "sim.remote_worker._post", side_effect=AssertionError("health must not compute"),
+        ):
+            self.at.button(key="check_compute_health").click().run()
+        self.assertFalse(self.at.exception)
+        health.assert_called_once_with(endpoints, timeout=4.0)
+        self.assertTrue(any("第 1 线路" in row.value and "已连通" in row.value for row in self.at.success))
+        self.assertTrue(any("第 2 线路" in row.value and "连接失败" in row.value for row in self.at.warning))

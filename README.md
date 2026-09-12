@@ -98,9 +98,17 @@ Streamlit Community Cloud 的本地磁盘不保证跨重启持久保存。每轮
 
 ## 超级 Bot 远程计算（可选）
 
-在 Streamlit Secrets 设置 `SUPER_BOT_REMOTE_URL`（HTTPS 地址）和
-`SUPER_BOT_REMOTE_TOKEN`，计算服务器设置相同的令牌。未设置 URL 时仍在
-Streamlit 内计算。不要把真实令牌或比赛数据库上传到 GitHub。
+在 Streamlit Secrets 设置计算地址和 `SUPER_BOT_REMOTE_TOKEN`，计算服务器设置
+相同的令牌。未设置地址时仍在 Streamlit 内计算。不要把真实令牌或比赛数据库上传到 GitHub。
+
+单线路可使用 `SUPER_BOT_REMOTE_URL`；双线路可按优先顺序配置，例如：
+
+```toml
+SUPER_BOT_REMOTE_URLS = ["https://本地隧道地址", "https://腾讯云函数地址"]
+```
+
+本地线路连接失败、繁忙或代理临时故障时，系统会对尚未保存的当前 Bot 自动尝试
+腾讯云备用线路；业务计算错误和过期结果不会被错误地切线掩盖。
 
 - 腾讯云函数：代码包根目录包含 `scf_worker.py` 和完整的 `sim/`，执行方法为
   `scf_worker.main_handler`。先更新计算服务器，再更新 Streamlit。

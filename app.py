@@ -51,7 +51,11 @@ if (
     importlib.reload(_bots_module)
 
 from sim.bots import submit_bot_decisions, submit_super_bot_decisions
-from sim.remote_worker import remote_pending, remote_submit
+from sim import remote_worker as _remote_worker_module
+if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 2:
+    importlib.invalidate_caches()
+    importlib.reload(_remote_worker_module)
+from sim.remote_worker import remote_health, remote_pending, remote_submit, resolve_remote_endpoints
 
 from sim.db import (
     all_rows,
@@ -101,13 +105,13 @@ def _remote_super_bot_submit(
     progress_callback=None,
 ) -> bool:
     """Compute and durably save one remote Super Bot at a time."""
-    endpoint = _deployment_secret("SUPER_BOT_REMOTE_URL")
-    if not endpoint:
+    endpoints = _remote_super_bot_endpoints()
+    if not endpoints:
         return False
     with connect() as conn:
         remote_submit(
             conn,
-            endpoint,
+            endpoints,
             _deployment_secret("SUPER_BOT_REMOTE_TOKEN"),
             int(round_no),
             replace_existing=replace_existing,
@@ -115,6 +119,19 @@ def _remote_super_bot_submit(
             timing_callback=lambda metrics: LOGGER.info("Super Bot remote timing: %s", metrics),
         )
     return True
+
+
+def _remote_super_bot_endpoints() -> list[str]:
+    urls = os.environ.get("SUPER_BOT_REMOTE_URLS", "").strip()
+    if not urls:
+        try:
+            urls = st.secrets.get("SUPER_BOT_REMOTE_URLS", [])
+        except Exception:
+            urls = []
+    return resolve_remote_endpoints(
+        _deployment_secret("SUPER_BOT_REMOTE_URL"), urls=urls,
+        fallback=_deployment_secret("SUPER_BOT_FALLBACK_URL"),
+    )
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -1681,6 +1698,12 @@ def render_admin_kds() -> None:
 
 def render_admin_rounds() -> None:
     hero("回合控制", "设置比赛总轮数、控制计时与结算；必要时可随时中断并从第一轮重开。")
+    remote_config_error = ""
+    try:
+        compute_endpoints = _remote_super_bot_endpoints()
+    except ValueError as exc:
+        compute_endpoints = []
+        remote_config_error = str(exc)
     with connect() as conn:
         round_row = current_round(conn)
         total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
@@ -1709,10 +1732,25 @@ def render_admin_rounds() -> None:
         ) if round_row else None
         history = all_rows(conn, "SELECT * FROM rounds ORDER BY round_no DESC")
         remote_job_pending = bool(
-            round_row and _deployment_secret("SUPER_BOT_REMOTE_URL")
+            round_row and compute_endpoints
             and remote_pending(conn, int(round_row["round_no"]))
         )
     round_banner(round_row)
+    if remote_config_error:
+        st.warning(remote_config_error)
+    elif compute_endpoints:
+        st.caption(f"已配置 {len(compute_endpoints)} 条计算线路；优先使用第 1 线路，连接中断时自动尝试备用线路。")
+        if st.button("检测计算线路", key="check_compute_health"):
+            with st.spinner("检测计算线路连通性…"):
+                try:
+                    statuses = remote_health(compute_endpoints, timeout=4.0)
+                except Exception:
+                    statuses = []
+                    st.warning("暂时无法检测计算线路，请稍后重试。")
+            for status in statuses:
+                label = "优先" if status["line"] == 1 else "备用"
+                message = f"第 {status['line']} 线路（{label}）：{status['message']} · {status['seconds']:.2f} 秒"
+                (st.success if status["ok"] else st.warning)(message)
     current_round_no = int(round_row["round_no"]) if round_row else 1
     settings_cols = st.columns([2, 1, 2])
     selected_total_rounds = settings_cols[0].number_input(
