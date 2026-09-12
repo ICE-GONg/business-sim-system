@@ -8,3 +8,4 @@ data/*.db-wal
 tmp/
 output/pdf/
 output/super_bot_scf.zip
+tools/cloudflared-bin/
