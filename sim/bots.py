@@ -8,12 +8,12 @@ import sqlite3
 import threading
 from typing import Any, Callable
 
-from .cpi import allocate_city_cpi, allocate_city_cpi_for_company
+from .cpi import allocate_city_cpi, allocate_city_cpi_for_company, prepare_city_cpi_for_company
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 19
+BOT_API_VERSION = 20
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -638,6 +638,9 @@ def _submit_bots(
     super_mode: bool,
     progress_callback: Callable[[int, int, str], None] | None = None,
     replace_existing: bool = False,
+    *,
+    target_ids: set[int] | None = None,
+    defer_rebalance: bool = False,
 ) -> int:
     bots = all_rows(
         conn,
@@ -737,13 +740,14 @@ def _submit_bots(
     submitted = 0
     pending_total = sum(
         1 for bot in bots
-        if replace_existing or not one(
+        if (target_ids is None or int(bot["id"]) in target_ids)
+        and (replace_existing or not one(
             conn,
             "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
             (int(bot["id"]), round_no),
-        )
+        ))
     )
-    progress_total = pending_total + (1 if super_mode and pending_total else 0)
+    progress_total = pending_total + (1 if super_mode and pending_total and not defer_rebalance else 0)
     submitted_super_ids = {
         int(row["company_id"])
         for row in all_rows(
@@ -756,6 +760,8 @@ def _submit_bots(
     for bot_row in bots:
         bot = dict(bot_row)
         company_id = int(bot["id"])
+        if target_ids is not None and company_id not in target_ids:
+            continue
         existing_decision = one(
             conn,
             "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
@@ -1480,6 +1486,60 @@ def _submit_bots(
                                 min(0.98, max(minimum_ratio, rival["price"] / cap - 0.004))
                             )
 
+            # Rival decisions and city KDS stay fixed during this Bot's search.
+            # Build them once, while retaining the same summation order and
+            # every candidate/CPI calculation used by the original search.
+            active_market_count = max(1, sum(1 for index in selected if agent_plan[index][1] > 0))
+            candidate_city_data: list[tuple[Any, ...]] = []
+            component_labor = component_need * worker_need * worker_hours / 504.0 * worker_salary * 3
+            product_labor = engineer_need * engineer_hours / 504.0 * engineer_salary * 3
+            for index in selected:
+                agents_after = agent_plan[index][1]
+                if agents_after <= 0:
+                    continue
+                market = markets[index]
+                cap = min(price_max, float(market["max_price"]))
+                low_price_unlocked = (
+                    previous_prices[index] >= cap * 0.75
+                    or late_game_low_price
+                    or index in saturated_low_price_indices
+                )
+                direct_unit_cost = (
+                    component_need * float(home_market["component_material"]) * material_factor
+                    + float(home_market["product_material"]) * material_factor
+                    + component_labor + product_labor
+                    + (transport_cost if str(market["city"]) != home else 0.0)
+                )
+                entries: list[dict[str, float | int]] = []
+                rival_weights: list[float] = []
+                rival_weighted_prices: list[float] = []
+                for rival_number, rival in enumerate(rival_metrics[index]):
+                    rival_agents = max(1.0, rival.get("agents", 1.0))
+                    entries.append({
+                        "company_id": -(rival_number + 1), "ma_index": rival["ma"],
+                        "qi_index": rival["qi"],
+                        "mi_investment": rival["mi_effective"] / (1.0 + rival_agents * 0.10),
+                        "price": rival["price"], "agents": rival_agents,
+                    })
+                    weight = max(1.0, rival.get("available", 1.0))
+                    rival_weights.append(weight)
+                    rival_weighted_prices.append(rival["price"] * weight)
+                own_entry = {
+                    "company_id": company_id, "ma_index": 0.0, "qi_index": 0.0,
+                    "mi_investment": 0.0, "price": 0.0, "agents": agents_after,
+                }
+                entries.append(own_entry)
+                size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
+                cpi_evaluator = prepare_city_cpi_for_company(
+                    entries, target_company_id=company_id, market_size=size,
+                    max_price=float(market["max_price"]), ma_large_threshold=ma_threshold,
+                    market_average_price=previous_prices[index],
+                )
+                candidate_city_data.append((
+                    index, cap, low_price_unlocked, direct_unit_cost,
+                    rival_weights, rival_weighted_prices, size, cpi_evaluator,
+                ))
+
             def evaluate_candidate(
                 candidate_ma: float,
                 candidate_qi: float,
@@ -1520,62 +1580,24 @@ def _submit_bots(
                     }
 
                 city_capacities: list[tuple[int, float, float]] = []
-                active_market_count = max(1, sum(1 for index in selected if agent_plan[index][1] > 0))
-                for index in selected:
-                    agents_after = agent_plan[index][1]
-                    if agents_after <= 0:
-                        continue
-                    market = markets[index]
-                    cap = min(price_max, float(market["max_price"]))
-                    low_price_unlocked = (
-                        previous_prices[index] >= cap * 0.75
-                        or late_game_low_price
-                        or index in saturated_low_price_indices
-                    )
+                for (
+                    index, cap, low_price_unlocked, direct_unit_cost,
+                    rival_weights, rival_weighted_prices, size, cpi_evaluator,
+                ) in candidate_city_data:
                     effective_ratio = (
                         candidate_price_ratio
                         if low_price_unlocked or candidate_price_ratio >= 0.75
                         else min(0.98, max(0.75, high_price_ratio))
                     )
                     candidate_price = cap * effective_ratio
-                    component_labor = component_need * worker_need * worker_hours / 504.0 * worker_salary * 3
-                    product_labor = engineer_need * engineer_hours / 504.0 * engineer_salary * 3
-                    direct_unit_cost = (
-                        component_need * float(home_market["component_material"]) * material_factor
-                        + float(home_market["product_material"]) * material_factor
-                        + component_labor + product_labor
-                        + (transport_cost if str(market["city"]) != home else 0.0)
-                    )
                     candidate_price = min(cap, max(price_min, candidate_price, direct_unit_cost * 1.03))
-                    entries: list[dict[str, float | int]] = []
-                    weighted_prices: list[tuple[float, float]] = []
-                    for rival_number, rival in enumerate(rival_metrics[index]):
-                        rival_agents = max(1.0, rival.get("agents", 1.0))
-                        entries.append({
-                            "company_id": -(rival_number + 1), "ma_index": rival["ma"],
-                            "qi_index": rival["qi"],
-                            "mi_investment": rival["mi_effective"] / (1.0 + rival_agents * 0.10),
-                            "price": rival["price"], "agents": rival_agents,
-                        })
-                        weighted_prices.append((rival["price"], max(1.0, rival.get("available", 1.0))))
-                    entries.append({
-                        "company_id": company_id, "ma_index": candidate_ma,
-                        "qi_index": candidate_qi,
-                        "mi_investment": candidate_marketing[index],
-                        "price": candidate_price, "agents": agents_after,
-                    })
-                    weighted_prices.append((candidate_price, max(1.0, candidate_available / active_market_count)))
-                    weighted_total = sum(weight for _, weight in weighted_prices)
-                    average_price = sum(price * weight for price, weight in weighted_prices) / max(1.0, weighted_total)
-                    size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
-                    own_cpi = allocate_city_cpi_for_company(
-                        entries,
-                        target_company_id=company_id,
-                        market_size=size,
-                        max_price=float(market["max_price"]),
-                        ma_large_threshold=ma_threshold,
-                        average_price=average_price,
-                        market_average_price=previous_prices[index],
+                    own_weight = max(1.0, candidate_available / active_market_count)
+                    weighted_total = sum([*rival_weights, own_weight])
+                    average_price = sum([*rival_weighted_prices, candidate_price * own_weight]) / max(1.0, weighted_total)
+                    own_cpi = cpi_evaluator.evaluate(
+                        ma_index=candidate_ma, qi_index=candidate_qi,
+                        mi_investment=candidate_marketing[index],
+                        price=candidate_price, average_price=average_price,
                     )
                     city_capacities.append((index, size * own_cpi / 100.0, candidate_price))
 
@@ -1778,7 +1800,7 @@ def _submit_bots(
         submitted += 1
         if progress_callback:
             progress_callback(submitted, max(1, progress_total), str(bot["code"]))
-    if super_mode and submitted:
+    if super_mode and submitted and not defer_rebalance:
         _rebalance_super_bot_production(conn, round_no, markets)
         if progress_callback:
             progress_callback(progress_total, progress_total, "联合复算")
@@ -1795,6 +1817,9 @@ def _submit_super_bot_decisions_locked(
     round_no: int,
     progress_callback: Callable[[int, int, str], None] | None = None,
     replace_existing: bool = False,
+    *,
+    target_ids: set[int] | None = None,
+    defer_rebalance: bool = False,
 ) -> int:
     """Super bots wait until every non-super team has submitted."""
     missing = one(
@@ -1815,6 +1840,8 @@ def _submit_super_bot_decisions_locked(
         True,
         progress_callback,
         replace_existing=replace_existing,
+        target_ids=target_ids,
+        defer_rebalance=defer_rebalance,
     )
 
 
@@ -1823,6 +1850,9 @@ def submit_super_bot_decisions(
     round_no: int,
     progress_callback: Callable[[int, int, str], None] | None = None,
     replace_existing: bool = False,
+    *,
+    target_ids: set[int] | None = None,
+    defer_rebalance: bool = False,
 ) -> int:
     """Serialize expensive submissions inside one Streamlit worker process."""
     with _SUPER_BOT_SUBMISSION_LOCK:
@@ -1831,4 +1861,27 @@ def submit_super_bot_decisions(
             round_no,
             progress_callback,
             replace_existing,
+            target_ids=target_ids,
+            defer_rebalance=defer_rebalance,
         )
+
+
+def rebalance_super_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
+    """Finish a split submission after every team's decision has been saved."""
+    with _SUPER_BOT_SUBMISSION_LOCK:
+        missing = one(
+            conn,
+            "SELECT COUNT(*) AS n FROM companies c WHERE NOT EXISTS "
+            "(SELECT 1 FROM decisions d WHERE d.company_id=c.id AND d.round_no=? "
+            "AND d.submitted_at IS NOT NULL)",
+            (round_no,),
+        )
+        if missing and int(missing["n"]) > 0:
+            raise ValueError("仍有玩家或 Bot 未提交，暂不能进行联合复算。")
+        markets = [dict(row) for row in all_rows(conn, "SELECT * FROM market_config ORDER BY city")]
+        if not markets:
+            return 0
+        _rebalance_super_bot_production(conn, round_no, markets)
+        conn.commit()
+        count = one(conn, "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1 AND is_super_bot=1")
+        return int(count["n"] if count else 0)

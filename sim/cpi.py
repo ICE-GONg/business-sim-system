@@ -347,6 +347,187 @@ def allocate_city_cpi_for_company(
     return qi_cpi + ma_cpi + mi_cpi + price_cpi
 
 
+class _PreparedIndexCPI:
+    """Invariant rival work for repeated evaluations of one index pool."""
+
+    def __init__(self, originals: list[float], large: float, target: int):
+        self.large = large
+        self.minimum = minimum_threshold(large)
+        self.target = target
+        self.originals = [max(0.0, value) for value in originals]
+        self.layer1_original = [
+            min(value, large) if value >= self.minimum else 0.0
+            for value in self.originals
+        ]
+        self.layer2_original = [self._layer2(value) for value in self.originals]
+        self.max_rival_original = max(
+            (value for index, value in enumerate(self.layer1_original) if index != target),
+            default=0.0,
+        )
+
+    def _layer2(self, value: float) -> float:
+        if value < self.minimum or value < self.large:
+            return 0.0
+        remaining = max(value - self.large, 0.0)
+        base_cap = min(remaining, self.large * 3.0)
+        return base_cap + max(remaining - base_cap, 0.0) * 0.1
+
+    def evaluate(self, original: float, factors: list[float], max_factor: float) -> float:
+        original = max(0.0, float(original))
+        # A zero investment receives none of this pool, regardless of rivals.
+        if original == 0.0:
+            return 0.0
+        target = self.target
+        large = self.large
+        minimum = self.minimum
+        adjusted_min = minimum * max_factor
+        adjusted_large = large * max_factor
+        originals = self.originals.copy()
+        originals[target] = original
+        layer1: list[float] = []
+        layer2: list[float] = []
+        gifts: list[float] = []
+        has_above_large = False
+        max_layer1 = 0.0
+        for value, factor in zip(originals, factors):
+            adjusted = value * factor
+            below_min = adjusted < adjusted_min
+            above_large = adjusted >= large
+            has_above_large = has_above_large or above_large
+            gifts.append(GIFT_CPI if value > 0 and below_min else 0.0)
+            first = adjusted if below_min else min(adjusted, adjusted_large)
+            layer1.append(first)
+            max_layer1 = max(max_layer1, first)
+            second = 0.0
+            if not below_min and above_large:
+                remaining = max(adjusted - large, 0.0)
+                base_cap = min(remaining, large * 3.0)
+                second = base_cap + max(remaining - base_cap, 0.0) * 0.1
+            layer2.append(second)
+
+        layer1_total = sum(layer1)
+        layer2_total = sum(layer2)
+        layer1_available = LAYER1_TOTAL_CPI
+        if not has_above_large and adjusted_large > 0 and max_layer1 > 0:
+            layer1_available *= max_layer1 / adjusted_large
+        original_first = min(original, large) if original >= minimum else 0.0
+        original_second = self._layer2(original)
+        first_originals = self.layer1_original.copy()
+        first_originals[target] = original_first
+        second_originals = self.layer2_original.copy()
+        second_originals[target] = original_second
+        first_total = sum(first_originals)
+        second_total = sum(second_originals)
+        max_original = max(self.max_rival_original, original_first)
+        gift_total = sum(gifts)
+        welfare_total = WELFARE_PART1_BASE + WELFARE_PART2_BASE
+        welfare_ratio = max(0.0, welfare_total - gift_total) / welfare_total if welfare_total else 0.0
+        welfare1_available = (
+            WELFARE_PART1_BASE * welfare_ratio * max_original / large
+            if large > 0 and max_original > 0 else 0.0
+        )
+        welfare2_available = WELFARE_PART2_BASE * welfare_ratio
+        result = gifts[target]
+        if layer1_total > 0 and layer1[target] > 0:
+            result += layer1[target] / layer1_total * layer1_available
+        if layer2_total > 0 and layer2[target] > 0:
+            result += layer2[target] / layer2_total * LAYER2_TOTAL_CPI
+        if original >= minimum and first_total > 0 and welfare1_available > 0:
+            result += original_first / first_total * welfare1_available
+        if original >= large and second_total > 0 and welfare2_available > 0:
+            result += original_second / second_total * welfare2_available
+        allocated_total = gift_total
+        if layer1_total > 0:
+            allocated_total += layer1_available
+        if layer2_total > 0:
+            allocated_total += LAYER2_TOTAL_CPI
+        if first_total > 0 and welfare1_available > 0:
+            allocated_total += welfare1_available
+        if second_total > 0 and welfare2_available > 0:
+            allocated_total += welfare2_available
+        if allocated_total > INDEX_CPI_TOTAL:
+            result *= INDEX_CPI_TOTAL / allocated_total
+        return result
+
+
+class PreparedCityCPI:
+    """Reusable exact target evaluator while the other companies stay fixed.
+
+    Settlement continues to use ``allocate_city_cpi``. This only avoids
+    rebuilding rival inputs and original-investment layers during bot search.
+    All sums retain their original entry order, including on Python 3.12+.
+    """
+
+    def __init__(
+        self, entries: list[dict[str, Any]], *, target_company_id: int,
+        market_size: float, max_price: float, ma_large_threshold: float,
+        price_power: int = 8, market_average_price: float | None = None,
+    ):
+        self.target = next(
+            (i for i, entry in enumerate(entries) if int(entry["company_id"]) == target_company_id),
+            None,
+        )
+        self.prices = [max(0.0, float(entry["price"])) for entry in entries]
+        self.market_average = market_average_price
+        self.power = max(1, int(price_power))
+        if self.target is None:
+            return
+        self.agent_benefit = agent_mi_benefit(entries[self.target].get("agents", 0))
+        qi_large = max(0.0, max_price / 50.0)
+        mi_large = qi_large * market_size * 0.20 / 1.5 / 2.0
+        self.qi = _PreparedIndexCPI([float(e["qi_index"]) for e in entries], qi_large, self.target)
+        self.ma = _PreparedIndexCPI([float(e["ma_index"]) for e in entries], max(0.0, float(ma_large_threshold)), self.target)
+        self.mi = _PreparedIndexCPI([
+            float(e["mi_investment"]) * agent_mi_benefit(e.get("agents", 0)) for e in entries
+        ], mi_large, self.target)
+        self.price_weights = self._price_weights(float(market_average_price)) if market_average_price is not None else []
+
+    def _price_weights(self, average: float) -> list[float]:
+        return [(average - price) ** self.power if price > 0 and price <= average else 0.0 for price in self.prices]
+
+    def evaluate(
+        self, *, ma_index: float, qi_index: float, mi_investment: float,
+        price: float, average_price: float | None = None, agents: int | float | None = None,
+    ) -> float:
+        if self.target is None:
+            return 0.0
+        target = self.target
+        price = max(0.0, float(price))
+        prices = self.prices.copy()
+        prices[target] = price
+        average = sum(prices) / len(prices) if average_price is None else float(average_price)
+        market_average = sum(prices) / len(prices) if self.market_average is None else float(self.market_average)
+        factors = [average / value if average > 0 and value > 0 else 1.0 for value in prices]
+        max_factor = max([1.0, *factors])
+        qi_cpi = self.qi.evaluate(qi_index, factors, max_factor)
+        ma_cpi = self.ma.evaluate(ma_index, factors, max_factor)
+        benefit = self.agent_benefit if agents is None else agent_mi_benefit(agents)
+        mi_cpi = self.mi.evaluate(float(mi_investment) * benefit, factors, max_factor)
+        price_cpi = 0.0
+        if price > 0 and price <= market_average:
+            weights = self.price_weights.copy() if self.market_average is not None else [
+                (market_average - value) ** self.power if value > 0 and value <= market_average else 0.0
+                for value in prices
+            ]
+            weights[target] = (market_average - price) ** self.power
+            denominator = sum(weights)
+            if denominator > 0:
+                price_cpi = PRICE_CPI_TOTAL * weights[target] / denominator
+        return qi_cpi + ma_cpi + mi_cpi + price_cpi
+
+
+def prepare_city_cpi_for_company(
+    entries: list[dict[str, Any]], *, target_company_id: int,
+    market_size: float, max_price: float, ma_large_threshold: float,
+    price_power: int = 8, market_average_price: float | None = None,
+) -> PreparedCityCPI:
+    return PreparedCityCPI(
+        entries, target_company_id=target_company_id, market_size=market_size,
+        max_price=max_price, ma_large_threshold=ma_large_threshold,
+        price_power=price_power, market_average_price=market_average_price,
+    )
+
+
 def allocate_city_cpi(
     entries: list[dict[str, Any]],
     *,

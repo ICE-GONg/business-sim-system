@@ -402,6 +402,56 @@ class ExtendedRulesTest(unittest.TestCase):
         # byte-for-byte; it was never deleted by the interrupted run.
         self.assertTrue(first_cities_before)
 
+    def test_split_super_bot_submission_matches_whole_batch(self):
+        import sqlite3
+        from contextlib import closing
+        from sim.bots import rebalance_super_bot_decisions, submit_super_bot_decisions
+
+        db = self.fresh("super-bot-split.db")
+        first_id = self.one_company(db)
+        with db.connect() as source:
+            source.execute(
+                "UPDATE companies SET is_bot=1,is_super_bot=1,bot_profile=0 WHERE id=?",
+                (first_id,),
+            )
+            second_id = int(source.execute(
+                "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,is_super_bot,bot_profile,"
+                "setup_submitted_at,created_at) VALUES('SBOT02','Super 2','test','深圳',15000000,1,1,1,?,?)",
+                (db.now_iso(), db.now_iso()),
+            ).lastrowid)
+            source.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (first_id,))
+            source.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'深圳',1)", (second_id,))
+            source.commit()
+            with closing(sqlite3.connect(":memory:")) as whole, closing(sqlite3.connect(":memory:")) as split:
+                whole.row_factory = split.row_factory = sqlite3.Row
+                source.backup(whole)
+                source.backup(split)
+                self.assertEqual(submit_super_bot_decisions(whole, 1), 2)
+                self.assertEqual(submit_super_bot_decisions(
+                    split, 1, target_ids={first_id}, defer_rebalance=True,
+                ), 1)
+                first_before = dict(db.one(split, "SELECT * FROM decisions WHERE company_id=?", (first_id,)))
+                with self.assertRaises(ValueError):
+                    rebalance_super_bot_decisions(split, 1)
+                self.assertEqual(submit_super_bot_decisions(
+                    split, 1, target_ids={first_id}, defer_rebalance=True,
+                ), 0)
+                self.assertEqual(submit_super_bot_decisions(
+                    split, 1, target_ids={second_id}, defer_rebalance=True,
+                ), 1)
+                self.assertEqual(
+                    dict(db.one(split, "SELECT * FROM decisions WHERE company_id=?", (first_id,))),
+                    first_before,
+                )
+                self.assertEqual(rebalance_super_bot_decisions(split, 1), 2)
+                for table, ordering in (("decisions", "company_id"), ("city_decisions", "company_id,city")):
+                    def rows(conn):
+                        values = [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}")]
+                        for value in values:
+                            value.pop("submitted_at", None)
+                        return values
+                    self.assertEqual(rows(split), rows(whole))
+
     def test_regular_bots_use_diverse_prices_and_cpi_profiles(self):
         db = self.fresh("bot-diversity.db")
         first_id = self.one_company(db, 30_000_000)

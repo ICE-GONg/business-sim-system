@@ -5,12 +5,9 @@ import importlib
 import json
 import logging
 import os
-import base64
 import sqlite3
 import sys
 import typing
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -43,9 +40,9 @@ if (
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
-    or getattr(_cpi_module, "CPI_API_VERSION", 0) < 3
+    or getattr(_cpi_module, "CPI_API_VERSION", 0) < 4
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 19
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 20
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -54,6 +51,7 @@ if (
     importlib.reload(_bots_module)
 
 from sim.bots import submit_bot_decisions, submit_super_bot_decisions
+from sim.remote_worker import remote_pending, remote_submit
 
 from sim.db import (
     all_rows,
@@ -97,34 +95,25 @@ def _deployment_secret(name: str) -> str:
         return ""
 
 
-def _remote_super_bot_submit(round_no: int, replace_existing: bool = False) -> bool:
-    """Run the expensive Super Bot pass in an optional Tencent SCF worker.
-
-    The worker receives a point-in-time SQLite backup and returns the updated
-    backup.  If no URL is configured, callers transparently use the local
-    implementation.  A shared token can be supplied through
-    ``SUPER_BOT_REMOTE_TOKEN``; it is never stored in the repository.
-    """
+def _remote_super_bot_submit(
+    round_no: int,
+    replace_existing: bool = False,
+    progress_callback=None,
+) -> bool:
+    """Compute and durably save one remote Super Bot at a time."""
     endpoint = _deployment_secret("SUPER_BOT_REMOTE_URL")
     if not endpoint:
         return False
-    payload = {
-        "db_b64": base64.b64encode(database_bytes()).decode("ascii"),
-        "round_no": int(round_no),
-        "replace_existing": bool(replace_existing),
-        "token": _deployment_secret("SUPER_BOT_REMOTE_TOKEN"),
-    }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "X-Super-Bot-Token": _deployment_secret("SUPER_BOT_REMOTE_TOKEN")},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=860) as response:
-        result = json.loads(response.read().decode("utf-8"))
-    if not result.get("ok") or not result.get("db_b64"):
-        raise RuntimeError(str(result.get("error") or "远程超级 Bot 未返回结果"))
-    restore_database_bytes(base64.b64decode(result["db_b64"]))
+    with connect() as conn:
+        remote_submit(
+            conn,
+            endpoint,
+            _deployment_secret("SUPER_BOT_REMOTE_TOKEN"),
+            int(round_no),
+            replace_existing=replace_existing,
+            progress_callback=progress_callback,
+            timing_callback=lambda metrics: LOGGER.info("Super Bot remote timing: %s", metrics),
+        )
     return True
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
@@ -1719,6 +1708,10 @@ def render_admin_rounds() -> None:
             (int(round_row["round_no"]),),
         ) if round_row else None
         history = all_rows(conn, "SELECT * FROM rounds ORDER BY round_no DESC")
+        remote_job_pending = bool(
+            round_row and _deployment_secret("SUPER_BOT_REMOTE_URL")
+            and remote_pending(conn, int(round_row["round_no"]))
+        )
     round_banner(round_row)
     current_round_no = int(round_row["round_no"]) if round_row else 1
     settings_cols = st.columns([2, 1, 2])
@@ -1766,7 +1759,9 @@ def render_admin_rounds() -> None:
                 "超级 Bot 只会在其他队伍全部提交后读取本轮决策。"
             )
             super_action_label = (
-                "重新分析并逐个覆盖超级 Bot 决策"
+                "继续分析未完成的超级 Bot"
+                if remote_job_pending
+                else "重新分析并逐个覆盖超级 Bot 决策"
                 if super_submitted >= super_total
                 else "继续分析未完成的超级 Bot"
                 if super_submitted > 0
@@ -1781,7 +1776,10 @@ def render_admin_rounds() -> None:
                 try:
                     super_progress = st.progress(0.0, text="超级 Bot 正在模拟 CPI 候选方案…")
                     def update_super_progress(done: int, total: int, code: str) -> None:
-                        stage = "联合复算完成" if code == "联合复算" else f"{code} 已分析并保存"
+                        stage = (
+                            "联合复算完成" if code == "联合复算"
+                            else code if code.endswith("中") else f"{code} 已分析并保存"
+                        )
                         super_progress.progress(
                             min(1.0, done / max(1, total)),
                             text=f"{stage} · {done}/{total}",
@@ -1789,7 +1787,8 @@ def render_admin_rounds() -> None:
                     remote_round = int(round_row["round_no"])
                     if _remote_super_bot_submit(
                         remote_round,
-                        replace_existing=super_submitted >= super_total,
+                        replace_existing=super_submitted >= super_total and not remote_job_pending,
+                        progress_callback=update_super_progress,
                     ):
                         update_super_progress(super_total, super_total, "远程计算完成")
                     else:
@@ -1827,31 +1826,39 @@ def render_admin_rounds() -> None:
             flash("success", f"已延长 {extend_minutes} 分钟。")
             st.rerun()
         non_super_ready = regular_submitted >= regular_total
-        settlement_label = "超级 Bot 分析并结算" if super_total and super_submitted < super_total else "结算本轮"
+        needs_super_analysis = super_total and (super_submitted < super_total or remote_job_pending)
+        settlement_label = "超级 Bot 分析并结算" if needs_super_analysis else "结算本轮"
         if cols[3].button(settlement_label, type="primary", use_container_width=True, disabled=not non_super_ready):
             try:
                 remote_completed = False
                 remote_round = int(round_row["round_no"])
-                if super_total and super_submitted < super_total:
+                if needs_super_analysis:
                     settlement_progress = st.progress(0.0, text="超级 Bot 正在模拟 CPI 候选方案…")
-                    remote_completed = _remote_super_bot_submit(remote_round)
+                    def update_settlement_progress(done: int, total: int, code: str) -> None:
+                        stage = (
+                            "联合复算完成" if code == "联合复算"
+                            else code if code.endswith("中") else f"{code} 已分析并保存"
+                        )
+                        settlement_progress.progress(
+                            min(1.0, done / max(1, total)),
+                            text=f"{stage} · {done}/{total}",
+                        )
+                    remote_completed = _remote_super_bot_submit(
+                        remote_round, progress_callback=update_settlement_progress,
+                    )
                     if remote_completed:
                         settlement_progress.progress(1.0, text="远程计算完成")
                 with connect() as conn:
-                    if super_total and super_submitted < super_total and not remote_completed:
-                        def update_settlement_progress(done: int, total: int, code: str) -> None:
-                            stage = "联合复算完成" if code == "联合复算" else f"{code} 已分析并保存"
-                            settlement_progress.progress(
-                                min(1.0, done / max(1, total)),
-                                text=f"{stage} · {done}/{total}",
-                            )
+                    if needs_super_analysis and not remote_completed:
                         submit_super_bot_decisions(conn, remote_round, update_settlement_progress)
                     settle_round(conn, int(round_row["round_no"]))
-                if super_total and super_submitted < super_total:
+                if needs_super_analysis:
                     settlement_progress.empty()
                 completed_label = "测试轮" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
                 flash("success", f"{completed_label}结算完成。")
                 st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
             except Exception:
                 LOGGER.exception("Round settlement failed")
                 st.error("结算失败，请在部署后台日志中查看详细原因。")
@@ -1934,6 +1941,7 @@ def render_admin_rounds() -> None:
             key="round_rollback_button",
             use_container_width=True,
         ):
+            rollback_committed = False
             try:
                 with connect() as conn:
                     reopened_round = rollback_latest_settled_round(conn, int(rollback_minutes))
@@ -1945,9 +1953,37 @@ def render_admin_rounds() -> None:
                         "AND d.submitted_at IS NOT NULL)",
                         (reopened_round,),
                     )
-                    super_bot_count = 0
-                    if not missing_non_super or int(missing_non_super["n"] or 0) == 0:
-                        super_bot_count = submit_super_bot_decisions(conn, reopened_round)
+                    super_bot_total = int(one(
+                        conn,
+                        "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1 AND is_super_bot=1",
+                    )["n"])
+                    super_ready = super_bot_total > 0 and (
+                        not missing_non_super or int(missing_non_super["n"] or 0) == 0
+                    )
+                # Persist the reopened round and ordinary Bots before an
+                # expensive network call; retries must not roll back twice.
+                rollback_committed = True
+                st.session_state.pop("round_rollback_confirm", None)
+                super_bot_count = 0
+                if super_ready:
+                    rollback_progress = st.progress(0.0, text="回退已完成，正在重新分析超级 Bot…")
+                    def update_rollback_progress(done: int, total: int, code: str) -> None:
+                        stage = (
+                            "联合复算完成" if code == "联合复算"
+                            else code if code.endswith("中") else f"{code} 已分析并保存"
+                        )
+                        rollback_progress.progress(
+                            min(1.0, done / max(1, total)),
+                            text=f"回退已完成 · {stage} · {done}/{total}",
+                        )
+                    if _remote_super_bot_submit(reopened_round, progress_callback=update_rollback_progress):
+                        super_bot_count = super_bot_total
+                    else:
+                        with connect() as conn:
+                            super_bot_count = submit_super_bot_decisions(
+                                conn, reopened_round, update_rollback_progress,
+                            )
+                    rollback_progress.empty()
                 bot_message = f"普通 Bot 已重新提交 {normal_bot_count} 支"
                 if super_bot_count:
                     bot_message += f"，超级 Bot 已重新提交 {super_bot_count} 支"
@@ -1957,7 +1993,16 @@ def render_admin_rounds() -> None:
                 )
                 st.rerun()
             except ValueError as exc:
+                if rollback_committed:
+                    flash("warning", f"第 {reopened_round} 轮已成功回退并重新开放；超级 Bot 分析尚未完成：{exc} 请在上方继续分析，无需再次回退。")
+                    st.rerun()
                 st.error(str(exc))
+            except Exception:
+                LOGGER.exception("Round rollback or reopened Super Bot analysis failed")
+                if rollback_committed:
+                    flash("warning", f"第 {reopened_round} 轮已成功回退并重新开放；超级 Bot 分析中断，已保存的决策会保留。请在上方继续分析，无需再次回退。")
+                    st.rerun()
+                st.error("回退失败，请在部署后台日志中查看详细原因。")
     else:
         st.caption("暂无已结算回合可回退。")
     st.divider()
