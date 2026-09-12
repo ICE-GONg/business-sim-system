@@ -87,6 +87,16 @@ from sim.report_pdf import build_round_report_pdf
 LOGGER = logging.getLogger(__name__)
 
 
+def _deployment_secret(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:
+        return ""
+
+
 def _remote_super_bot_submit(round_no: int, replace_existing: bool = False) -> bool:
     """Run the expensive Super Bot pass in an optional Tencent SCF worker.
 
@@ -95,19 +105,19 @@ def _remote_super_bot_submit(round_no: int, replace_existing: bool = False) -> b
     implementation.  A shared token can be supplied through
     ``SUPER_BOT_REMOTE_TOKEN``; it is never stored in the repository.
     """
-    endpoint = os.environ.get("SUPER_BOT_REMOTE_URL", "").strip()
+    endpoint = _deployment_secret("SUPER_BOT_REMOTE_URL")
     if not endpoint:
         return False
     payload = {
         "db_b64": base64.b64encode(database_bytes()).decode("ascii"),
         "round_no": int(round_no),
         "replace_existing": bool(replace_existing),
-        "token": os.environ.get("SUPER_BOT_REMOTE_TOKEN", ""),
+        "token": _deployment_secret("SUPER_BOT_REMOTE_TOKEN"),
     }
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "X-Super-Bot-Token": os.environ.get("SUPER_BOT_REMOTE_TOKEN", "")},
+        headers={"Content-Type": "application/json", "X-Super-Bot-Token": _deployment_secret("SUPER_BOT_REMOTE_TOKEN")},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=860) as response:
