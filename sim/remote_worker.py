@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .defaults import DEFAULT_SETTINGS
 
 PROTOCOL = 2
-REMOTE_API_VERSION = 2
+REMOTE_API_VERSION = 3
 TABLES = ("settings", "companies", "employee_cohorts", "market_config", "rounds",
           "decisions", "city_decisions", "agents", "results", "city_results", "market_round_stats")
 _LOCK = threading.Lock()
@@ -34,6 +34,10 @@ class RemoteWorkerError(ValueError):
 
 class RemoteTransportError(RemoteWorkerError):
     """Only connection failures or a temporarily unavailable worker may retry."""
+
+
+class RemoteAnalysisChangedError(RemoteWorkerError):
+    """Authoritative calculation inputs changed while an analysis was running."""
 
 
 def resolve_remote_endpoints(primary: str = "", *, urls: Any = None, fallback: str = "") -> list[str]:
@@ -123,6 +127,72 @@ def _snapshot(conn: sqlite3.Connection) -> tuple[bytes, str]:
         if own_transaction:
             conn.rollback()
     return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _job_fingerprints(conn: sqlite3.Connection, round_no: int) -> tuple[str, str]:
+    """Return stable analysis-input and exact-state fingerprints.
+
+    A segmented job intentionally changes current-round Super Bot decisions after
+    each completed segment.  Those rows therefore cannot be part of the stable
+    input fingerprint, but the state checkpoint still records them so an
+    administrator edit to an already saved Bot is detected as well. Round timer
+    and pause metadata are ignored because they do not affect Bot calculations;
+    the round incarnation itself is checked separately through ``starts_at``.
+    """
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    try:
+        state = _state(conn)
+        fingerprint_state = dict(state)
+        round_data = state.get("rounds")
+        if round_data:
+            ignored = {"status", "starts_at", "ends_at", "settled_at"}
+            kept_indexes = [
+                index for index, column in enumerate(round_data["columns"])
+                if column not in ignored
+            ]
+            fingerprint_state["rounds"] = {
+                "schema": round_data["schema"],
+                "columns": [round_data["columns"][index] for index in kept_indexes],
+                "rows": [
+                    [row[index] for index in kept_indexes]
+                    for row in round_data["rows"]
+                ],
+            }
+        state_raw = _json(fingerprint_state)
+        super_ids = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1"
+            )
+        }
+        input_state = dict(fingerprint_state)
+        for table in ("decisions", "city_decisions"):
+            data = fingerprint_state.get(table)
+            if not data:
+                continue
+            columns = list(data["columns"])
+            round_index = columns.index("round_no")
+            company_index = columns.index("company_id")
+            rows = [
+                row for row in data["rows"]
+                if not (
+                    int(row[round_index]) == int(round_no)
+                    and int(row[company_index]) in super_ids
+                )
+            ]
+            input_state[table] = {
+                "schema": data["schema"],
+                "columns": columns,
+                "rows": rows,
+            }
+        input_hash = hashlib.sha256(_json(input_state)).hexdigest()
+        state_hash = hashlib.sha256(state_raw).hexdigest()
+    finally:
+        if own_transaction:
+            conn.rollback()
+    return input_hash, state_hash
 
 
 def _check_round(conn: sqlite3.Connection, round_no: int) -> str:
@@ -253,16 +323,227 @@ def apply_remote_result(conn: sqlite3.Connection, request: dict, result: dict,
 
 
 def _job_table(conn: sqlite3.Connection) -> None:
-    conn.execute("CREATE TABLE IF NOT EXISTS super_bot_remote_jobs(round_no INTEGER PRIMARY KEY, round_start TEXT NOT NULL, pending_json TEXT NOT NULL, total INTEGER NOT NULL, replace_existing INTEGER NOT NULL, phase TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS super_bot_remote_jobs("
+        "round_no INTEGER PRIMARY KEY,round_start TEXT NOT NULL,pending_json TEXT NOT NULL,"
+        "total INTEGER NOT NULL,replace_existing INTEGER NOT NULL,phase TEXT NOT NULL,"
+        "input_fingerprint TEXT NOT NULL DEFAULT '',state_fingerprint TEXT NOT NULL DEFAULT '')"
+    )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(super_bot_remote_jobs)")
+    }
+    if "input_fingerprint" not in columns:
+        conn.execute(
+            "ALTER TABLE super_bot_remote_jobs "
+            "ADD COLUMN input_fingerprint TEXT NOT NULL DEFAULT ''"
+        )
+    if "state_fingerprint" not in columns:
+        conn.execute(
+            "ALTER TABLE super_bot_remote_jobs "
+            "ADD COLUMN state_fingerprint TEXT NOT NULL DEFAULT ''"
+        )
     conn.commit()
 
 
 def remote_pending(conn: sqlite3.Connection, round_no: int) -> bool:
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='super_bot_remote_jobs'").fetchone():
-        return False
-    row = conn.execute("SELECT phase,round_start FROM super_bot_remote_jobs WHERE round_no=?", (round_no,)).fetchone()
     current = conn.execute("SELECT starts_at FROM rounds WHERE round_no=? AND status IN ('open','paused')", (round_no,)).fetchone()
-    return bool(row and current and row[0] != "done" and row[1] == str(current[0] or ""))
+    if not current:
+        return False
+    tracked = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='super_bot_remote_jobs'"
+    ).fetchone()
+    if not tracked:
+        return bool(conn.execute(
+            "SELECT 1 FROM companies c JOIN decisions d ON d.company_id=c.id "
+            "WHERE c.is_bot=1 AND c.is_super_bot=1 AND d.round_no=? "
+            "AND d.submitted_at IS NOT NULL LIMIT 1",
+            (round_no,),
+        ).fetchone())
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(super_bot_remote_jobs)")
+    }
+    fingerprint_columns = (
+        "input_fingerprint,state_fingerprint"
+        if {"input_fingerprint", "state_fingerprint"} <= columns
+        else "'' AS input_fingerprint,'' AS state_fingerprint"
+    )
+    row = conn.execute(
+        f"SELECT phase,round_start,{fingerprint_columns} "
+        "FROM super_bot_remote_jobs WHERE round_no=?",
+        (round_no,),
+    ).fetchone()
+    if not row or row[1] != str(current[0] or ""):
+        return bool(conn.execute(
+            "SELECT 1 FROM companies c JOIN decisions d ON d.company_id=c.id "
+            "WHERE c.is_bot=1 AND c.is_super_bot=1 AND d.round_no=? "
+            "AND d.submitted_at IS NOT NULL LIMIT 1",
+            (round_no,),
+        ).fetchone())
+    if row[0] != "done":
+        return True
+    # A completed analysis becomes pending again if KDS, player decisions, or
+    # any other authoritative input changes before settlement.
+    if not row[2] or not row[3]:
+        return True
+    input_hash, state_hash = _job_fingerprints(conn, round_no)
+    return input_hash != row[2] or state_hash != row[3]
+
+
+def mark_remote_job_complete(
+    conn: sqlite3.Connection,
+    round_no: int,
+    *,
+    expected_input_fingerprint: str | None = None,
+) -> None:
+    """Close a persisted remote job after a successful full local fallback."""
+    if conn.in_transaction:
+        raise RemoteWorkerError("完成状态需使用独立短事务保存")
+    _job_table(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        round_start = _check_round(conn, round_no)
+        input_hash, state_hash = _job_fingerprints(conn, round_no)
+        if (
+            expected_input_fingerprint is not None
+            and input_hash != expected_input_fingerprint
+        ):
+            raise RemoteAnalysisChangedError(
+                "本地分析期间 KDS 或比赛输入已改变，全部超级 Bot 需要重新分析。"
+            )
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM companies WHERE is_bot=1 AND is_super_bot=1"
+        ).fetchone()[0])
+        conn.execute(
+            "INSERT INTO super_bot_remote_jobs("
+            "round_no,round_start,pending_json,total,replace_existing,phase,"
+            "input_fingerprint,state_fingerprint) VALUES(?,?,?,?,?,'done',?,?) "
+            "ON CONFLICT(round_no) DO UPDATE SET "
+            "round_start=excluded.round_start,pending_json=excluded.pending_json,"
+            "total=excluded.total,replace_existing=excluded.replace_existing,"
+            "phase=excluded.phase,input_fingerprint=excluded.input_fingerprint,"
+            "state_fingerprint=excluded.state_fingerprint",
+            (round_no, round_start, "[]", total, 1, input_hash, state_hash),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def submit_local_super_bots(
+    conn: sqlite3.Connection,
+    round_no: int,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    *,
+    replace_existing: bool = False,
+    max_restarts: int = 2,
+) -> int:
+    """Run local fallback without accepting a mixed-input batch."""
+    from .bots import submit_super_bot_decisions
+
+    if not _LOCK.acquire(blocking=False):
+        raise RemoteWorkerError("已有超级 Bot 分析正在进行，请等待当前任务完成。")
+    try:
+        if conn.in_transaction:
+            raise RemoteWorkerError("本地分析需使用独立连接执行")
+        _job_table(conn)
+        force_replace = bool(replace_existing)
+        for attempt in range(max(0, int(max_restarts)) + 1):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                round_start = _check_round(conn, round_no)
+                input_hash, state_hash = _job_fingerprints(conn, round_no)
+                ids = [
+                    int(row[0])
+                    for row in conn.execute(
+                        "SELECT id FROM companies "
+                        "WHERE is_bot=1 AND is_super_bot=1 ORDER BY id"
+                    )
+                ]
+                conn.execute(
+                    "INSERT INTO super_bot_remote_jobs("
+                    "round_no,round_start,pending_json,total,replace_existing,phase,"
+                    "input_fingerprint,state_fingerprint) VALUES(?,?,?,?,?,'bot',?,?) "
+                    "ON CONFLICT(round_no) DO UPDATE SET "
+                    "round_start=excluded.round_start,pending_json=excluded.pending_json,"
+                    "total=excluded.total,replace_existing=excluded.replace_existing,"
+                    "phase=excluded.phase,input_fingerprint=excluded.input_fingerprint,"
+                    "state_fingerprint=excluded.state_fingerprint",
+                    (round_no, round_start, json.dumps(ids), len(ids),
+                     int(force_replace), input_hash, state_hash),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+            submitted = submit_super_bot_decisions(
+                conn,
+                round_no,
+                progress_callback,
+                replace_existing=force_replace,
+            )
+            # The Bot implementation commits each expensive per-team segment,
+            # then performs its final joint rebalance. Persist that final stage
+            # before opening the short fingerprint transaction below.
+            conn.commit()
+            try:
+                mark_remote_job_complete(
+                    conn,
+                    round_no,
+                    expected_input_fingerprint=input_hash,
+                )
+                return submitted
+            except RemoteAnalysisChangedError:
+                force_replace = True
+                if progress_callback:
+                    progress_callback(
+                        0, max(1, len(ids)),
+                        "KDS 或比赛输入已变化，全部超级 Bot 重新分析中",
+                    )
+                if attempt >= max(0, int(max_restarts)):
+                    raise
+        raise RemoteWorkerError("超级 Bot 本地分析未完成。")
+    finally:
+        _LOCK.release()
+
+
+def assert_remote_job_current(conn: sqlite3.Connection, round_no: int) -> None:
+    """Require a completed, current fingerprint inside the caller's write transaction."""
+    if not conn.in_transaction:
+        raise RemoteWorkerError("结算前校验必须在写事务内执行")
+    _check_round(conn, round_no)
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='super_bot_remote_jobs'"
+    ).fetchone():
+        raise RemoteAnalysisChangedError("超级 Bot 决策缺少完整分析记录，请重新分析。")
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(super_bot_remote_jobs)")
+    }
+    if not {"input_fingerprint", "state_fingerprint"} <= columns:
+        raise RemoteAnalysisChangedError("超级 Bot 分析记录需要升级，请重新分析。")
+    row = conn.execute(
+        "SELECT phase,round_start,input_fingerprint,state_fingerprint "
+        "FROM super_bot_remote_jobs WHERE round_no=?",
+        (round_no,),
+    ).fetchone()
+    current_start = _check_round(conn, round_no)
+    if (
+        not row
+        or row[0] != "done"
+        or row[1] != current_start
+        or not row[2]
+        or not row[3]
+    ):
+        raise RemoteAnalysisChangedError("超级 Bot 分析尚未完整结束，请继续分析。")
+    input_hash, state_hash = _job_fingerprints(conn, round_no)
+    if input_hash != row[2] or state_hash != row[3]:
+        raise RemoteAnalysisChangedError(
+            "KDS 或比赛输入在分析后发生变化，请重新分析超级 Bot 后再结算。"
+        )
 
 
 def _post(endpoint: str, token: str, payload: dict) -> dict:
@@ -308,28 +589,116 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
     try:
         round_start = _check_round(conn, round_no)
         _job_table(conn)
-        if not remote_pending(conn, round_no):
+        existing_job = conn.execute(
+            "SELECT round_start,phase,input_fingerprint,state_fingerprint "
+            "FROM super_bot_remote_jobs WHERE round_no=?",
+            (round_no,),
+        ).fetchone()
+        current_input_hash, current_state_hash = _job_fingerprints(conn, round_no)
+        resume_existing = bool(
+            existing_job
+            and existing_job[0] == round_start
+            and (
+                existing_job[1] != "done"
+                or not existing_job[2]
+                or not existing_job[3]
+                or existing_job[2] != current_input_hash
+                or existing_job[3] != current_state_hash
+            )
+        )
+        if not resume_existing:
+            has_untracked_decisions = bool(conn.execute(
+                "SELECT 1 FROM companies c JOIN decisions d ON d.company_id=c.id "
+                "WHERE c.is_bot=1 AND c.is_super_bot=1 AND d.round_no=? LIMIT 1",
+                (round_no,),
+            ).fetchone())
+            replace_existing = bool(
+                replace_existing
+                or has_untracked_decisions
+                or (existing_job and existing_job[1] == "done")
+            )
             query = "SELECT c.id FROM companies c WHERE c.is_bot=1 AND c.is_super_bot=1"
             if not replace_existing:
                 query += " AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.company_id=c.id AND d.round_no=?)"
             ids = [int(r[0]) for r in conn.execute(query + " ORDER BY c.id", () if replace_existing else (round_no,))]
-            conn.execute("INSERT OR REPLACE INTO super_bot_remote_jobs VALUES(?,?,?,?,?,?)",
-                         (round_no, round_start, json.dumps(ids), len(ids), int(replace_existing), "bot" if ids else "rebalance"))
+            conn.execute(
+                "INSERT INTO super_bot_remote_jobs("
+                "round_no,round_start,pending_json,total,replace_existing,phase,"
+                "input_fingerprint,state_fingerprint) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(round_no) DO UPDATE SET "
+                "round_start=excluded.round_start,pending_json=excluded.pending_json,"
+                "total=excluded.total,replace_existing=excluded.replace_existing,"
+                "phase=excluded.phase,input_fingerprint=excluded.input_fingerprint,"
+                "state_fingerprint=excluded.state_fingerprint",
+                (round_no, round_start, json.dumps(ids), len(ids), int(replace_existing),
+                 "bot" if ids else "rebalance", current_input_hash, current_state_hash),
+            )
             conn.commit()
-        job = conn.execute("SELECT pending_json,total,replace_existing,phase FROM super_bot_remote_jobs WHERE round_no=?", (round_no,)).fetchone()
+        job = conn.execute(
+            "SELECT pending_json,total,replace_existing,phase,input_fingerprint,state_fingerprint "
+            "FROM super_bot_remote_jobs WHERE round_no=?",
+            (round_no,),
+        ).fetchone()
         pending, total, replace = json.loads(job[0]), int(job[1]), bool(job[2])
-        # Admin deletion or conversion to a normal player must not strand a
-        # persisted job forever on an id that no longer represents a Super Bot.
         eligible = {int(r[0]) for r in conn.execute("SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1")}
-        active_pending = [company_id for company_id in pending if company_id in eligible]
-        if active_pending != pending:
-            total -= len(pending) - len(active_pending)
-            pending = active_pending
-            conn.execute("UPDATE super_bot_remote_jobs SET pending_json=?,total=? WHERE round_no=?", (json.dumps(pending), total, round_no))
+        input_hash, state_hash = _job_fingerprints(conn, round_no)
+        expected_input_hash, expected_state_hash = str(job[4] or ""), str(job[5] or "")
+        if (
+            not expected_input_hash
+            or not expected_state_hash
+            or input_hash != expected_input_hash
+            or state_hash != expected_state_hash
+        ):
+            # KDS/player/admin state changed between segments (or this is a
+            # legacy job without fingerprints). Keep every saved decision as
+            # a recoverable checkpoint, but make every current Super Bot
+            # pending so settlement can never mix analysis generations.
+            pending = sorted(eligible)
+            total = len(pending)
+            replace = True
+            conn.execute(
+                "UPDATE super_bot_remote_jobs SET pending_json=?,total=?,"
+                "replace_existing=1,phase=?,input_fingerprint=?,state_fingerprint=? "
+                "WHERE round_no=?",
+                (json.dumps(pending), total, "bot" if pending else "rebalance",
+                 input_hash, state_hash, round_no),
+            )
             conn.commit()
+            if progress_callback:
+                progress_callback(
+                    0, max(1, total),
+                    "KDS 或比赛输入已变化，全部超级 Bot 正在重新分析",
+                )
+            expected_input_hash, expected_state_hash = input_hash, state_hash
         submitted = 0
         active_endpoint = 0
         while True:
+            input_hash, state_hash = _job_fingerprints(conn, round_no)
+            if input_hash != expected_input_hash or state_hash != expected_state_hash:
+                eligible = {
+                    int(row[0])
+                    for row in conn.execute(
+                        "SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1"
+                    )
+                }
+                pending = sorted(eligible)
+                total = len(pending)
+                replace = True
+                submitted = 0
+                expected_input_hash, expected_state_hash = input_hash, state_hash
+                conn.execute(
+                    "UPDATE super_bot_remote_jobs SET pending_json=?,total=?,"
+                    "replace_existing=1,phase=?,input_fingerprint=?,state_fingerprint=? "
+                    "WHERE round_no=?",
+                    (json.dumps(pending), total, "bot" if pending else "rebalance",
+                     expected_input_hash, expected_state_hash, round_no),
+                )
+                conn.commit()
+                if progress_callback:
+                    progress_callback(
+                        0, max(1, total),
+                        "KDS 或比赛输入已变化，全部超级 Bot 正在重新分析",
+                    )
             phase = "bot" if pending else "rebalance"
             if progress_callback:
                 stage = "联合复算中"
@@ -362,9 +731,16 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
                 if pending:
                     code = str(conn.execute("SELECT code FROM companies WHERE id=?", (pending[0],)).fetchone()[0])
                     pending = pending[1:]
-                conn.execute("UPDATE super_bot_remote_jobs SET pending_json=?,phase=? WHERE round_no=?",
-                    (json.dumps(pending), "done" if phase == "rebalance" else "bot" if pending else "rebalance", round_no))
+                input_hash, state_hash = _job_fingerprints(conn, round_no)
+                conn.execute(
+                    "UPDATE super_bot_remote_jobs SET pending_json=?,phase=?,"
+                    "input_fingerprint=?,state_fingerprint=? WHERE round_no=?",
+                    (json.dumps(pending),
+                     "done" if phase == "rebalance" else "bot" if pending else "rebalance",
+                     input_hash, state_hash, round_no),
+                )
                 conn.commit()
+                expected_input_hash, expected_state_hash = input_hash, state_hash
             except BaseException:
                 conn.rollback()
                 raise

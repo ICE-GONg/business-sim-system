@@ -136,6 +136,238 @@ class RemoteWorkerTests(unittest.TestCase):
             remote.remote_submit(self.conn, "https://example.test", "token", 1, replace_existing=True)
         self.assertEqual(self.calls, [("bot", 1), ("bot", 2), ("rebalance", None)])
 
+    def test_kds_change_between_segments_restarts_every_super_bot(self):
+        self.calls = []
+
+        def kds_submit(conn, round_no, **kwargs):
+            company_id = next(iter(kwargs["target_ids"]))
+            power = int(float(conn.execute(
+                "SELECT value FROM settings WHERE key='cpi_price_power'"
+            ).fetchone()[0]))
+            conn.execute(
+                "DELETE FROM decisions WHERE company_id=? AND round_no=?",
+                (company_id, round_no),
+            )
+            conn.execute(
+                "INSERT INTO decisions(company_id,round_no,management_investment,submitted_at) "
+                "VALUES(?,?,?,?)",
+                (company_id, round_no, power * 1000 + company_id, "new-submission"),
+            )
+            for row in conn.execute("SELECT city FROM market_config"):
+                conn.execute(
+                    "INSERT OR REPLACE INTO city_decisions(company_id,round_no,city,price) "
+                    "VALUES(?,?,?,12345)",
+                    (company_id, round_no, row[0]),
+                )
+            conn.commit()
+            return 1
+
+        def dispatch(endpoint, token, payload):
+            self.calls.append((payload["phase"], payload["company_id"]))
+            with sqlite3.connect(":memory:") as worker:
+                worker.row_factory = sqlite3.Row
+                remote.load_snapshot(worker, remote.decode_snapshot(payload))
+                with patch("sim.bots.submit_super_bot_decisions", kds_submit), patch(
+                    "sim.bots.rebalance_super_bot_decisions", self.fake_rebalance
+                ):
+                    return remote.run_remote_request(worker, payload)
+
+        def interrupted(done, total, stage):
+            if stage == "C01":
+                raise RuntimeError("browser disconnected")
+
+        old_power = int(float(self.conn.execute(
+            "SELECT value FROM settings WHERE key='cpi_price_power'"
+        ).fetchone()[0]))
+        with patch.object(remote, "_post", dispatch):
+            with self.assertRaisesRegex(RuntimeError, "disconnected"):
+                remote.remote_submit(
+                    self.conn, "https://example.test", "token", 1,
+                    progress_callback=interrupted,
+                )
+            # The completed segment remains durable after interruption.
+            self.assertEqual(
+                self.conn.execute(
+                    "SELECT management_investment FROM decisions WHERE company_id=1"
+                ).fetchone()[0],
+                old_power * 1000 + 1,
+            )
+            self.conn.execute(
+                "UPDATE settings SET value=? WHERE key='cpi_price_power'",
+                (str(old_power + 7),),
+            )
+            self.conn.commit()
+            remote.remote_submit(self.conn, "https://example.test", "token", 1)
+
+        # Bot 1 is intentionally recalculated: the final batch cannot contain
+        # one old-KDS decision and one new-KDS decision.
+        self.assertEqual(self.calls, [
+            ("bot", 1), ("bot", 1), ("bot", 2), ("rebalance", None),
+        ])
+        self.assertEqual(
+            [row[0] for row in self.conn.execute(
+                "SELECT management_investment FROM decisions ORDER BY company_id"
+            )],
+            [(old_power + 7) * 1000 + 2, (old_power + 7) * 1000 + 3],
+        )
+        self.assertFalse(remote.remote_pending(self.conn, 1))
+
+    def test_finished_job_becomes_pending_when_player_input_changes(self):
+        self.calls = []
+        self.conn.execute(
+            "UPDATE companies SET is_bot=0,is_super_bot=0 WHERE id=2"
+        )
+        self.conn.execute(
+            "INSERT INTO decisions(company_id,round_no,management_investment,submitted_at) "
+            "VALUES(2,1,500,'player')"
+        )
+        self.conn.commit()
+        with patch.object(remote, "_post", self.dispatch):
+            remote.remote_submit(self.conn, "https://example.test", "token", 1)
+            self.assertFalse(remote.remote_pending(self.conn, 1))
+            self.conn.execute(
+                "UPDATE decisions SET management_investment=900 "
+                "WHERE company_id=2 AND round_no=1"
+            )
+            self.conn.commit()
+            self.assertTrue(remote.remote_pending(self.conn, 1))
+            remote.remote_submit(self.conn, "https://example.test", "token", 1)
+        self.assertEqual(self.calls, [
+            ("bot", 1), ("rebalance", None),
+            ("bot", 1), ("rebalance", None),
+        ])
+
+    def test_kds_change_during_one_call_restarts_before_next_segment(self):
+        self.calls = []
+        changed = False
+
+        def mutate_after_first_save(done, total, stage):
+            nonlocal changed
+            if stage == "C01" and not changed:
+                changed = True
+                self.conn.execute(
+                    "UPDATE settings SET value='19' WHERE key='cpi_price_power'"
+                )
+                self.conn.commit()
+
+        with patch.object(remote, "_post", self.dispatch):
+            remote.remote_submit(
+                self.conn, "https://example.test", "token", 1,
+                progress_callback=mutate_after_first_save,
+            )
+        self.assertEqual(self.calls, [
+            ("bot", 1), ("bot", 1), ("bot", 2), ("rebalance", None),
+        ])
+        self.assertFalse(remote.remote_pending(self.conn, 1))
+
+    def test_completed_local_fallback_is_invalidated_by_later_kds_edit(self):
+        for company_id in (1, 2):
+            self.fake_submit(self.conn, 1, target_ids={company_id})
+        self.fake_rebalance(self.conn, 1)
+        self.conn.commit()
+        remote.mark_remote_job_complete(self.conn, 1)
+        self.assertFalse(remote.remote_pending(self.conn, 1))
+        self.conn.execute(
+            "UPDATE settings SET value='23' WHERE key='cpi_price_power'"
+        )
+        self.conn.commit()
+        self.assertTrue(remote.remote_pending(self.conn, 1))
+
+    def test_pause_and_timer_extension_do_not_restart_saved_segments(self):
+        self.calls = []
+
+        def interrupted(done, total, stage):
+            if stage == "C01":
+                raise RuntimeError("browser disconnected")
+
+        with patch.object(remote, "_post", self.dispatch):
+            with self.assertRaisesRegex(RuntimeError, "disconnected"):
+                remote.remote_submit(
+                    self.conn, "https://example.test", "token", 1,
+                    progress_callback=interrupted,
+                )
+            self.conn.execute(
+                "UPDATE rounds SET status='paused',ends_at='extended' WHERE round_no=1"
+            )
+            self.conn.commit()
+            remote.remote_submit(self.conn, "https://example.test", "token", 1)
+        self.assertEqual(self.calls, [
+            ("bot", 1), ("bot", 2), ("rebalance", None),
+        ])
+
+    def test_local_fallback_restarts_if_kds_changes_during_batch(self):
+        attempts = []
+        changed = False
+
+        def local_batch(conn, round_no, progress_callback=None, **kwargs):
+            attempts.append(bool(kwargs.get("replace_existing")))
+            for company_id in (1, 2):
+                power = int(float(conn.execute(
+                    "SELECT value FROM settings WHERE key='cpi_price_power'"
+                ).fetchone()[0]))
+                conn.execute(
+                    "DELETE FROM decisions WHERE company_id=? AND round_no=?",
+                    (company_id, round_no),
+                )
+                conn.execute(
+                    "INSERT INTO decisions(company_id,round_no,management_investment,submitted_at) "
+                    "VALUES(?,?,?,'local')",
+                    (company_id, round_no, power * 1000 + company_id),
+                )
+                for row in conn.execute("SELECT city FROM market_config"):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO city_decisions(company_id,round_no,city,price) "
+                        "VALUES(?,?,?,12345)",
+                        (company_id, round_no, row[0]),
+                    )
+                conn.commit()
+                if progress_callback:
+                    progress_callback(company_id, 2, f"C0{company_id}")
+            return 2
+
+        def mutate_once(done, total, stage):
+            nonlocal changed
+            if stage == "C01" and not changed:
+                changed = True
+                self.conn.execute(
+                    "UPDATE settings SET value='17' WHERE key='cpi_price_power'"
+                )
+                self.conn.commit()
+
+        with patch("sim.bots.submit_super_bot_decisions", local_batch):
+            self.assertEqual(
+                remote.submit_local_super_bots(
+                    self.conn, 1, mutate_once, max_restarts=1,
+                ),
+                2,
+            )
+        self.assertEqual(attempts, [False, True])
+        self.assertEqual(
+            [row[0] for row in self.conn.execute(
+                "SELECT management_investment FROM decisions ORDER BY company_id"
+            )],
+            [17001, 17002],
+        )
+        self.assertFalse(remote.remote_pending(self.conn, 1))
+
+    def test_settlement_guard_rejects_changed_completed_analysis(self):
+        for company_id in (1, 2):
+            self.fake_submit(self.conn, 1, target_ids={company_id})
+        self.fake_rebalance(self.conn, 1)
+        self.conn.commit()
+        remote.mark_remote_job_complete(self.conn, 1)
+        self.conn.execute("BEGIN IMMEDIATE")
+        remote.assert_remote_job_current(self.conn, 1)
+        self.conn.rollback()
+        self.conn.execute(
+            "UPDATE settings SET value='29' WHERE key='cpi_price_power'"
+        )
+        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(remote.RemoteAnalysisChangedError, "重新分析"):
+            remote.assert_remote_job_current(self.conn, 1)
+        self.conn.rollback()
+
     def test_worker_requires_token_and_health_is_read_only(self):
         from scf_worker import main_handler
         with patch.dict(os.environ, {"SUPER_BOT_REMOTE_TOKEN": ""}):

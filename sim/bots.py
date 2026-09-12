@@ -8,12 +8,14 @@ import sqlite3
 import threading
 from typing import Any, Callable
 
-from .cpi import allocate_city_cpi, allocate_city_cpi_for_company, prepare_city_cpi_for_company
+from .bot_joint_pricing import JointPriceTarget, solve_joint_prices
+from .bot_market_forecast import forecast_market_sales
+from .cpi import PRICE_CPI_TOTAL, allocate_city_cpi_for_company, prepare_city_cpi_for_company
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 20
+BOT_API_VERSION = 21
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -183,53 +185,85 @@ def _affordable_group_count(
     return max(0, min(int(affordable), max(0, int(demand_groups))))
 
 
-def _weighted_average(pairs: list[tuple[float, float]], fallback: float) -> float:
-    total = sum(max(0.0, weight) for _, weight in pairs)
-    if total <= 0:
-        return float(fallback)
-    return sum(value * max(0.0, weight) for value, weight in pairs) / total
+def _kds_price_depth(base_depth: float, price_power: int) -> float:
+    """Translate an 8th-power price style to the current KDS exponent.
+
+    Price CPI compares ``price_gap ** power``.  Transforming the normalized
+    gap by ``8 / power`` preserves the intended relative CPI weight instead of
+    treating the same cash undercut as equivalent in every competition.
+    """
+    return min(1.0, max(0.0, float(base_depth))) ** (8.0 / max(1, int(price_power)))
+
+
+def _price_for_weight_advantage(
+    market_average: float,
+    rival_price: float,
+    price_floor: float,
+    price_power: int,
+    weight_multiplier: float = 1.5,
+) -> float:
+    """Return the smallest KDS-aware undercut for a CPI-weight advantage."""
+    average = float(market_average)
+    rival_gap = max(0.0, average - float(rival_price))
+    if rival_gap <= 0:
+        return max(float(price_floor), min(average, float(rival_price)))
+    target_gap = rival_gap * max(1.0, float(weight_multiplier)) ** (1.0 / max(1, int(price_power)))
+    return max(float(price_floor), average - target_gap)
 
 
 def _all_markets_near_capacity(
     conn: sqlite3.Connection,
     round_no: int,
     markets: list[dict[str, Any]],
-    threshold: float = 0.95,
+    threshold: float = 0.90,
 ) -> bool:
-    """Cash may be held only after every market is effectively sold out."""
+    """Cash may be held only when every market was full in the same latest round."""
     if round_no <= 1 or not markets:
         return False
+    latest = one(
+        conn,
+        "SELECT MAX(round_no) AS round_no FROM market_round_stats "
+        "WHERE round_no>=1 AND round_no<?",
+        (round_no,),
+    )
+    if not latest or latest["round_no"] is None:
+        return False
+    latest_round = int(latest["round_no"])
     for market in markets:
         stats = one(
             conn,
-            "SELECT player_total_volume,market_size FROM market_round_stats WHERE city=? "
-            "AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
-            (market["city"], round_no),
+            "SELECT player_total_volume,market_size FROM market_round_stats "
+            "WHERE city=? AND round_no=?",
+            (market["city"], latest_round),
         )
         if not stats:
             return False
-        utilization = float(stats["player_total_volume"] or 0) / max(1.0, float(stats["market_size"] or 0))
+        utilization = (
+            float(stats["player_total_volume"] or 0)
+            / max(1.0, float(stats["market_size"] or 0))
+        )
         if utilization + 1e-9 < threshold:
             return False
     return True
 
 
-def _forecast_submitted_cpi_capacity(
+def _forecast_submitted_market(
     conn: sqlite3.Connection,
     round_no: int,
     markets: list[dict[str, Any]],
-) -> dict[int, float]:
-    """Re-run CPI against the final submitted field and return unit capacity.
+) -> dict[str, Any]:
+    """Forecast the complete submitted field with the settlement algorithm.
 
-    This intentionally happens after every Super Bot has selected a candidate.
-    Candidate-by-candidate forecasts cannot know the final choices of the other
-    Super Bots and may otherwise buy several times more CPI than their stock.
+    This uses the same average-price fixed point and category-isolated
+    secondary allocation as settlement.  Reading the KDS here (rather than
+    accepting cached planner defaults) also means an unlocked KDS change is
+    reflected the next time a round is analysed.
     """
     official_round = 1 if round_no < 0 else round_no
     growth = float(get_setting(conn, "market_growth", 1.10))
     ma_threshold = float(get_setting(conn, "cpi_ma_large_threshold", 1300))
     price_power = max(1, int(get_setting(conn, "cpi_price_power", 8)))
-    states: dict[int, dict[str, Any]] = {}
+    players: dict[int, dict[str, Any]] = {}
     for row in all_rows(
         conn,
         "SELECT c.id,c.product_inventory,d.worker_delta,d.engineer_delta,d.management_investment,"
@@ -242,17 +276,17 @@ def _forecast_submitted_cpi_capacity(
         engineers = max(0, employee_count(conn, company_id, "engineer") + int(row["engineer_delta"] or 0))
         production = max(0, int(row["production_volume"] or 0))
         old_products = max(0, int(row["product_inventory"] or 0))
-        states[company_id] = {
+        players[company_id] = {
+            "company_id": company_id,
             "available": old_products + production,
-            "ma": float(row["management_investment"] or 0) / max(1, workers + engineers),
-            "qi": float(row["quality_investment"] or 0) / max(1.0, old_products * 1.2 + production),
+            "ma_index": float(row["management_investment"] or 0) / max(1, workers + engineers),
+            "qi_index": float(row["quality_investment"] or 0) / max(1.0, old_products * 1.2 + production),
             "cities": {},
         }
-    if not states:
-        return {}
+    if not players:
+        return {"companies": {}, "player_average_prices": {}, "price_power": price_power}
 
-    base_averages: dict[str, float] = {}
-    market_sizes: dict[str, float] = {}
+    resolved_markets: list[dict[str, Any]] = []
     for market in markets:
         city = str(market["city"])
         previous = one(
@@ -261,15 +295,19 @@ def _forecast_submitted_cpi_capacity(
             "AND round_no<? ORDER BY round_no DESC LIMIT 1",
             (city, max(1, round_no)),
         )
-        base_averages[city] = (
-            float(previous["average_price"])
-            if previous else float(market["initial_avg_price"])
-        )
-        market_sizes[city] = (
-            float(market["population"])
-            * float(market["penetration"])
-            * growth ** max(0, official_round - 1)
-        )
+        resolved_markets.append({
+            "city": city,
+            "market_size": (
+                float(market["population"])
+                * float(market["penetration"])
+                * growth ** max(0, official_round - 1)
+            ),
+            "max_price": float(market["max_price"]),
+            "base_average_price": (
+                float(previous["average_price"])
+                if previous else float(market["initial_avg_price"])
+            ),
+        })
         for row in all_rows(
             conn,
             "SELECT cd.company_id,cd.agent_delta,cd.marketing_investment,cd.price,COALESCE(a.count,0) AS current_agents "
@@ -278,74 +316,385 @@ def _forecast_submitted_cpi_capacity(
             (round_no, city),
         ):
             company_id = int(row["company_id"])
-            if company_id not in states:
+            if company_id not in players:
                 continue
             agents = max(0, int(row["current_agents"] or 0) + int(row["agent_delta"] or 0))
             if agents > 0:
-                states[company_id]["cities"][city] = {
+                players[company_id]["cities"][city] = {
                     "agents": agents,
                     "marketing": float(row["marketing_investment"] or 0),
                     "price": float(row["price"] or 0),
                 }
+    return forecast_market_sales(
+        players=list(players.values()),
+        markets=resolved_markets,
+        ma_large_threshold=ma_threshold,
+        price_power=price_power,
+    )
 
-    player_averages = {
-        city: _weighted_average(
-            [
-                (float(state["cities"][city]["price"]), max(1.0, float(state["available"])))
-                for state in states.values() if city in state["cities"]
-            ],
-            base_averages[city],
-        )
-        for city in base_averages
-    }
-    capacities: dict[int, dict[str, float]] = {company_id: {} for company_id in states}
-    for _ in range(12):
-        capacities = {company_id: {} for company_id in states}
-        for market in markets:
-            city = str(market["city"])
-            entries = [
-                {
-                    "company_id": company_id,
-                    "ma_index": state["ma"],
-                    "qi_index": state["qi"],
-                    "mi_investment": state["cities"][city]["marketing"],
-                    "price": state["cities"][city]["price"],
-                    "agents": state["cities"][city]["agents"],
-                }
-                for company_id, state in states.items() if city in state["cities"]
-            ]
-            for allocation in allocate_city_cpi(
-                entries,
-                market_size=market_sizes[city],
-                max_price=float(market["max_price"]),
-                ma_large_threshold=ma_threshold,
-                price_power=price_power,
-                average_price=player_averages[city],
-                market_average_price=base_averages[city],
-            ):
-                capacities[int(allocation["company_id"])][city] = (
-                    market_sizes[city] * float(allocation["total_cpi"]) / 100.0
-                )
-        next_averages: dict[str, float] = {}
-        for city in base_averages:
-            sold_pairs: list[tuple[float, float]] = []
-            for company_id, state in states.items():
-                if city not in state["cities"]:
-                    continue
-                total_capacity = sum(capacities[company_id].values())
-                factor = min(1.0, float(state["available"]) / total_capacity) if total_capacity > 0 else 0.0
-                sold_pairs.append((
-                    float(state["cities"][city]["price"]),
-                    capacities[company_id].get(city, 0.0) * factor,
-                ))
-            next_averages[city] = _weighted_average(sold_pairs, player_averages[city])
-        if all(math.isclose(next_averages[city], player_averages[city], abs_tol=0.01) for city in player_averages):
-            break
-        player_averages = next_averages
+
+def _forecast_submitted_cpi_capacity(
+    conn: sqlite3.Connection,
+    round_no: int,
+    markets: list[dict[str, Any]],
+) -> dict[int, float]:
+    """Return visible CPI capacity before stock and secondary allocation."""
+    forecast = _forecast_submitted_market(conn, round_no, markets)
     return {
-        company_id: sum(city_values.values())
-        for company_id, city_values in capacities.items()
+        int(company_id): float(result["visible_total"])
+        for company_id, result in forecast["companies"].items()
     }
+
+
+def _forecast_submitted_sales_capacity(
+    conn: sqlite3.Connection,
+    round_no: int,
+    markets: list[dict[str, Any]],
+) -> dict[int, float]:
+    """Return exact sellable units, including category-isolated redistribution."""
+    forecast = _forecast_submitted_market(conn, round_no, markets)
+    return {
+        int(company_id): float(result["sold_total"])
+        for company_id, result in forecast["companies"].items()
+    }
+
+
+def _coordinate_super_bot_prices(
+    conn: sqlite3.Connection,
+    round_no: int,
+    markets: list[dict[str, Any]],
+) -> bool:
+    """Apply one simultaneous KDS-aware price plan to low-price Super Bots.
+
+    Individual candidates are deliberately persisted one at a time so an
+    interrupted analysis is resumable.  Their prices cannot, however, be
+    reconciled one at a time when the KDS uses a high price exponent: a later
+    tiny undercut would erase an earlier Bot's forecast.  This final pass works
+    in price-CPI weight space and updates the whole vector together.
+    """
+    if not markets:
+        return False
+    official_round = 1 if round_no < 0 else round_no
+    total_rounds = max(1, int(get_setting(conn, "total_rounds", 5)))
+    price_power = max(1, int(get_setting(conn, "cpi_price_power", 8)))
+    price_min = float(get_setting(conn, "price_min", 3500))
+    global_price_max = float(get_setting(conn, "price_max", 25000))
+    growth = float(get_setting(conn, "market_growth", 1.10))
+    ma_threshold = max(1.0, float(get_setting(conn, "cpi_ma_large_threshold", 1300)))
+    qi_safe_multiplier = max(1.0, float(get_setting(conn, "qi_safe_multiplier", 1.10)))
+    worker_need = float(get_setting(conn, "component_workers", 3))
+    worker_hours = float(get_setting(conn, "component_hours", 7))
+    engineer_need = float(get_setting(conn, "product_engineers", 4))
+    engineer_hours = float(get_setting(conn, "product_hours", 14))
+    component_need = max(1, int(round(get_setting(conn, "components_per_product", 7))))
+    patent_factor = float(get_setting(conn, "patent_factor", 0.70))
+    transport_cost = float(get_setting(conn, "transport_cost", 0))
+    worker_training = float(get_setting(conn, "worker_training_cost", 0))
+    engineer_training = float(get_setting(conn, "engineer_training_cost", 0))
+    add_agent_cost = float(get_setting(conn, "agent_add_cost", 300000))
+    remove_agent_cost = float(get_setting(conn, "agent_remove_cost", 100000))
+    market_by_city = {str(market["city"]): market for market in markets}
+
+    previous_stats: dict[str, dict[str, float]] = {}
+    for market in markets:
+        city = str(market["city"])
+        stats = one(
+            conn,
+            "SELECT average_price,player_total_volume,market_size FROM market_round_stats "
+            "WHERE city=? AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
+            (city, max(1, round_no)),
+        )
+        previous_stats[city] = {
+            "average": float(stats["average_price"]) if stats else float(market["initial_avg_price"]),
+            "utilization": (
+                float(stats["player_total_volume"] or 0) / max(1.0, float(stats["market_size"] or 0))
+                if stats else 0.0
+            ),
+        }
+    low_price_open = (
+        official_round >= max(1, total_rounds - 1)
+        or all(value["utilization"] >= 0.90 for value in previous_stats.values())
+        or any(
+            value["average"] >= min(global_price_max, float(market_by_city[city]["max_price"])) * 0.75
+            for city, value in previous_stats.items()
+        )
+    )
+    if not low_price_open:
+        return False
+
+    rows = [dict(row) for row in all_rows(
+        conn,
+        "SELECT c.id,c.is_super_bot,c.bot_profile,c.home_city,c.cash,c.patents,"
+        "c.component_inventory,c.product_inventory,c.component_storage_capacity,c.product_storage_capacity,"
+        "d.loan_change,d.worker_salary,d.engineer_salary,d.worker_delta,d.engineer_delta,d.production_volume,"
+        "d.management_investment,d.quality_investment,cd.city,cd.price,cd.marketing_investment,"
+        "cd.agent_delta,COALESCE(a.count,0) AS agents_before,"
+        "COALESCE(a.count,0)+cd.agent_delta AS agents_after "
+        "FROM companies c JOIN decisions d ON d.company_id=c.id "
+        "JOIN city_decisions cd ON cd.company_id=c.id AND cd.round_no=d.round_no "
+        "LEFT JOIN agents a ON a.company_id=c.id AND a.city=cd.city "
+        "WHERE d.round_no=? AND d.submitted_at IS NOT NULL",
+        (round_no,),
+    )]
+    if not rows:
+        return False
+
+    company_rows: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        if int(row["agents_after"] or 0) > 0:
+            company_rows.setdefault(int(row["id"]), []).append(row)
+    prior_sellthrough: dict[int, float] = {}
+    for company_id in company_rows:
+        prior = one(
+            conn,
+            "SELECT sold,produced,inventory FROM results WHERE company_id=? AND round_no>=1 "
+            "AND round_no<? ORDER BY round_no DESC LIMIT 1",
+            (company_id, max(1, round_no)),
+        )
+        previous_available = (
+            float(prior["sold"] or 0) + float(prior["inventory"] or 0)
+            if prior else 0.0
+        )
+        prior_sellthrough[company_id] = (
+            float(prior["sold"] or 0) / previous_available
+            if prior and previous_available > 0 else 1.0
+        )
+
+    # Two stable personality families deliberately use the price route once it
+    # is unlocked.  Their CPI spend is expressed as live KDS threshold
+    # multiples, not copied cash values.  Without this specialization every
+    # profit maximizer converges on maximum MA+QI and the field becomes both
+    # homogeneous and unnecessarily expensive.
+    strategic_ids = {
+        int(row["id"])
+        for row in rows
+        if int(row["is_super_bot"] or 0)
+        and (
+            int(row["bot_profile"] or row["id"]) % 7 in (0, 5)
+            or float(row["price"] or 0) < previous_stats[str(row["city"])]["average"]
+            or (
+                int(row["product_inventory"] or 0) > 0
+                and prior_sellthrough.get(int(row["id"]), 1.0) < 0.80
+            )
+        )
+    }
+    for company_id in strategic_ids:
+        sample = next(row for row in rows if int(row["id"]) == company_id)
+        profile = int(sample["bot_profile"] or company_id) % 7
+        workers = max(
+            0,
+            employee_count(conn, company_id, "worker") + int(sample["worker_delta"] or 0),
+        )
+        engineers = max(
+            0,
+            employee_count(conn, company_id, "engineer") + int(sample["engineer_delta"] or 0),
+        )
+        production = max(0, int(sample["production_volume"] or 0))
+        old_components = max(0, int(sample["component_inventory"] or 0))
+        old_products = max(0, int(sample["product_inventory"] or 0))
+        individuality = (company_id % 5) * 0.0125
+        active_rows_for_company = [
+            row for row in rows
+            if int(row["id"]) == company_id and int(row["agents_after"] or 0) > 0
+        ]
+        active_caps = [
+            float(market_by_city[str(row["city"])]["max_price"])
+            for row in active_rows_for_company
+        ]
+        qi_line = max(active_caps, default=global_price_max) / 50.0
+        ma_index = (
+            ma_threshold * (1.02 + individuality)
+            if profile in (1, 4, 6) else 1.0 + individuality
+        )
+        qi_index = (
+            qi_line * qi_safe_multiplier * (1.0 + individuality)
+            if profile in (2, 4, 5) else 1.0 + individuality
+        )
+        proposed_management = ma_index * max(1, workers + engineers)
+        proposed_quality = qi_index * max(1.0, old_products * 1.2 + production)
+        proposed_marketing: dict[str, float] = {}
+        for city_row in active_rows_for_company:
+            city = str(city_row["city"])
+            agents = max(1, int(city_row["agents_after"] or 0))
+            city_market = market_by_city[city]
+            size = (
+                float(city_market["population"])
+                * float(city_market["penetration"])
+                * growth ** max(0, official_round - 1)
+            )
+            mi_line = (float(city_market["max_price"]) / 50.0) * size * 0.20
+            mi_line /= (1.0 + agents * 0.10) * 1.5 * 2.0
+            marketing = mi_line * (1.02 + individuality) if profile == 3 else 0.0
+            proposed_marketing[city] = marketing
+
+        # Settlement pays wages, production, storage and Agent changes before
+        # MI -> QI -> MA.  Keep the specialised CPI mix inside the same live
+        # KDS cash envelope so a nominal decision never relies on settlement
+        # silently truncating its investments.
+        home = market_by_city.get(str(sample["home_city"]), markets[0])
+        material_factor = patent_factor ** int(sample["patents"] or 0)
+        components_to_make = max(0, production * component_need - old_components)
+        base_cost = (
+            workers * float(sample["worker_salary"] or home["worker_initial_salary"]) * 3
+            + engineers * float(sample["engineer_salary"] or home["engineer_initial_salary"]) * 3
+            + max(0, int(sample["worker_delta"] or 0)) * worker_training
+            + max(0, int(sample["engineer_delta"] or 0)) * engineer_training
+            + max(0, -int(sample["worker_delta"] or 0))
+            * float(sample["worker_salary"] or home["worker_initial_salary"])
+            + max(0, -int(sample["engineer_delta"] or 0))
+            * float(sample["engineer_salary"] or home["engineer_initial_salary"])
+            + components_to_make * float(home["component_material"]) * material_factor
+            + production * float(home["product_material"]) * material_factor
+            + max(
+                0,
+                old_components + components_to_make
+                - int(sample["component_storage_capacity"] or 0),
+            ) * float(home["component_storage"])
+            + max(
+                0,
+                old_products + production
+                - int(sample["product_storage_capacity"] or 0),
+            ) * float(home["product_storage"])
+        )
+        all_company_rows = [row for row in rows if int(row["id"]) == company_id]
+        base_cost += sum(
+            int(row["agent_delta"] or 0) * add_agent_cost
+            if int(row["agent_delta"] or 0) > 0
+            else -int(row["agent_delta"] or 0) * remove_agent_cost
+            for row in all_company_rows
+        )
+        remaining = max(
+            0.0,
+            float(sample["cash"] or 0) + max(0.0, float(sample["loan_change"] or 0))
+            - base_cost,
+        )
+        paid_marketing: dict[str, float] = {}
+        for city_row in sorted(all_company_rows, key=lambda row: str(row["city"])):
+            city = str(city_row["city"])
+            requested = max(0.0, proposed_marketing.get(city, 0.0))
+            paid_marketing[city] = min(requested, remaining)
+            remaining -= paid_marketing[city]
+        paid_quality = min(max(0.0, proposed_quality), remaining)
+        remaining -= paid_quality
+        paid_management = min(max(0.0, proposed_management), remaining)
+        conn.execute(
+            "UPDATE decisions SET management_investment=?,quality_investment=? "
+            "WHERE company_id=? AND round_no=?",
+            (paid_management, paid_quality, company_id, round_no),
+        )
+        for city, marketing in paid_marketing.items():
+            conn.execute(
+                "UPDATE city_decisions SET marketing_investment=? "
+                "WHERE company_id=? AND round_no=? AND city=?",
+                (marketing, company_id, round_no, city),
+            )
+
+    forecast = _forecast_submitted_market(conn, round_no, markets)
+    forecast_companies = forecast["companies"]
+
+    company_active_size = {
+        company_id: sum(
+            float(market_by_city[str(row["city"])]["population"])
+            * float(market_by_city[str(row["city"])]["penetration"])
+            * growth ** max(0, official_round - 1)
+            for row in active_rows
+        )
+        for company_id, active_rows in company_rows.items()
+    }
+    updates: list[tuple[float, int, str]] = []
+    for market in markets:
+        city = str(market["city"])
+        base_average = previous_stats[city]["average"]
+        market_size = (
+            float(market["population"])
+            * float(market["penetration"])
+            * growth ** max(0, official_round - 1)
+        )
+        active_rows = [row for row in rows if str(row["city"]) == city and int(row["agents_after"] or 0) > 0]
+        specialists: list[dict[str, Any]] = []
+        for row in active_rows:
+            if not int(row["is_super_bot"] or 0):
+                continue
+            company_id = int(row["id"])
+            inventory_crisis = (
+                int(row["product_inventory"] or 0) > 0
+                and prior_sellthrough.get(company_id, 1.0) < 0.80
+            )
+            personality = int(row["bot_profile"] or company_id) % 7
+            strategic_price_route = personality in (0, 5)
+            if (
+                float(row["price"] or 0) < base_average
+                or inventory_crisis
+                or strategic_price_route
+            ):
+                specialists.append(row)
+        if not specialists:
+            continue
+
+        specialist_ids = {int(row["id"]) for row in specialists}
+        external_prices = [
+            float(row["price"] or 0)
+            for row in active_rows
+            if int(row["id"]) not in specialist_ids
+        ]
+        targets: list[JointPriceTarget] = []
+        for row in specialists:
+            company_id = int(row["id"])
+            home = market_by_city.get(str(row["home_city"]), market)
+            material_factor = patent_factor ** int(row["patents"] or 0)
+            component_labor = (
+                component_need * worker_need * worker_hours / 504.0
+                * float(row["worker_salary"] or home["worker_initial_salary"]) * 3
+            )
+            product_labor = (
+                engineer_need * engineer_hours / 504.0
+                * float(row["engineer_salary"] or home["engineer_initial_salary"]) * 3
+            )
+            direct_cost = (
+                component_need * float(home["component_material"]) * material_factor
+                + float(home["product_material"]) * material_factor
+                + component_labor + product_labor
+                + (transport_cost if city != str(row["home_city"]) else 0.0)
+            )
+            available = float(row["product_inventory"] or 0) + float(row["production_volume"] or 0)
+            active_size = max(1.0, company_active_size.get(company_id, market_size))
+            personality = int(row["bot_profile"] or company_id) % 7
+            sellthrough_target = 0.78 + personality * 0.01
+            desired_city_units = available * sellthrough_target * market_size / active_size
+            city_forecast = forecast_companies.get(company_id, {})
+            investment_units = float(city_forecast.get("investment", {}).get(city, 0.0))
+            required_price_units = max(0.0, desired_city_units - investment_units)
+            requested_share = required_price_units / max(1.0, market_size * 0.40)
+            requested_share *= 0.92 + personality * 0.025
+            # Keep several profitable participants in the price route. A
+            # single Bot taking the entire pool is the exact failure mode this
+            # pass is designed to prevent.
+            requested_share = min(0.22, max(0.025, requested_share))
+            targets.append(JointPriceTarget(
+                key=company_id,
+                target_share=requested_share,
+                share_cap=0.24,
+                cost_floor=max(price_min, direct_cost * 1.04),
+            ))
+        solved = solve_joint_prices(
+            base_average=base_average,
+            external_prices=external_prices,
+            targets=targets,
+            price_power=price_power,
+            price_min=price_min,
+            price_max=min(global_price_max, float(market["max_price"])),
+            total_share_cap=0.68,
+            zero_external_anchor_gap=0.025,
+        )
+        for company_id, result in solved.items():
+            updates.append((round(float(result.price), 2), int(company_id), city))
+
+    for price, company_id, city in updates:
+        conn.execute(
+            "UPDATE city_decisions SET price=? WHERE company_id=? AND round_no=? AND city=?",
+            (price, company_id, round_no, city),
+        )
+    return bool(updates)
 
 
 def _rebalance_super_bot_production(
@@ -368,10 +717,13 @@ def _rebalance_super_bot_production(
     remove_agent_cost = float(get_setting(conn, "agent_remove_cost", 100000))
     patent_factor = float(get_setting(conn, "patent_factor", 0.70))
     growth = float(get_setting(conn, "market_growth", 1.10))
+    ma_large_threshold = max(1.0, float(get_setting(conn, "cpi_ma_large_threshold", 1300)))
+    ma_index_ceiling = ma_large_threshold * (8000.0 / 1300.0)
     official_round = 1 if round_no < 0 else round_no
 
     market_by_city = {str(market["city"]): market for market in markets}
     all_markets_full = _all_markets_near_capacity(conn, round_no, markets)
+    _coordinate_super_bot_prices(conn, round_no, markets)
 
     # Deploy idle capital before the joint CPI/production convergence. Only a
     # fraction of the gap is assigned to indices; the rest stays available to
@@ -450,8 +802,13 @@ def _rebalance_super_bot_production(
 
         headcount = max(1, workers + engineers)
         qi_denominator = max(1.0, old_products * 1.2 + production)
-        ma_headroom = max(0.0, 8000.0 * headcount - float(row["management_investment"] or 0))
-        qi_headroom = max(0.0, 3000.0 * qi_denominator - float(row["quality_investment"] or 0))
+        qi_large_threshold = max(
+            (float(city["max_price"]) / 50.0 for city in active_cities),
+            default=1.0,
+        )
+        qi_index_ceiling = qi_large_threshold * 6.0
+        ma_headroom = max(0.0, ma_index_ceiling * headcount - float(row["management_investment"] or 0))
+        qi_headroom = max(0.0, qi_index_ceiling * qi_denominator - float(row["quality_investment"] or 0))
         mi_headrooms: dict[str, float] = {}
         for city in active_cities:
             agents = int(city["current_agents"] or 0) + int(city["agent_delta"] or 0)
@@ -487,10 +844,10 @@ def _rebalance_super_bot_production(
     # equilibrium than the former dense grid. Allow enough damped passes for
     # production and investment to converge without leaving affordable groups.
     for _ in range(40):
-        capacities = (
-            _forecast_submitted_cpi_capacity(conn, round_no, markets)
-            if all_markets_full else {}
-        )
+        # Production follows the exact units this field can sell after the
+        # category-isolated secondary pass. Visible CPI alone misses legitimate
+        # price-to-price and investment-to-investment redistribution.
+        capacities = _forecast_submitted_sales_capacity(conn, round_no, markets)
         changed = False
         for row in all_rows(
             conn,
@@ -555,11 +912,23 @@ def _rebalance_super_bot_production(
 
             total_funds = float(row["cash"]) + max(0.0, float(row["loan_change"] or 0))
             if all_markets_full:
-                target_new = max(0.0, capacities.get(company_id, 0.0) - old_products)
-                target_groups = max(0, int(round(target_new / max(group["products"], 1.0))))
+                personality = int(row["bot_profile"] or company_id) % 7
+                personality_headroom = 0.97 + personality * 0.01
+                target_available = (
+                    capacities.get(company_id, 0.0)
+                    * personality_headroom
+                )
+                target_new = max(0.0, target_available - old_products)
+                target_groups = max(
+                    0,
+                    int(math.floor(target_new / max(group["products"], 1.0))),
+                )
                 low, high = 0, target_groups
             else:
-                current_groups = max(0, int(round(current_production / max(group["products"], 1.0))))
+                current_groups = max(
+                    0,
+                    int(round(current_production / max(group["products"], 1.0))),
+                )
                 low, high = 0, max(1, current_groups)
                 while float(plan_for(high)["total"]) <= total_funds + 1e-9:
                     low = high
@@ -659,6 +1028,8 @@ def _submit_bots(
     salary_min, salary_max = setting("salary_min", 1000), setting("salary_max", 10000)
     salary_change = setting("salary_change_limit", 1000)
     price_min, price_max = setting("price_min", 3500), setting("price_max", 25000)
+    price_power = max(1, int(setting("cpi_price_power", 8)))
+    max_agent_add = max(0, int(setting("max_agent_add_per_city_round", 3)))
     growth = setting("market_growth", 1.10)
     worker_need, worker_hours = setting("component_workers", 3), setting("component_hours", 7)
     engineer_need, engineer_hours = setting("product_engineers", 4), setting("product_hours", 14)
@@ -666,9 +1037,11 @@ def _submit_bots(
     worker_training = setting("worker_training_cost", 0)
     engineer_training = setting("engineer_training_cost", 0)
     add_agent_cost = setting("agent_add_cost", 300000)
+    remove_agent_cost = setting("agent_remove_cost", 100000)
     transport_cost = setting("transport_cost", 0)
     patent_factor = setting("patent_factor", 0.70)
     ma_threshold = setting("cpi_ma_large_threshold", 1300)
+    qi_safe_multiplier = max(1.0, setting("qi_safe_multiplier", 1.10))
     initial_cash = max(1.0, setting("initial_cash", 15_000_000))
     total_rounds = max(1, int(setting("total_rounds", 5)))
     loan_threshold = setting("loan_asset_threshold", 15_000_000)
@@ -748,15 +1121,11 @@ def _submit_bots(
         ))
     )
     progress_total = pending_total + (1 if super_mode and pending_total and not defer_rebalance else 0)
-    submitted_super_ids = {
-        int(row["company_id"])
-        for row in all_rows(
-            conn,
-            "SELECT d.company_id FROM decisions d JOIN companies c ON c.id=d.company_id "
-            "WHERE d.round_no=? AND d.submitted_at IS NOT NULL AND c.is_super_bot=1",
-            (round_no,),
-        )
-    } if super_mode else set()
+    # Every Super Bot evaluates the same deterministic synthetic Super field.
+    # A decision saved a few milliseconds earlier in this pass (or before an
+    # interrupted resume) must not become the next Bot's undercut target. The
+    # real saved vector is reconciled synchronously after all Bots exist.
+    frozen_super_ids: set[int] = set()
     for bot_row in bots:
         bot = dict(bot_row)
         company_id = int(bot["id"])
@@ -822,10 +1191,12 @@ def _submit_bots(
             current = int(row["count"] if row else 0)
             agent_variation = rng.choice((-1, 0, 0, 0, 1))
             desired = max(1, int(plan["agents"]) + agent_variation) if index in selected else current
-            delta = max(-current, min(3, desired - current))
+            delta = max(-current, min(max_agent_add, desired - current))
             agent_plan[index] = (delta, current + delta)
             if delta > 0:
                 agent_cost += delta * add_agent_cost
+            elif delta < 0:
+                agent_cost += -delta * remove_agent_cost
 
         saturated: dict[int, bool] = {}
         utilization: dict[int, float] = {}
@@ -838,17 +1209,11 @@ def _submit_bots(
                 "WHERE city=? AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
                 (market["city"], max(1, round_no)),
             )
-            saturation_history = one(
-                conn,
-                "SELECT MAX(player_total_volume / MAX(market_size,1)) AS peak FROM market_round_stats "
-                "WHERE city=? AND round_no>=1 AND round_no<?",
-                (market["city"], max(1, round_no)),
-            )
-            saturated[index] = bool(saturation_history and float(saturation_history["peak"] or 0) >= 0.60)
             utilization[index] = (
                 float(stats["player_total_volume"] or 0) / max(1.0, float(stats["market_size"] or 0))
                 if stats else 0.0
             )
+            saturated[index] = utilization[index] >= 0.60
             previous_prices[index] = float(stats["average_price"]) if stats else float(market["initial_avg_price"])
 
         late_game_low_price = official_round >= max(1, total_rounds - 1)
@@ -868,7 +1233,19 @@ def _submit_bots(
         capital_scale = 1.0 + (
             min(8.0, math.sqrt(wealth_multiple)) - 1.0
         ) * unsaturated_share
-        desired_available = int(float(plan["production"]) * variation * capital_scale)
+        round_market_ramp = (0.34, 0.52, 0.72, 0.88, 1.00, 1.08, 1.15)[plan_index]
+        fair_market_units = sum(
+            (
+                float(markets[index]["population"])
+                * float(markets[index]["penetration"])
+                * growth ** max(0, official_round - 1)
+            ) / max(1, city_competitors[index])
+            for index in selected
+        )
+        # Production anchors scale with the live KDS market size and actual
+        # field density. The seven-round table supplies only the strategy
+        # phase; no historic event's raw unit count leaks into this KDS.
+        desired_available = int(fair_market_units * round_market_ramp * variation * capital_scale)
         prior_production = report.get("production", {})
         prior_sold = 0
         prior_total = 0
@@ -912,7 +1289,8 @@ def _submit_bots(
             rival_rows = all_rows(
                 conn,
                 "SELECT d.company_id,d.worker_delta,d.engineer_delta,d.management_investment,d.production_volume,"
-                "d.quality_investment,cd.city,cd.agent_delta,cd.marketing_investment,cd.price,c.product_inventory "
+                "d.quality_investment,cd.city,cd.agent_delta,cd.marketing_investment,cd.price,c.product_inventory,"
+                "c.is_super_bot AS rival_is_super "
                 "FROM decisions d JOIN companies c ON c.id=d.company_id "
                 "JOIN city_decisions cd ON cd.company_id=d.company_id AND cd.round_no=d.round_no "
                 "WHERE d.round_no=? AND d.submitted_at IS NOT NULL AND d.company_id<>?",
@@ -920,6 +1298,8 @@ def _submit_bots(
             )
             market_index = {str(market["city"]): index for index, market in enumerate(markets)}
             for rival in rival_rows:
+                if int(rival["rival_is_super"] or 0) and int(rival["company_id"]) not in frozen_super_ids:
+                    continue
                 index = market_index[str(rival["city"])]
                 agent_row = one(
                     conn, "SELECT count FROM agents WHERE company_id=? AND city=?",
@@ -951,13 +1331,14 @@ def _submit_bots(
                     ) / max(1, int(active_count["n"] or 0)),
                 })
 
-            # Super Bots are analysed and committed one at a time. Decisions
-            # already saved in this pass are real rivals above; only the smaller
-            # unresolved remainder still needs a synthetic estimate.
+            # Super Bots are analysed and committed one at a time, but every
+            # one sees the same synthetic peers. This keeps a resumed/split run
+            # identical to an uninterrupted batch; the final joint pass uses
+            # the complete real vector.
             for other_row in bots:
                 other = dict(other_row)
                 other_id = int(other["id"])
-                if other_id == company_id or other_id in submitted_super_ids:
+                if other_id == company_id or other_id in frozen_super_ids:
                     continue
                 other_profile = int(other["bot_profile"] if other["bot_profile"] is not None else other_id) % 7
                 other_style = BOT_STYLES[other_profile]
@@ -984,21 +1365,34 @@ def _submit_bots(
                         # low-price competitors once that strategy is unlocked.
                         # Otherwise every sequential Bot falsely believes it can
                         # monopolise the 40-CPI price pool at exactly 75%.
-                        expected_low_ratios = (0.72, 0.68, 0.64, 0.60, 0.56, 0.52, 0.48)
-                        expected_ratio = max(
-                            price_min / max(1.0, cap),
-                            expected_low_ratios[other_profile],
-                        )
-                        expected_price = cap * expected_ratio
+                        # Model unresolved rivals in price-gap/CPI-weight
+                        # space.  A fixed percentage of max price is wildly
+                        # wrong when one KDS uses power 8 and another uses 20.
+                        base_depths = (0.18, 0.26, 0.34, 0.43, 0.53, 0.64, 0.76)
+                        depth = _kds_price_depth(base_depths[other_profile], price_power)
+                        expected_price = prior_average - (
+                            prior_average - price_min
+                        ) * depth
+                        expected_price = min(cap, max(price_min, expected_price))
                     else:
                         expected_price = cap * float(other_style["high"])
                     rival_metrics[index].append({
-                        "ma": max(ma_threshold * 1.02, float(plan["ma"]) * other_variation) * float(other_style["ma"]),
+                        "ma": (
+                            ma_threshold
+                            * (1.02 + plan_index * 0.16)
+                            * other_variation
+                            * float(other_style["ma"])
+                        ),
                         "qi": qi_large * float(other_style["qi"]) if plan_index >= 1 else 0.0,
                         "mi_effective": mi_large * float(other_style["mi"]) if plan_index >= 2 else 0.0,
                         "price": expected_price,
                         "agents": float(other_agents),
-                        "available": float(plan["production"]) * other_variation / max(1, len(other_selected)),
+                        "available": (
+                            size
+                            / max(1, city_competitors[index])
+                            * round_market_ramp
+                            * other_variation
+                        ),
                     })
 
         current_pressure: dict[int, float] = {}
@@ -1037,7 +1431,12 @@ def _submit_bots(
         # Choose the CPI indices first. The affordable production count is then
         # derived from the strategy guide's complete group cost; investment is
         # never used as a blind cash sink after production has been calculated.
-        ma_index_target = max(ma_threshold * ma_round_buffer, float(plan["ma"]) * variation) * ma_strength
+        ma_index_target = (
+            ma_threshold
+            * max(ma_round_buffer, 1.02 + plan_index * 0.16)
+            * variation
+            * ma_strength
+        )
         normal_mix = NORMAL_INVESTMENT_MIXES[(profile + plan_index * 5) % len(NORMAL_INVESTMENT_MIXES)]
         normal_phase = (1.00, 1.08, 1.20, 1.38, 1.58, 1.82, 2.08)[plan_index]
         if not super_mode:
@@ -1057,10 +1456,10 @@ def _submit_bots(
                 max(ma_index_target, ma_threshold * super_aggression, rival_ma * super_aggression),
             )
         qi_line = max(float(markets[index]["max_price"]) / 50.0 for index in selected)
-        qi_index_target = qi_line * max(1.03, qi_strength)
+        qi_index_target = qi_line * max(qi_safe_multiplier, qi_strength)
         if not super_mode:
             qi_index_target = qi_line * max(
-                1.02,
+                qi_safe_multiplier,
                 float(normal_mix["qi"]) * normal_phase * rng.uniform(0.95, 1.06),
             )
             if distress_liquidation:
@@ -1398,6 +1797,7 @@ def _submit_bots(
                     entries, market_size=size, max_price=float(market["max_price"]),
                     ma_large_threshold=ma_threshold, average_price=average_price,
                     market_average_price=previous_prices[index],
+                    price_power=price_power,
                     target_company_id=company_id,
                 )
                 capacity += size * own_cpi / 100.0
@@ -1415,8 +1815,11 @@ def _submit_bots(
                 - ma_index_target * (group["workers"] + group["engineers"])
                 - qi_index_target * group["products"],
             )
-            ma_ceiling = 8000.0
-            qi_ceiling = 3000.0
+            # Keep the organiser's original 1–8000 / 1–3000 search range for
+            # the default KDS, but express it as live threshold multiples so a
+            # different event scales correctly.
+            ma_ceiling = max(1.0, ma_threshold * (8000.0 / 1300.0))
+            qi_ceiling = max(1.0, qi_line * 6.0)
             mi_ratio_ceiling = 6.0 if use_mi else 0.0
             field_ma = min(ma_ceiling, max(1.0, ma_index_target))
             field_qi = min(qi_ceiling, max(1.0, qi_index_target))
@@ -1467,10 +1870,20 @@ def _submit_bots(
                     price_min / max(1.0, min(price_max, float(markets[index]["max_price"])))
                     for index in selected
                 )
-                price_ratio_candidates.update(
-                    max(minimum_ratio, ratio)
-                    for ratio in (0.70, 0.64, 0.58, 0.52, 0.46, 0.40, 0.34, 0.28, 0.22, 0.16)
-                )
+                # Low-price candidates use normalized price gaps transformed
+                # to the live KDS exponent.  This gives comparable CPI-weight
+                # steps across an 8th-power regional game and a 20th-power
+                # national game without blindly jumping thousands of yuan.
+                representative_ratios = [
+                    previous_prices[index]
+                    / max(1.0, min(price_max, float(markets[index]["max_price"])))
+                    for index in selected
+                ]
+                previous_ratio = sum(representative_ratios) / max(1, len(representative_ratios))
+                for base_depth in (0.08, 0.16, 0.28, 0.42, 0.58, 0.74, 0.88, 0.97):
+                    depth = _kds_price_depth(base_depth, price_power)
+                    candidate_ratio = previous_ratio - (previous_ratio - minimum_ratio) * depth
+                    price_ratio_candidates.add(round(min(0.98, max(minimum_ratio, candidate_ratio)), 5))
                 price_ratio_candidates.add(minimum_ratio)
                 for index in selected:
                     cap = min(price_max, float(markets[index]["max_price"]))
@@ -1480,11 +1893,22 @@ def _submit_bots(
                         or index in saturated_low_price_indices
                     ):
                         continue
-                    for rival in rival_metrics[index]:
-                        if rival["price"] > 0:
-                            price_ratio_candidates.add(
-                                min(0.98, max(minimum_ratio, rival["price"] / cap - 0.004))
-                            )
+                    rival_prices = [
+                        float(rival["price"])
+                        for rival in rival_metrics[index]
+                        if float(rival["price"]) > 0
+                    ]
+                    if rival_prices:
+                        candidate_price = _price_for_weight_advantage(
+                            previous_prices[index],
+                            min(rival_prices),
+                            price_min,
+                            price_power,
+                        )
+                        price_ratio_candidates.add(round(
+                            min(0.98, max(minimum_ratio, candidate_price / cap)),
+                            5,
+                        ))
 
             # Rival decisions and city KDS stay fixed during this Bot's search.
             # Build them once, while retaining the same summation order and
@@ -1533,11 +1957,20 @@ def _submit_bots(
                 cpi_evaluator = prepare_city_cpi_for_company(
                     entries, target_company_id=company_id, market_size=size,
                     max_price=float(market["max_price"]), ma_large_threshold=ma_threshold,
+                    price_power=price_power,
                     market_average_price=previous_prices[index],
                 )
+                # Price CPI is exceptionally fragile when the KDS uses a high
+                # exponent: one later Bot can take almost the whole 40-point
+                # pool with a tiny undercut.  Candidate scoring therefore keeps
+                # a KDS-scaled shadow competitor instead of valuing a temporary
+                # price monopoly as guaranteed revenue.  This is only a Bot
+                # risk model; settlement continues to use the exact field.
+                shadow_price_competitors = min(3.0, max(0.75, price_power / 12.0))
                 candidate_city_data.append((
                     index, cap, low_price_unlocked, direct_unit_cost,
                     rival_weights, rival_weighted_prices, size, cpi_evaluator,
+                    shadow_price_competitors,
                 ))
 
             def evaluate_candidate(
@@ -1583,6 +2016,7 @@ def _submit_bots(
                 for (
                     index, cap, low_price_unlocked, direct_unit_cost,
                     rival_weights, rival_weighted_prices, size, cpi_evaluator,
+                    shadow_price_competitors,
                 ) in candidate_city_data:
                     effective_ratio = (
                         candidate_price_ratio
@@ -1599,6 +2033,23 @@ def _submit_bots(
                         mi_investment=candidate_marketing[index],
                         price=candidate_price, average_price=average_price,
                     )
+                    market_average = float(previous_prices[index])
+                    if candidate_price < market_average:
+                        own_price_weight = (market_average - candidate_price) ** price_power
+                        known_price_weight = sum(cpi_evaluator.price_weights)
+                        known_price_cpi = (
+                            PRICE_CPI_TOTAL * own_price_weight
+                            / max(own_price_weight + known_price_weight, 1e-300)
+                        )
+                        resilient_price_cpi = (
+                            PRICE_CPI_TOTAL * own_price_weight
+                            / max(
+                                known_price_weight
+                                + own_price_weight * (1.0 + shadow_price_competitors * 1.35),
+                                1e-300,
+                            )
+                        )
+                        own_cpi = max(0.0, own_cpi - known_price_cpi + resilient_price_cpi)
                     city_capacities.append((index, size * own_cpi / 100.0, candidate_price))
 
                 total_capacity = sum(capacity for _, capacity, _ in city_capacities)
@@ -1796,7 +2247,6 @@ def _submit_bots(
         # A rerun resumes after this saved Bot instead of rebuilding it.
         if super_mode:
             conn.commit()
-            submitted_super_ids.add(company_id)
         submitted += 1
         if progress_callback:
             progress_callback(submitted, max(1, progress_total), str(bot["code"]))

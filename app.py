@@ -42,7 +42,7 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 4
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 20
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 21
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -50,12 +50,19 @@ if (
     importlib.reload(_engine_module)
     importlib.reload(_bots_module)
 
-from sim.bots import submit_bot_decisions, submit_super_bot_decisions
+from sim.bots import submit_bot_decisions
 from sim import remote_worker as _remote_worker_module
-if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 2:
+if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 3:
     importlib.invalidate_caches()
     importlib.reload(_remote_worker_module)
-from sim.remote_worker import remote_health, remote_pending, remote_submit, resolve_remote_endpoints
+from sim.remote_worker import (
+    assert_remote_job_current,
+    remote_health,
+    remote_pending,
+    remote_submit,
+    resolve_remote_endpoints,
+    submit_local_super_bots,
+)
 
 from sim.db import (
     all_rows,
@@ -1732,8 +1739,7 @@ def render_admin_rounds() -> None:
         ) if round_row else None
         history = all_rows(conn, "SELECT * FROM rounds ORDER BY round_no DESC")
         remote_job_pending = bool(
-            round_row and compute_endpoints
-            and remote_pending(conn, int(round_row["round_no"]))
+            round_row and remote_pending(conn, int(round_row["round_no"]))
         )
     round_banner(round_row)
     if remote_config_error:
@@ -1831,11 +1837,13 @@ def render_admin_rounds() -> None:
                         update_super_progress(super_total, super_total, "远程计算完成")
                     else:
                         with connect() as conn:
-                            submit_super_bot_decisions(
+                            submit_local_super_bots(
                                 conn,
                                 remote_round,
                                 update_super_progress,
-                                replace_existing=super_submitted >= super_total,
+                                replace_existing=(
+                                    remote_job_pending or super_submitted >= super_total
+                                ),
                             )
                     super_progress.empty()
                     flash("success", f"{super_total} 支超级 Bot 已读取全部对手决策并完成提交。")
@@ -1888,7 +1896,18 @@ def render_admin_rounds() -> None:
                         settlement_progress.progress(1.0, text="远程计算完成")
                 with connect() as conn:
                     if needs_super_analysis and not remote_completed:
-                        submit_super_bot_decisions(conn, remote_round, update_settlement_progress)
+                        submit_local_super_bots(
+                            conn,
+                            remote_round,
+                            update_settlement_progress,
+                            replace_existing=remote_job_pending,
+                        )
+                    conn.execute("BEGIN IMMEDIATE")
+                    if conn.execute(
+                        "SELECT 1 FROM companies "
+                        "WHERE is_bot=1 AND is_super_bot=1 LIMIT 1"
+                    ).fetchone():
+                        assert_remote_job_current(conn, remote_round)
                     settle_round(conn, int(round_row["round_no"]))
                 if needs_super_analysis:
                     settlement_progress.empty()
@@ -2018,7 +2037,7 @@ def render_admin_rounds() -> None:
                         super_bot_count = super_bot_total
                     else:
                         with connect() as conn:
-                            super_bot_count = submit_super_bot_decisions(
+                            super_bot_count = submit_local_super_bots(
                                 conn, reopened_round, update_rollback_progress,
                             )
                     rollback_progress.empty()
