@@ -15,7 +15,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 23
+BOT_API_VERSION = 24
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -261,6 +261,7 @@ def _forecast_submitted_market(
     """
     official_round = 1 if round_no < 0 else round_no
     growth = float(get_setting(conn, "market_growth", 1.10))
+    total_rounds = max(1, int(get_setting(conn, "total_rounds", 5)))
     ma_threshold = float(get_setting(conn, "cpi_ma_large_threshold", 1300))
     price_power = max(1, int(get_setting(conn, "cpi_price_power", 8)))
     players: dict[int, dict[str, Any]] = {}
@@ -437,6 +438,31 @@ def _coordinate_super_bot_prices(
     for row in rows:
         if int(row["agents_after"] or 0) > 0:
             company_rows.setdefault(int(row["id"]), []).append(row)
+    price_led_ids: set[int] = set()
+    for company_id, active_rows in company_rows.items():
+        sample = active_rows[0]
+        if not int(sample["is_super_bot"] or 0):
+            continue
+        workers = max(
+            0,
+            employee_count(conn, company_id, "worker")
+            + int(sample["worker_delta"] or 0),
+        )
+        engineers = max(
+            0,
+            employee_count(conn, company_id, "engineer")
+            + int(sample["engineer_delta"] or 0),
+        )
+        available = (
+            float(sample["product_inventory"] or 0) * 1.2
+            + float(sample["production_volume"] or 0)
+        )
+        ma_index = float(sample["management_investment"] or 0) / max(1, workers + engineers)
+        qi_index = float(sample["quality_investment"] or 0) / max(1.0, available)
+        if ma_index <= 1.01 and qi_index <= 1.01:
+            # Price-led plans may be pure price or price + per-city MI. Both
+            # deliberately chose their undercut in the profit search.
+            price_led_ids.add(company_id)
     prior_sellthrough: dict[int, float] = {}
     for company_id in company_rows:
         prior = one(
@@ -485,6 +511,11 @@ def _coordinate_super_bot_prices(
             if not int(row["is_super_bot"] or 0):
                 continue
             company_id = int(row["id"])
+            if company_id in price_led_ids:
+                # The optimiser explicitly selected price-led competition.
+                # Joint coordination may use it as an external anchor but must
+                # not raise away the deep undercut it just selected.
+                continue
             inventory_crisis = (
                 int(row["product_inventory"] or 0) > 0
                 and prior_sellthrough.get(company_id, 1.0) < 0.80
@@ -577,7 +608,7 @@ def _coordinate_super_bot_prices(
             "UPDATE city_decisions SET price=? WHERE company_id=? AND round_no=? AND city=?",
             (price, company_id, round_no, city),
         )
-    return bool(updates)
+    return bool(updates or price_led_ids)
 
 
 def _rebalance_super_bot_production(
@@ -600,12 +631,22 @@ def _rebalance_super_bot_production(
     remove_agent_cost = float(get_setting(conn, "agent_remove_cost", 100000))
     patent_factor = float(get_setting(conn, "patent_factor", 0.70))
     growth = float(get_setting(conn, "market_growth", 1.10))
+    total_rounds = max(1, int(get_setting(conn, "total_rounds", 5)))
     ma_large_threshold = max(1.0, float(get_setting(conn, "cpi_ma_large_threshold", 1300)))
     ma_index_ceiling = ma_large_threshold * (8000.0 / 1300.0)
     official_round = 1 if round_no < 0 else round_no
 
     market_by_city = {str(market["city"]): market for market in markets}
     _coordinate_super_bot_prices(conn, round_no, markets)
+
+    if (
+        official_round <= max(2, math.ceil(total_rounds * 0.50))
+        and not _all_markets_near_capacity(conn, round_no, markets, threshold=0.60)
+    ):
+        # During the unsaturated expansion phase, keep the maximum affordable
+        # complete-group production selected by the search. Do not trim output
+        # merely to accommodate the current competitors' conservative volume.
+        return
 
     # The candidate search has already compared affordable production levels.
     # This pass may trim newly revealed surplus after simultaneous price
@@ -840,7 +881,12 @@ def _submit_bots(
             max(0, int(math.ceil(math.log2(wealth_multiple)))),
         )
         market_count = int(plan["markets"]) + wealth_expansion + (2 if super_mode else 0)
-        if official_round >= total_rounds:
+        late_market_expansion_round = max(3, math.ceil(total_rounds * 0.65))
+        if super_mode and official_round >= late_market_expansion_round:
+            # Late Super Bots compete everywhere. Leaving cities unopened
+            # wastes market capacity and the independent per-city MI route.
+            market_count = len(markets)
+        elif official_round >= total_rounds:
             market_count += 2
         selected_by_bot[int(bot["id"])] = _selected_markets(bot, markets, min(len(markets), market_count))
     city_competitors: dict[int, int] = {}
@@ -874,12 +920,23 @@ def _submit_bots(
         ))
     )
     progress_total = pending_total + (1 if super_mode and pending_total and not defer_rebalance else 0)
-    # Every Super Bot evaluates the same deterministic synthetic Super field.
-    # A decision saved a few milliseconds earlier in this pass (or before an
-    # interrupted resume) must not become the next Bot's undercut target. The
-    # real saved vector is reconciled synchronously after all Bots exist.
-    frozen_super_ids: set[int] = set()
-    for bot_row in bots:
+    # Later Super Bots see decisions completed earlier in this pass, while
+    # unresolved peers stay synthetic. This preserves resumability and gives
+    # later positions a real opportunity to counter or deeply undercut.
+    frozen_super_ids: set[int] = {
+        int(saved["id"])
+        for saved in bots
+        if one(
+            conn,
+            "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
+            (int(saved["id"]), round_no),
+        )
+        and not (
+            replace_existing
+            and (target_ids is None or int(saved["id"]) in target_ids)
+        )
+    }
+    for bot_position, bot_row in enumerate(bots):
         bot = dict(bot_row)
         company_id = int(bot["id"])
         if target_ids is not None and company_id not in target_ids:
@@ -903,6 +960,12 @@ def _submit_bots(
         ma_round_buffer = rng.uniform(0.96, 1.10)
         super_aggression = rng.uniform(1.12, 1.34)
         super_mi_cap = rng.uniform(2.80, 3.60)
+        sequence_strength = 1.0 + 0.18 * bot_position / max(1, len(bots) - 1)
+        if super_mode:
+            # Later Super Bots have observed more real decisions. Convert that
+            # information advantage into a wider, still capped response range.
+            super_aggression *= sequence_strength
+            super_mi_cap = min(6.0, super_mi_cap * sequence_strength)
         normal_price_factor = rng.uniform(0.978, 0.994)
         aggressive_price_factor = rng.uniform(0.935, 0.968)
         home = str(bot["home_city"] or markets[profile % len(markets)]["city"])
@@ -945,6 +1008,9 @@ def _submit_bots(
             agent_variation = rng.choice((-1, 0, 0, 0, 1))
             desired = max(1, int(plan["agents"]) + agent_variation) if index in selected else current
             delta = max(-current, min(max_agent_add, desired - current))
+            if super_mode:
+                # Never pay to remove a 10%-MI amplifier or abandon a city.
+                delta = max(0, delta)
             agent_plan[index] = (delta, current + delta)
             if delta > 0:
                 agent_cost += delta * add_agent_cost
@@ -1179,7 +1245,14 @@ def _submit_bots(
             ),
             reverse=True,
         )
-        mi_selected = set(mi_priority[:mi_city_limit]) if use_mi else set()
+        if super_mode and use_mi:
+            # MI owns an independent 20-CPI pool in every city. Once the route
+            # is active, fund every opened market rather than only a shortlist.
+            mi_selected = {
+                index for index in selected if agent_plan[index][1] > 0
+            }
+        else:
+            mi_selected = set(mi_priority[:mi_city_limit]) if use_mi else set()
 
         # Choose the CPI indices first. The affordable production count is then
         # derived from the strategy guide's complete group cost; investment is
@@ -1746,9 +1819,27 @@ def _submit_bots(
                 candidate_mi_ratio: float,
                 candidate_price_ratio: float,
             ) -> dict[str, Any]:
+                pure_price_route = bool(
+                    candidate_ma <= 1.00000001
+                    and candidate_qi <= 1.00000001
+                    and candidate_mi_ratio <= 1e-12
+                )
+                resolved_mi_ratio = candidate_mi_ratio
+                if super_mode and use_mi and not pure_price_route:
+                    # MA/QI naturally compound as the field invests more. MI is
+                    # city-specific, so enforce the same progression separately
+                    # in every opened city. Only a true pure-price route may use
+                    # zero MI; there is no half-open MI strategy.
+                    mi_phase_floor = min(
+                        mi_ratio_ceiling,
+                        1.02
+                        + max(0, plan_index - 2) * 0.55
+                        + (sequence_strength - 1.0) * 2.0,
+                    )
+                    resolved_mi_ratio = max(resolved_mi_ratio, mi_phase_floor)
                 candidate_marketing = {
                     index: (
-                        mi_thresholds.get(index, 0.0) * candidate_mi_ratio
+                        mi_thresholds.get(index, 0.0) * resolved_mi_ratio
                         if index in mi_selected and agent_plan[index][1] > 0 else 0.0
                     )
                     for index in selected
@@ -1842,7 +1933,13 @@ def _submit_bots(
                         / max(1.0, group["products"])
                     )),
                 )
-                if profitable_group_limit < candidate_groups:
+                early_expansion = bool(
+                    official_round <= max(2, math.ceil(total_rounds * 0.50))
+                    and not all_markets_full
+                    and market_pressure < 0.60
+                    and prior_surplus_ratio < 0.20
+                )
+                if not early_expansion and profitable_group_limit < candidate_groups:
                     candidate_groups = profitable_group_limit
                     candidate_production = int(math.floor(candidate_groups * group["products"]))
                     candidate_available = old_products + candidate_production
@@ -1890,6 +1987,7 @@ def _submit_bots(
                     "price_ratio": candidate_price_ratio,
                     "coverage": cpi_coverage,
                     "predicted_profit": predicted_profit,
+                    "predicted_sold": predicted_sold,
                     "sell_ratio": sell_ratio,
                 }
 
@@ -1915,6 +2013,7 @@ def _submit_bots(
                 (leader_ma, leader_qi, leader_mi_ratio),
             }
             best_candidate: dict[str, Any] | None = None
+            best_deep_price_candidate: dict[str, Any] | None = None
             candidate_cache: dict[tuple[float, float, float, float], dict[str, Any]] = {}
 
             def test_candidate(
@@ -1923,7 +2022,7 @@ def _submit_bots(
                 candidate_mi_ratio: float,
                 candidate_price_ratio: float,
             ) -> dict[str, Any]:
-                nonlocal best_candidate
+                nonlocal best_candidate, best_deep_price_candidate
                 key = (
                     round(candidate_ma, 8), round(candidate_qi, 8),
                     round(candidate_mi_ratio, 8), round(candidate_price_ratio, 8),
@@ -1939,6 +2038,17 @@ def _submit_bots(
                     candidate_cache[key] = candidate
                 if best_candidate is None or candidate["score"] > best_candidate["score"]:
                     best_candidate = candidate
+                if (
+                    candidate_ma <= 1.00000001
+                    and candidate_qi <= 1.00000001
+                    and candidate_price_ratio <= 0.65
+                    and float(candidate.get("predicted_profit", -math.inf)) >= 0
+                    and (
+                        best_deep_price_candidate is None
+                        or candidate["score"] > best_deep_price_candidate["score"]
+                    )
+                ):
+                    best_deep_price_candidate = candidate
                 return candidate
 
             for candidate_price_ratio in sorted(price_ratio_candidates, reverse=True):
@@ -1960,6 +2070,33 @@ def _submit_bots(
                             high_scale = scale
                         else:
                             low_scale = scale
+
+            # The last sequential Super Bot may take a genuine price-led route
+            # when it captures materially more demand and still keeps most of
+            # the maximum-profit plan. It may be aggressive, never suicidal.
+            if best_candidate is not None and best_deep_price_candidate is not None:
+                best_profit = max(0.0, float(best_candidate.get("predicted_profit", 0.0)))
+                best_sold = max(1.0, float(best_candidate.get("predicted_sold", 0.0)))
+                deep_profit = float(best_deep_price_candidate.get("predicted_profit", 0.0))
+                deep_sold = float(best_deep_price_candidate.get("predicted_sold", 0.0))
+                is_last_pending_super = not any(
+                    (target_ids is None or int(later["id"]) in target_ids)
+                    and (
+                        replace_existing
+                        or not one(
+                            conn,
+                            "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
+                            (int(later["id"]), round_no),
+                        )
+                    )
+                    for later in bots[bot_position + 1:]
+                )
+                if (
+                    is_last_pending_super
+                    and deep_sold >= best_sold * 1.20
+                    and (best_profit <= 0 or deep_profit >= best_profit * 0.72)
+                ):
+                    best_candidate = best_deep_price_candidate
 
             if best_candidate is not None:
                 ma_index_target = float(best_candidate["ma"])
@@ -2047,6 +2184,7 @@ def _submit_bots(
         # A rerun resumes after this saved Bot instead of rebuilding it.
         if super_mode:
             conn.commit()
+            frozen_super_ids.add(company_id)
         submitted += 1
         if progress_callback:
             progress_callback(submitted, max(1, progress_total), str(bot["code"]))

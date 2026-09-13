@@ -144,6 +144,33 @@ class BotKDSRegressionTest(unittest.TestCase):
                     else:
                         self.assertTrue(all(delta > 3 for delta in additions), additions)
 
+    def test_late_super_bot_opens_every_city_never_removes_agents_and_has_no_partial_mi(self):
+        super_id = self.company("SUPER-LATE", super_mode=True, cash=1_000_000_000)
+        self.db.set_setting(self.conn, "total_rounds", 7)
+        self.conn.execute("INSERT INTO rounds(round_no,status) VALUES(5,'open')")
+        for city in ("广州", "深圳"):
+            self.conn.execute(
+                "INSERT INTO agents(company_id,city,count) VALUES(?,?,10)",
+                (super_id, city),
+            )
+
+        self.assertEqual(
+            self.bots.submit_super_bot_decisions(
+                self.conn, 5, replace_existing=True, defer_rebalance=True,
+            ),
+            1,
+        )
+        rows = [dict(row) for row in self.db.all_rows(
+            self.conn,
+            "SELECT city,agent_delta,marketing_investment FROM city_decisions "
+            "WHERE company_id=? AND round_no=5 ORDER BY city",
+            (super_id,),
+        )]
+        self.assertEqual({row["city"] for row in rows}, {"广州", "深圳"})
+        self.assertTrue(all(int(row["agent_delta"]) == 0 for row in rows), rows)
+        funded = [float(row["marketing_investment"] or 0) > 0 for row in rows]
+        self.assertEqual(sum(funded), len(rows), rows)
+
     def test_global_saturation_uses_one_latest_round_not_historical_peaks(self):
         markets = [dict(row) for row in self.db.all_rows(
             self.conn, "SELECT * FROM market_config ORDER BY city",
@@ -228,6 +255,11 @@ class BotKDSRegressionTest(unittest.TestCase):
         self.assertEqual(float(decision["management_investment"]), 0.0)
         self.assertEqual(float(decision["quality_investment"]), 0.0)
         self.assertEqual(float(marketing["total"] or 0), 0.0)
+        price = self.db.one(
+            self.conn, "SELECT price FROM city_decisions WHERE company_id=? "
+            "AND round_no=5 AND city='广州'", (super_id,),
+        )
+        self.assertEqual(float(price["price"]), 6000.0)
 
 
 if __name__ == "__main__":
