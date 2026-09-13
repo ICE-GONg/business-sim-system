@@ -42,7 +42,7 @@ if (
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 4
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 10
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 11
     or getattr(_bots_module, "BOT_API_VERSION", 0) < 23
 ):
     importlib.invalidate_caches()
@@ -979,6 +979,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         ("市场报告 / Market report", -float(finance.get("market_reports", 0.0)), 0.0),
         ("贷款利息 / Debt interest", 0.0, float(finance.get("interest", 0.0))),
         ("税费 / Tax", -float(finance.get("tax", 0.0)), 0.0),
+        ("奖励 / Bonus", float(finance.get("project_bonus", 0.0)), 0.0),
     ]
     finance_rows = []
     for label, cash_flow, debt_change in finance_items:

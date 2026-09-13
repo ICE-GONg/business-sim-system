@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 10
+ENGINE_API_VERSION = 11
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -829,6 +829,17 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
     for company_id, state in states.items():
         company = state["company"]
         home = state["home"]
+        bonus_row = one(
+            conn,
+            "SELECT amount FROM round_bonuses WHERE company_id=? AND round_no=?",
+            (company_id, round_no),
+        )
+        project_bonus = float(bonus_row["amount"]) if bonus_row else 0.0
+        # The round-start controller has already credited this amount so it is
+        # available for wages, production and investment immediately.  The
+        # report moves it out of "Round begins" and presents it after tax;
+        # settlement must not credit it for a second time.
+        report_round_begins = float(company["cash"]) - project_bonus
         revenue = 0.0
         requested_transport_total = 0.0
         sold = 0
@@ -913,7 +924,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         report = {
             "key_metrics": {"total_assets": total_assets, "debt": debt, "net_assets": net_assets, "sales_revenue": revenue, "cost": total_cost, "net_profit": net_profit, "inventory_book_value": inventory_book_value},
             "finance": {
-                "round_begins": company["cash"], "starting_debt": company["debt"], "loan_base_net_assets": state["loan_base_net_assets"],
+                "round_begins": report_round_begins, "starting_debt": company["debt"], "loan_base_net_assets": state["loan_base_net_assets"],
                 "loan_ceiling": state["loan_ceiling"], "loan_limit": state["loan_limit"], "loan_change": state["loan_change"],
                 "worker_wages": state["worker_wage_cost"], "engineer_wages": state["engineer_wage_cost"], "wages": state["wage_cost"],
                 "layoff": state["layoff_cost"], "layoff_cash": state["layoff_cash"], "layoff_debt": state["layoff_debt"],
@@ -923,7 +934,8 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "component_storage": state["component_storage_cost"], "product_storage": state["product_storage_cost"],
                 "materials": state["component_material_cost"] + state["product_material_cost"], "storage": state["storage_cost"],
                 "agents": state["agent_cost"], "marketing": state["marketing_total"], "quality": state["quality"], "management": state["management"],
-                "sales_revenue": revenue, "research": research, "market_reports": total_report_cost, "transport": transport_cost, "interest": interest, "tax": tax, "round_ends": cash,
+                "sales_revenue": revenue, "research": research, "market_reports": total_report_cost, "transport": transport_cost, "interest": interest, "tax": tax,
+                "project_bonus": project_bonus, "round_ends": cash,
             },
             "human_resources": {
                 "workers": state["workers"], "engineers": state["engineers"], "previous_workers": state["previous_workers"], "previous_engineers": state["previous_engineers"],

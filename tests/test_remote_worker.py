@@ -92,6 +92,20 @@ class RemoteWorkerTests(unittest.TestCase):
             remote.apply_remote_result(self.conn, request, result)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
 
+    def test_remote_analysis_is_always_saved_as_draft(self):
+        self.calls = []
+        request = remote.create_remote_request(self.conn, 1, company_id=1)
+        result = self.dispatch("https://example.test", "token", request)
+        # Simulate a worker package from before the draft flag existed in its
+        # submission path.  The receiving app remains authoritative.
+        result["decisions"][0]["is_draft"] = 0
+        remote.apply_remote_result(self.conn, request, result)
+        row = self.conn.execute(
+            "SELECT submitted_at,is_draft FROM decisions WHERE company_id=1 AND round_no=1"
+        ).fetchone()
+        self.assertIsNotNone(row["submitted_at"])
+        self.assertEqual(row["is_draft"], 1)
+
     def test_interrupt_resumes_saved_bots_and_final_rebalance(self):
         self.calls = []
         progress = []

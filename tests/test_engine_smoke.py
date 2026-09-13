@@ -23,6 +23,15 @@ class SettlementSmokeTest(unittest.TestCase):
                 db.set_setting(conn, "transport_cost", 123)
                 companies = db.all_rows(conn, "SELECT * FROM companies ORDER BY id")
                 conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+                project_bonus = 123_456
+                conn.execute(
+                    "UPDATE companies SET cash=cash+? WHERE id=?",
+                    (project_bonus, companies[0]["id"]),
+                )
+                conn.execute(
+                    "INSERT INTO round_bonuses(company_id,round_no,amount,created_at) VALUES(?,?,?,?)",
+                    (companies[0]["id"], 1, project_bonus, db.now_iso()),
+                )
                 for company in companies:
                     conn.execute(
                         "UPDATE companies SET home_city='广州',setup_submitted_at=? WHERE id=?",
@@ -77,12 +86,15 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
                 self.assertGreater(len(pdf_bytes), 7_000)
                 finance = report["finance"]
+                self.assertEqual(finance["project_bonus"], project_bonus)
+                self.assertEqual(finance["round_begins"], companies[0]["cash"])
                 expected_cash = (
                     finance["round_begins"] + finance["loan_change"]
                     - finance["wages"] - finance["layoff"] - finance["training"]
                     - finance["materials"] - finance["storage"] - finance["agents"]
                     - finance["marketing"] - finance["quality"] - finance["management"]
                     + finance["sales_revenue"] - finance["research"] - finance["market_reports"] - finance["transport"] - finance["tax"]
+                    + finance["project_bonus"]
                 )
                 self.assertAlmostEqual(finance["round_ends"], expected_cash)
                 taxable_profit = report["key_metrics"]["sales_revenue"] - (report["key_metrics"]["cost"] - finance["tax"])

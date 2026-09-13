@@ -312,8 +312,17 @@ def apply_remote_result(conn: sqlite3.Connection, request: dict, result: dict,
             for company_id in allowed_ids:
                 conn.execute(f'DELETE FROM "{table}" WHERE company_id=? AND round_no=?', (company_id, round_no))
             quoted = ",".join('"' + c + '"' for c in columns)
+            rows_to_insert = []
+            for row in result[table]:
+                values = dict(row)
+                # A remote Super Bot calculation is always an editable draft.
+                # Do not trust an older worker package to set this new column;
+                # only the explicit admin submit action may formalise it.
+                if table == "decisions" and "is_draft" in columns:
+                    values["is_draft"] = 1
+                rows_to_insert.append([values[c] for c in columns])
             conn.executemany(f'INSERT INTO "{table}" ({quoted}) VALUES ({",".join("?" for _ in columns)})',
-                             [[r[c] for c in columns] for r in result[table]])
+                             rows_to_insert)
         if commit:
             conn.commit()
     except BaseException:
