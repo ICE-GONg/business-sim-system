@@ -33,7 +33,7 @@ class RemoteRollbackAppTests(unittest.TestCase):
         db.init_db()
 
     def prepare(self, *, super_bot=True, human=False):
-        from sim.bots import submit_bot_decisions, submit_super_bot_decisions
+        from sim.bots import finalize_super_bot_decisions, submit_bot_decisions, submit_super_bot_decisions
         from sim.engine import settle_round
 
         with self.db.connect() as conn:
@@ -55,6 +55,8 @@ class RemoteRollbackAppTests(unittest.TestCase):
                 # Preserve an ordinary generated decision as the human's
                 # submitted test decision; rollback must make it a draft.
                 conn.execute("UPDATE companies SET is_bot=0 WHERE id=?", (ids[-1],))
+            if super_bot:
+                finalize_super_bot_decisions(conn, 1)
             settle_round(conn, 1)
         self.calls = []
         self.at = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=30)
@@ -85,9 +87,21 @@ class RemoteRollbackAppTests(unittest.TestCase):
         self.assertFalse(self.at.exception)
         self.assertEqual(self.calls, ["bot", "rebalance"])
         with self.db.connect() as conn:
-            self.assertEqual(self.db.one(conn, "SELECT COUNT(*) AS n FROM decisions WHERE submitted_at IS NOT NULL")["n"], 4)
+            self.assertEqual(self.db.one(conn, "SELECT COUNT(*) AS n FROM decisions WHERE submitted_at IS NOT NULL AND is_draft=0")["n"], 3)
+            self.assertEqual(self.db.one(conn, "SELECT COUNT(*) AS n FROM decisions WHERE is_draft=1")["n"], 1)
             self.assertEqual(self.db.one(conn, "SELECT phase FROM super_bot_remote_jobs WHERE round_no=1")["phase"], "done")
         self.assertTrue(any("已撤销第 1 轮" in item.value for item in self.at.success))
+        submit_all = next(
+            item for item in self.at.button
+            if item.label == "正式提交全部 Super Bot 决策"
+        )
+        self.assertFalse(submit_all.disabled)
+        submit_all.click().run()
+        self.assertFalse(self.at.exception)
+        with self.db.connect() as conn:
+            self.assertEqual(self.db.one(conn, "SELECT COUNT(*) AS n FROM decisions WHERE submitted_at IS NOT NULL AND is_draft=0")["n"], 4)
+            self.assertEqual(self.db.one(conn, "SELECT COUNT(*) AS n FROM decisions WHERE is_draft=1")["n"], 0)
+        self.assertTrue(any("已正式提交并锁定" in item.value for item in self.at.success))
 
     def test_remote_interruption_does_not_undo_or_repeat_rollback(self):
         from sim.remote_worker import RemoteWorkerError

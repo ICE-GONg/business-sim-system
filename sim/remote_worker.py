@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .defaults import DEFAULT_SETTINGS
 
 PROTOCOL = 2
-REMOTE_API_VERSION = 3
+REMOTE_API_VERSION = 4
 TABLES = ("settings", "companies", "employee_cohorts", "market_config", "rounds",
           "decisions", "city_decisions", "agents", "results", "city_results", "market_round_stats")
 _LOCK = threading.Lock()
@@ -383,12 +383,13 @@ def remote_pending(conn: sqlite3.Connection, round_no: int) -> bool:
         ).fetchone())
     if row[0] != "done":
         return True
-    # A completed analysis becomes pending again if KDS, player decisions, or
-    # any other authoritative input changes before settlement.
+    # A completed analysis becomes pending again only when an analysis input
+    # changes. Admin edits to the saved Super Bot drafts are intentional and
+    # must not force the whole batch to be analysed again.
     if not row[2] or not row[3]:
         return True
-    input_hash, state_hash = _job_fingerprints(conn, round_no)
-    return input_hash != row[2] or state_hash != row[3]
+    input_hash, _ = _job_fingerprints(conn, round_no)
+    return input_hash != row[2]
 
 
 def mark_remote_job_complete(
@@ -539,8 +540,8 @@ def assert_remote_job_current(conn: sqlite3.Connection, round_no: int) -> None:
         or not row[3]
     ):
         raise RemoteAnalysisChangedError("超级 Bot 分析尚未完整结束，请继续分析。")
-    input_hash, state_hash = _job_fingerprints(conn, round_no)
-    if input_hash != row[2] or state_hash != row[3]:
+    input_hash, _ = _job_fingerprints(conn, round_no)
+    if input_hash != row[2]:
         raise RemoteAnalysisChangedError(
             "KDS 或比赛输入在分析后发生变化，请重新分析超级 Bot 后再结算。"
         )
@@ -595,16 +596,13 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
             (round_no,),
         ).fetchone()
         current_input_hash, current_state_hash = _job_fingerprints(conn, round_no)
+        # A completed job is a finished draft generation. Pressing analyse
+        # again must start a new batch and replace those drafts; only a truly
+        # unfinished job may resume its pending list.
         resume_existing = bool(
             existing_job
             and existing_job[0] == round_start
-            and (
-                existing_job[1] != "done"
-                or not existing_job[2]
-                or not existing_job[3]
-                or existing_job[2] != current_input_hash
-                or existing_job[3] != current_state_hash
-            )
+            and existing_job[1] != "done"
         )
         if not resume_existing:
             has_untracked_decisions = bool(conn.execute(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -17,7 +18,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 4
+DB_API_VERSION = 6
 
 
 def now_iso() -> str:
@@ -174,6 +175,7 @@ def init_db() -> None:
                 quality_investment REAL NOT NULL DEFAULT 0,
                 research_investment REAL NOT NULL DEFAULT 0,
                 submitted_at TEXT,
+                is_draft INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(company_id,round_no),
                 FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
             );
@@ -271,6 +273,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE companies ADD COLUMN is_super_bot INTEGER NOT NULL DEFAULT 0")
         if "bot_profile" not in company_columns:
             conn.execute("ALTER TABLE companies ADD COLUMN bot_profile INTEGER NOT NULL DEFAULT 0")
+        decision_columns = {row["name"] for row in all_rows(conn, "PRAGMA table_info(decisions)")}
+        if "is_draft" not in decision_columns:
+            conn.execute("ALTER TABLE decisions ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0")
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
         count = one(conn, "SELECT COUNT(*) AS n FROM market_config")
@@ -350,7 +355,7 @@ def submission_status(conn: sqlite3.Connection, round_no: int) -> dict[str, int 
     total_row = one(conn, "SELECT COUNT(*) AS n FROM companies")
     submitted_row = one(
         conn,
-        "SELECT COUNT(*) AS n FROM decisions WHERE round_no=? AND submitted_at IS NOT NULL",
+        "SELECT COUNT(*) AS n FROM decisions WHERE round_no=? AND submitted_at IS NOT NULL AND is_draft=0",
         (round_no,),
     )
     total = int(total_row["n"] if total_row else 0)
@@ -603,9 +608,14 @@ def reset_competition(conn: sqlite3.Connection) -> None:
         conn.execute(f"DELETE FROM {table}")
     initial_cash = get_setting(conn, "initial_cash", 15_000_000)
     homes = [str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config WHERE home_enabled=1 ORDER BY city")]
+    ranked_super_homes = ranked_bot_home_cities(conn)
     for company in all_rows(conn, "SELECT id,code,is_bot,is_super_bot,bot_profile FROM companies ORDER BY id"):
         if bool(company["is_bot"]) and homes:
-            home = homes[int(company["bot_profile"] or 0) % len(homes)]
+            home_pool = ranked_super_homes if bool(company["is_super_bot"]) and ranked_super_homes else homes
+            # Keep Super Bots diverse without assigning them to weak homes:
+            # rotate only through the strongest third of the live KDS ranking.
+            pool_size = max(1, math.ceil(len(home_pool) / 3)) if bool(company["is_super_bot"]) else len(home_pool)
+            home = home_pool[int(company["bot_profile"] or 0) % pool_size]
             conn.execute(
                 "UPDATE companies SET name=?,home_city=?,setup_submitted_at=?,cash=?,debt=0,patents=0,research_balance=0,"
                 "component_inventory=0,product_inventory=0,component_storage_capacity=0,product_storage_capacity=0 WHERE id=?",
@@ -620,6 +630,69 @@ def reset_competition(conn: sqlite3.Connection) -> None:
             )
     set_setting(conn, "test_round_enabled", 0)
     conn.execute("INSERT INTO rounds(round_no,status) VALUES(1,'waiting')")
+
+
+def ranked_bot_home_cities(conn: sqlite3.Connection) -> list[str]:
+    """Rank KDS homes by production cost and transport-adjusted market size."""
+    markets = [dict(row) for row in all_rows(
+        conn,
+        "SELECT * FROM market_config WHERE home_enabled=1 ORDER BY city",
+    )]
+    if not markets:
+        return []
+    worker_need = float(get_setting(conn, "component_workers", 3))
+    worker_hours = float(get_setting(conn, "component_hours", 7))
+    engineer_need = float(get_setting(conn, "product_engineers", 4))
+    engineer_hours = float(get_setting(conn, "product_hours", 14))
+    component_need = max(1.0, float(get_setting(conn, "components_per_product", 7)))
+    transport = max(0.0, float(get_setting(conn, "transport_cost", 0)))
+    scored: list[dict[str, float | str]] = []
+    for market in markets:
+        component_labor = (
+            worker_need * worker_hours / 504.0
+            * float(market["worker_initial_salary"]) * 3.0
+        )
+        product_labor = (
+            engineer_need * engineer_hours / 504.0
+            * float(market["engineer_initial_salary"]) * 3.0
+        )
+        unit_cost = (
+            component_need * (
+                float(market["component_material"])
+                + float(market["component_storage"])
+                + component_labor
+            )
+            + float(market["product_material"])
+            + float(market["product_storage"])
+            + product_labor
+        )
+        market_size = max(1.0, float(market["population"]) * float(market["penetration"]))
+        scored.append({"city": str(market["city"]), "cost": unit_cost, "size": market_size})
+    costs = [float(row["cost"]) for row in scored]
+    sizes = [math.log1p(float(row["size"])) for row in scored]
+    cost_span = max(costs) - min(costs)
+    size_span = max(sizes) - min(sizes)
+    typical_cost = sorted(costs)[len(costs) // 2]
+    # When transport is expensive, a large home market avoids more outbound
+    # freight. With little/no transport, production cost remains dominant.
+    size_weight = min(0.72, transport / max(1.0, typical_cost + transport))
+    for row, logged_size in zip(scored, sizes):
+        cost_score = (
+            (max(costs) - float(row["cost"])) / cost_span
+            if cost_span > 1e-9 else 1.0
+        )
+        size_score = (
+            (logged_size - min(sizes)) / size_span
+            if size_span > 1e-9 else 1.0
+        )
+        row["score"] = cost_score * (1.0 - size_weight) + size_score * size_weight
+    return [
+        str(row["city"])
+        for row in sorted(
+            scored,
+            key=lambda row: (-float(row["score"]), float(row["cost"]), -float(row["size"]), str(row["city"])),
+        )
+    ]
 
 
 def delete_company(conn: sqlite3.Connection, company_id: int) -> None:

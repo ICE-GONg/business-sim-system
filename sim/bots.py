@@ -15,7 +15,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 21
+BOT_API_VERSION = 23
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -380,8 +380,6 @@ def _coordinate_super_bot_prices(
     price_min = float(get_setting(conn, "price_min", 3500))
     global_price_max = float(get_setting(conn, "price_max", 25000))
     growth = float(get_setting(conn, "market_growth", 1.10))
-    ma_threshold = max(1.0, float(get_setting(conn, "cpi_ma_large_threshold", 1300)))
-    qi_safe_multiplier = max(1.0, float(get_setting(conn, "qi_safe_multiplier", 1.10)))
     worker_need = float(get_setting(conn, "component_workers", 3))
     worker_hours = float(get_setting(conn, "component_hours", 7))
     engineer_need = float(get_setting(conn, "product_engineers", 4))
@@ -389,10 +387,6 @@ def _coordinate_super_bot_prices(
     component_need = max(1, int(round(get_setting(conn, "components_per_product", 7))))
     patent_factor = float(get_setting(conn, "patent_factor", 0.70))
     transport_cost = float(get_setting(conn, "transport_cost", 0))
-    worker_training = float(get_setting(conn, "worker_training_cost", 0))
-    engineer_training = float(get_setting(conn, "engineer_training_cost", 0))
-    add_agent_cost = float(get_setting(conn, "agent_add_cost", 300000))
-    remove_agent_cost = float(get_setting(conn, "agent_remove_cost", 100000))
     market_by_city = {str(market["city"]): market for market in markets}
 
     previous_stats: dict[str, dict[str, float]] = {}
@@ -460,135 +454,6 @@ def _coordinate_super_bot_prices(
             if prior and previous_available > 0 else 1.0
         )
 
-    # Two stable personality families deliberately use the price route once it
-    # is unlocked.  Their CPI spend is expressed as live KDS threshold
-    # multiples, not copied cash values.  Without this specialization every
-    # profit maximizer converges on maximum MA+QI and the field becomes both
-    # homogeneous and unnecessarily expensive.
-    strategic_ids = {
-        int(row["id"])
-        for row in rows
-        if int(row["is_super_bot"] or 0)
-        and (
-            int(row["bot_profile"] or row["id"]) % 7 in (0, 5)
-            or float(row["price"] or 0) < previous_stats[str(row["city"])]["average"]
-            or (
-                int(row["product_inventory"] or 0) > 0
-                and prior_sellthrough.get(int(row["id"]), 1.0) < 0.80
-            )
-        )
-    }
-    for company_id in strategic_ids:
-        sample = next(row for row in rows if int(row["id"]) == company_id)
-        profile = int(sample["bot_profile"] or company_id) % 7
-        workers = max(
-            0,
-            employee_count(conn, company_id, "worker") + int(sample["worker_delta"] or 0),
-        )
-        engineers = max(
-            0,
-            employee_count(conn, company_id, "engineer") + int(sample["engineer_delta"] or 0),
-        )
-        production = max(0, int(sample["production_volume"] or 0))
-        old_components = max(0, int(sample["component_inventory"] or 0))
-        old_products = max(0, int(sample["product_inventory"] or 0))
-        individuality = (company_id % 5) * 0.0125
-        active_rows_for_company = [
-            row for row in rows
-            if int(row["id"]) == company_id and int(row["agents_after"] or 0) > 0
-        ]
-        active_caps = [
-            float(market_by_city[str(row["city"])]["max_price"])
-            for row in active_rows_for_company
-        ]
-        qi_line = max(active_caps, default=global_price_max) / 50.0
-        ma_index = (
-            ma_threshold * (1.02 + individuality)
-            if profile in (1, 4, 6) else 1.0 + individuality
-        )
-        qi_index = (
-            qi_line * qi_safe_multiplier * (1.0 + individuality)
-            if profile in (2, 4, 5) else 1.0 + individuality
-        )
-        proposed_management = ma_index * max(1, workers + engineers)
-        proposed_quality = qi_index * max(1.0, old_products * 1.2 + production)
-        proposed_marketing: dict[str, float] = {}
-        for city_row in active_rows_for_company:
-            city = str(city_row["city"])
-            agents = max(1, int(city_row["agents_after"] or 0))
-            city_market = market_by_city[city]
-            size = (
-                float(city_market["population"])
-                * float(city_market["penetration"])
-                * growth ** max(0, official_round - 1)
-            )
-            mi_line = (float(city_market["max_price"]) / 50.0) * size * 0.20
-            mi_line /= (1.0 + agents * 0.10) * 1.5 * 2.0
-            marketing = mi_line * (1.02 + individuality) if profile == 3 else 0.0
-            proposed_marketing[city] = marketing
-
-        # Settlement pays wages, production, storage and Agent changes before
-        # MI -> QI -> MA.  Keep the specialised CPI mix inside the same live
-        # KDS cash envelope so a nominal decision never relies on settlement
-        # silently truncating its investments.
-        home = market_by_city.get(str(sample["home_city"]), markets[0])
-        material_factor = patent_factor ** int(sample["patents"] or 0)
-        components_to_make = max(0, production * component_need - old_components)
-        base_cost = (
-            workers * float(sample["worker_salary"] or home["worker_initial_salary"]) * 3
-            + engineers * float(sample["engineer_salary"] or home["engineer_initial_salary"]) * 3
-            + max(0, int(sample["worker_delta"] or 0)) * worker_training
-            + max(0, int(sample["engineer_delta"] or 0)) * engineer_training
-            + max(0, -int(sample["worker_delta"] or 0))
-            * float(sample["worker_salary"] or home["worker_initial_salary"])
-            + max(0, -int(sample["engineer_delta"] or 0))
-            * float(sample["engineer_salary"] or home["engineer_initial_salary"])
-            + components_to_make * float(home["component_material"]) * material_factor
-            + production * float(home["product_material"]) * material_factor
-            + max(
-                0,
-                old_components + components_to_make
-                - int(sample["component_storage_capacity"] or 0),
-            ) * float(home["component_storage"])
-            + max(
-                0,
-                old_products + production
-                - int(sample["product_storage_capacity"] or 0),
-            ) * float(home["product_storage"])
-        )
-        all_company_rows = [row for row in rows if int(row["id"]) == company_id]
-        base_cost += sum(
-            int(row["agent_delta"] or 0) * add_agent_cost
-            if int(row["agent_delta"] or 0) > 0
-            else -int(row["agent_delta"] or 0) * remove_agent_cost
-            for row in all_company_rows
-        )
-        remaining = max(
-            0.0,
-            float(sample["cash"] or 0) + max(0.0, float(sample["loan_change"] or 0))
-            - base_cost,
-        )
-        paid_marketing: dict[str, float] = {}
-        for city_row in sorted(all_company_rows, key=lambda row: str(row["city"])):
-            city = str(city_row["city"])
-            requested = max(0.0, proposed_marketing.get(city, 0.0))
-            paid_marketing[city] = min(requested, remaining)
-            remaining -= paid_marketing[city]
-        paid_quality = min(max(0.0, proposed_quality), remaining)
-        remaining -= paid_quality
-        paid_management = min(max(0.0, proposed_management), remaining)
-        conn.execute(
-            "UPDATE decisions SET management_investment=?,quality_investment=? "
-            "WHERE company_id=? AND round_no=?",
-            (paid_management, paid_quality, company_id, round_no),
-        )
-        for city, marketing in paid_marketing.items():
-            conn.execute(
-                "UPDATE city_decisions SET marketing_investment=? "
-                "WHERE company_id=? AND round_no=? AND city=?",
-                (marketing, company_id, round_no, city),
-            )
-
     forecast = _forecast_submitted_market(conn, round_no, markets)
     forecast_companies = forecast["companies"]
 
@@ -602,6 +467,10 @@ def _coordinate_super_bot_prices(
         for company_id, active_rows in company_rows.items()
     }
     updates: list[tuple[float, int, str]] = []
+    original_prices = {
+        (int(row["id"]), str(row["city"])): float(row["price"] or 0)
+        for row in rows
+    }
     for market in markets:
         city = str(market["city"])
         base_average = previous_stats[city]["average"]
@@ -620,12 +489,9 @@ def _coordinate_super_bot_prices(
                 int(row["product_inventory"] or 0) > 0
                 and prior_sellthrough.get(company_id, 1.0) < 0.80
             )
-            personality = int(row["bot_profile"] or company_id) % 7
-            strategic_price_route = personality in (0, 5)
             if (
                 float(row["price"] or 0) < base_average
                 or inventory_crisis
-                or strategic_price_route
             ):
                 specialists.append(row)
         if not specialists:
@@ -657,6 +523,15 @@ def _coordinate_super_bot_prices(
                 + (transport_cost if city != str(row["home_city"]) else 0.0)
             )
             available = float(row["product_inventory"] or 0) + float(row["production_volume"] or 0)
+            company_marketing = sum(
+                float(item["marketing_investment"] or 0)
+                for item in company_rows.get(company_id, [])
+            )
+            investment_unit_cost = (
+                float(row["management_investment"] or 0)
+                + float(row["quality_investment"] or 0)
+                + company_marketing
+            ) / max(1.0, available)
             active_size = max(1.0, company_active_size.get(company_id, market_size))
             personality = int(row["bot_profile"] or company_id) % 7
             sellthrough_target = 0.78 + personality * 0.01
@@ -674,7 +549,7 @@ def _coordinate_super_bot_prices(
                 key=company_id,
                 target_share=requested_share,
                 share_cap=0.24,
-                cost_floor=max(price_min, direct_cost * 1.04),
+                cost_floor=max(price_min, (direct_cost + investment_unit_cost) * 1.04),
             ))
         solved = solve_joint_prices(
             base_average=base_average,
@@ -687,7 +562,15 @@ def _coordinate_super_bot_prices(
             zero_external_anchor_gap=0.025,
         )
         for company_id, result in solved.items():
-            updates.append((round(float(result.price), 2), int(company_id), city))
+            # Joint coordination may spread the price CPI, but it must never
+            # push a profit-selected candidate below its own price. Production
+            # can be controlled instead; forced undercutting caused the old
+            # final-round crashes.
+            safe_price = max(
+                float(result.price),
+                original_prices.get((int(company_id), city), price_min),
+            )
+            updates.append((round(safe_price, 2), int(company_id), city))
 
     for price, company_id, city in updates:
         conn.execute(
@@ -702,7 +585,7 @@ def _rebalance_super_bot_production(
     round_no: int,
     markets: list[dict[str, Any]],
 ) -> None:
-    """Use full-group cash, then taper only genuinely surplus CPI spending."""
+    """Reconcile joint CPI without overriding profit-selected production."""
     worker_need = float(get_setting(conn, "component_workers", 3))
     worker_hours = float(get_setting(conn, "component_hours", 7))
     engineer_need = float(get_setting(conn, "product_engineers", 4))
@@ -722,128 +605,12 @@ def _rebalance_super_bot_production(
     official_round = 1 if round_no < 0 else round_no
 
     market_by_city = {str(market["city"]): market for market in markets}
-    all_markets_full = _all_markets_near_capacity(conn, round_no, markets)
     _coordinate_super_bot_prices(conn, round_no, markets)
 
-    # Deploy idle capital before the joint CPI/production convergence. Only a
-    # fraction of the gap is assigned to indices; the rest stays available to
-    # build the complete production groups unlocked by that extra CPI.
-    for row in ([] if all_markets_full else all_rows(
-        conn,
-        "SELECT c.*,d.loan_change,d.worker_salary,d.engineer_salary,d.worker_delta,d.engineer_delta,"
-        "d.management_investment,d.production_volume,d.quality_investment FROM companies c "
-        "JOIN decisions d ON d.company_id=c.id WHERE c.is_super_bot=1 AND d.round_no=?",
-        (round_no,),
-    )):
-        company_id = int(row["id"])
-        home = market_by_city.get(str(row["home_city"]), markets[0])
-        production = max(0, int(row["production_volume"] or 0))
-        old_products = max(0, int(row["product_inventory"] or 0))
-        old_components = max(0, int(row["component_inventory"] or 0))
-        workers = max(0, employee_count(conn, company_id, "worker") + int(row["worker_delta"] or 0))
-        engineers = max(0, employee_count(conn, company_id, "engineer") + int(row["engineer_delta"] or 0))
-        components_to_make = max(0, production * component_need - old_components)
-        staff_cost = workers * float(row["worker_salary"]) * 3 + engineers * float(row["engineer_salary"]) * 3
-        staff_cost += max(0, int(row["worker_delta"] or 0)) * worker_training
-        staff_cost += max(0, int(row["engineer_delta"] or 0)) * engineer_training
-        staff_cost += max(0, -int(row["worker_delta"] or 0)) * float(row["worker_salary"])
-        staff_cost += max(0, -int(row["engineer_delta"] or 0)) * float(row["engineer_salary"])
-        materials = components_to_make * float(home["component_material"]) * (patent_factor ** int(row["patents"] or 0))
-        materials += production * float(home["product_material"]) * (patent_factor ** int(row["patents"] or 0))
-        storage = max(
-            0, old_components + components_to_make - int(row["component_storage_capacity"] or 0),
-        ) * float(home["component_storage"])
-        storage += max(
-            0, old_products + production - int(row["product_storage_capacity"] or 0),
-        ) * float(home["product_storage"])
-        city_rows = [dict(city) for city in all_rows(
-            conn,
-            "SELECT cd.*,COALESCE(a.count,0) AS current_agents,m.population,m.penetration,m.max_price "
-            "FROM city_decisions cd JOIN market_config m ON m.city=cd.city LEFT JOIN agents a "
-            "ON a.company_id=cd.company_id AND a.city=cd.city "
-            "WHERE cd.company_id=? AND cd.round_no=?",
-            (company_id, round_no),
-        )]
-        agent_cost = sum(
-            int(city["agent_delta"]) * add_agent_cost
-            if int(city["agent_delta"]) > 0
-            else -int(city["agent_delta"]) * remove_agent_cost
-            for city in city_rows
-        )
-        marketing = sum(float(city["marketing_investment"] or 0) for city in city_rows)
-        current_spend = (
-            staff_cost + materials + storage + agent_cost + marketing
-            + float(row["management_investment"] or 0)
-            + float(row["quality_investment"] or 0)
-        )
-        active_cities = [
-            city for city in city_rows
-            if int(city["current_agents"] or 0) + int(city["agent_delta"] or 0) > 0
-        ]
-        utilizations: list[float] = []
-        for city in active_cities:
-            stats = one(
-                conn,
-                "SELECT player_total_volume,market_size FROM market_round_stats WHERE city=? "
-                "AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
-                (city["city"], max(1, round_no)),
-            )
-            utilizations.append(
-                float(stats["player_total_volume"] or 0) / max(1.0, float(stats["market_size"] or 0))
-                if stats else 0.0
-            )
-        market_is_saturated = bool(utilizations) and sum(utilizations) / len(utilizations) >= 0.60
-        total_funds = float(row["cash"]) + max(0.0, float(row["loan_change"] or 0))
-        target_spend_ratio = 0.72 if market_is_saturated else 0.94
-        spend_gap = max(0.0, total_funds * target_spend_ratio - current_spend)
-        investment_budget = spend_gap * (0.15 if market_is_saturated else 0.45)
-        if investment_budget <= 1:
-            continue
-
-        headcount = max(1, workers + engineers)
-        qi_denominator = max(1.0, old_products * 1.2 + production)
-        qi_large_threshold = max(
-            (float(city["max_price"]) / 50.0 for city in active_cities),
-            default=1.0,
-        )
-        qi_index_ceiling = qi_large_threshold * 6.0
-        ma_headroom = max(0.0, ma_index_ceiling * headcount - float(row["management_investment"] or 0))
-        qi_headroom = max(0.0, qi_index_ceiling * qi_denominator - float(row["quality_investment"] or 0))
-        mi_headrooms: dict[str, float] = {}
-        for city in active_cities:
-            agents = int(city["current_agents"] or 0) + int(city["agent_delta"] or 0)
-            size = float(city["population"]) * float(city["penetration"]) * growth ** max(0, official_round - 1)
-            threshold = (float(city["max_price"]) / 50.0) * size * 0.20
-            threshold /= max(1.0, 1.0 + agents * 0.10) * 1.5 * 2.0
-            mi_headrooms[str(city["city"])] = max(
-                0.0,
-                threshold * 6.0 - float(city["marketing_investment"] or 0),
-            )
-        total_headroom = ma_headroom + qi_headroom + sum(mi_headrooms.values())
-        deployed = min(investment_budget, total_headroom)
-        if deployed <= 1 or total_headroom <= 0:
-            continue
-        conn.execute(
-            "UPDATE decisions SET management_investment=management_investment+?,"
-            "quality_investment=quality_investment+? WHERE company_id=? AND round_no=?",
-            (
-                deployed * ma_headroom / total_headroom,
-                deployed * qi_headroom / total_headroom,
-                company_id,
-                round_no,
-            ),
-        )
-        for city, headroom in mi_headrooms.items():
-            conn.execute(
-                "UPDATE city_decisions SET marketing_investment=marketing_investment+? "
-                "WHERE company_id=? AND round_no=? AND city=?",
-                (deployed * headroom / total_headroom, company_id, round_no, city),
-            )
-
-    # Binary candidate selection can start farther from the final joint CPI
-    # equilibrium than the former dense grid. Allow enough damped passes for
-    # production and investment to converge without leaving affordable groups.
-    for _ in range(40):
+    # The candidate search has already compared affordable production levels.
+    # This pass may trim newly revealed surplus after simultaneous price
+    # coordination, but it must never expand back to the cash maximum.
+    for _ in range(12):
         # Production follows the exact units this field can sell after the
         # category-isolated secondary pass. Visible CPI alone misses legitimate
         # price-to-price and investment-to-investment redistribution.
@@ -911,35 +678,21 @@ def _rebalance_super_bot_production(
                 }
 
             total_funds = float(row["cash"]) + max(0.0, float(row["loan_change"] or 0))
-            if all_markets_full:
-                personality = int(row["bot_profile"] or company_id) % 7
-                personality_headroom = 0.97 + personality * 0.01
-                target_available = (
-                    capacities.get(company_id, 0.0)
-                    * personality_headroom
-                )
-                target_new = max(0.0, target_available - old_products)
-                target_groups = max(
-                    0,
-                    int(math.floor(target_new / max(group["products"], 1.0))),
-                )
-                low, high = 0, target_groups
-            else:
-                current_groups = max(
-                    0,
-                    int(round(current_production / max(group["products"], 1.0))),
-                )
-                low, high = 0, max(1, current_groups)
-                while float(plan_for(high)["total"]) <= total_funds + 1e-9:
-                    low = high
-                    high *= 2
-            while low < high:
-                middle = (low + high + 1) // 2
-                if float(plan_for(middle)["total"]) <= total_funds + 1e-9:
-                    low = middle
-                else:
-                    high = middle - 1
-            selected_plan = plan_for(low)
+            current_groups = max(
+                0,
+                int(round(current_production / max(group["products"], 1.0))),
+            )
+            sellable = max(0.0, capacities.get(company_id, 0.0))
+            if sellable >= old_products + current_production * 0.97:
+                continue
+            target_new = max(0.0, sellable * 1.02 - old_products)
+            target_groups = min(
+                current_groups,
+                max(0, int(math.ceil(target_new / max(group["products"], 1.0)))),
+            )
+            selected_plan = plan_for(target_groups)
+            if float(selected_plan["total"]) > total_funds + 1e-9:
+                continue
             if int(selected_plan["production"]) == current_production:
                 continue
             conn.execute(
@@ -1532,10 +1285,24 @@ def _submit_bots(
             # not capacity the bot must rely upon to complete its plan.
             worker_planning_multiplier = min(1.0, worker_multiplier)
             engineer_planning_multiplier = min(1.0, engineer_multiplier)
+            current_workers = employee_count(conn, company_id, "worker")
+            current_engineers = employee_count(conn, company_id, "engineer")
             worker_delta = _staff_delta(conn, company_id, "worker", round_no, worker_effective / worker_planning_multiplier)
             engineer_delta = _staff_delta(conn, company_id, "engineer", round_no, engineer_effective / engineer_planning_multiplier)
-            workers = max(0, employee_count(conn, company_id, "worker") + worker_delta)
-            engineers = max(0, employee_count(conn, company_id, "engineer") + engineer_delta)
+            if super_mode and production <= 0 and old_products > 0 and ma_index_target >= ma_threshold:
+                # Inventory-only MA play: retain exactly one employee so the
+                # whole MA investment becomes the MA index denominator.
+                if current_workers > 0:
+                    worker_delta = max(worker_delta, 1 - current_workers)
+                    engineer_delta = -current_engineers
+                elif current_engineers > 0:
+                    worker_delta = -current_workers
+                    engineer_delta = max(engineer_delta, 1 - current_engineers)
+                else:
+                    worker_delta = 1
+                    engineer_delta = 0
+            workers = max(0, current_workers + worker_delta)
+            engineers = max(0, current_engineers + engineer_delta)
             staff_cost = workers * worker_salary * 3 + engineers * engineer_salary * 3
             staff_cost += max(0, worker_delta) * worker_training + max(0, engineer_delta) * engineer_training
             staff_cost += max(0, -worker_delta) * worker_salary + max(0, -engineer_delta) * engineer_salary
@@ -1991,7 +1758,13 @@ def _submit_bots(
                     + candidate_ma * (group["workers"] + group["engineers"])
                     + candidate_qi * group["products"]
                 )
-                candidate_fixed = agent_cost + sum(candidate_marketing.values())
+                # QI also applies to old stock. Omitting this fixed part made
+                # inventory-heavy low-price plans look cheaper than they are.
+                candidate_fixed = (
+                    agent_cost
+                    + sum(candidate_marketing.values())
+                    + candidate_qi * old_products * 1.2
+                )
                 candidate_group_limit = math.floor(
                     max(0.0, cash_budget - candidate_fixed) / max(candidate_group_cost, 1.0)
                 )
@@ -2053,6 +1826,26 @@ def _submit_bots(
                     city_capacities.append((index, size * own_cpi / 100.0, candidate_price))
 
                 total_capacity = sum(capacity for _, capacity, _ in city_capacities)
+                # High investment does not require maximum production. Keep a
+                # small demand buffer, but never pay for complete groups whose
+                # products are not forecast to sell. This is the high-CPI,
+                # controlled-output strategy used in saturated/high-price play.
+                capacity_safety = (
+                    0.94 if last_round
+                    else 0.98 if official_round >= max(1, total_rounds - 1)
+                    else 1.03
+                )
+                profitable_group_limit = max(
+                    0,
+                    int(math.ceil(
+                        max(0.0, total_capacity * capacity_safety - old_products)
+                        / max(1.0, group["products"])
+                    )),
+                )
+                if profitable_group_limit < candidate_groups:
+                    candidate_groups = profitable_group_limit
+                    candidate_production = int(math.floor(candidate_groups * group["products"]))
+                    candidate_available = old_products + candidate_production
                 predicted_sold = min(float(candidate_available), total_capacity)
                 sell_ratio = predicted_sold / max(1.0, float(candidate_available))
                 cpi_coverage = total_capacity / max(1.0, float(candidate_available))
@@ -2063,15 +1856,31 @@ def _submit_bots(
                     if str(markets[index]["city"]) != home
                 )
                 predicted_transport = predicted_sold * transport_cost * non_home_capacity / max(1.0, capacity_weight)
-                predicted_cost = candidate_fixed + candidate_groups * candidate_group_cost + predicted_transport
-                predicted_profit = predicted_sold * predicted_price - predicted_cost
+                # With inventory but no new production, a pure MA strategy
+                # keeps one employee; model that one-person MA spend here.
+                control_ma_cost = candidate_ma if candidate_groups == 0 and old_products > 0 else 0.0
+                predicted_cost = (
+                    candidate_fixed
+                    + candidate_groups * candidate_group_cost
+                    + control_ma_cost
+                    + predicted_transport
+                )
+                predicted_revenue = predicted_sold * predicted_price
+                predicted_profit = predicted_revenue - predicted_cost
+                # A conservative revenue haircut protects the late-game
+                # strategy from a later undercut or small CPI forecast error.
+                # Safe profit wins first; near break-even market filling is
+                # allowed only when no safely profitable candidate exists.
+                risk_profit = predicted_revenue * 0.92 - predicted_cost
+                non_loss = int(predicted_profit >= 0)
                 # Profit is the primary objective. Sell-through and CPI/stock
                 # fit break ties between similarly profitable strategies, so a
                 # pure low-price plan is selected only when it truly earns more.
                 return {
                     "score": (
-                        int(predicted_profit > 0),
+                        non_loss,
                         predicted_profit,
+                        risk_profit,
                         sell_ratio,
                         -abs(cpi_coverage - 1.0),
                         candidate_price_ratio,
@@ -2156,19 +1965,10 @@ def _submit_bots(
                 ma_index_target = float(best_candidate["ma"])
                 qi_index_target = float(best_candidate["qi"])
                 marketing_targets = dict(best_candidate["marketing"])
-                low_groups = 0
-                high_groups = max(1, int(best_candidate["groups"]))
-                while budget_for(int(math.floor(high_groups * group["products"])))["total"] <= cash_budget + 1e-9:
-                    low_groups = high_groups
-                    high_groups *= 2
-                while low_groups < high_groups:
-                    middle_groups = (low_groups + high_groups + 1) // 2
-                    middle_products = int(math.floor(middle_groups * group["products"]))
-                    if budget_for(middle_products)["total"] <= cash_budget + 1e-9:
-                        low_groups = middle_groups
-                    else:
-                        high_groups = middle_groups - 1
-                chosen_groups = low_groups
+                # Preserve the profit-selected production level. The former
+                # post-search expansion silently replaced it with the maximum
+                # cash-affordable output and forced low-price liquidation.
+                chosen_groups = max(0, int(best_candidate["groups"]))
                 production = int(math.floor(chosen_groups * group["products"]))
                 budget = budget_for(production)
                 city_rows = make_city_rows(
@@ -2232,10 +2032,10 @@ def _submit_bots(
             )
         conn.execute(
             "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,"
-            "engineer_salary,management_investment,production_volume,quality_investment,research_investment,submitted_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "engineer_salary,management_investment,production_volume,quality_investment,research_investment,submitted_at,is_draft) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (company_id, round_no, loan_change, budget["worker_delta"], worker_salary, budget["engineer_delta"],
-             engineer_salary, budget["management"], production, budget["quality"], research, now_iso()),
+             engineer_salary, budget["management"], production, budget["quality"], research, now_iso(), int(super_mode)),
         )
         for row in city_rows:
             conn.execute(
@@ -2275,7 +2075,8 @@ def _submit_super_bot_decisions_locked(
     missing = one(
         conn,
         "SELECT COUNT(*) AS n FROM companies c WHERE c.is_super_bot=0 AND NOT EXISTS "
-        "(SELECT 1 FROM decisions d WHERE d.company_id=c.id AND d.round_no=? AND d.submitted_at IS NOT NULL)",
+        "(SELECT 1 FROM decisions d WHERE d.company_id=c.id AND d.round_no=? "
+        "AND d.submitted_at IS NOT NULL AND d.is_draft=0)",
         (round_no,),
     )
     if missing and int(missing["n"]) > 0:
@@ -2314,6 +2115,35 @@ def submit_super_bot_decisions(
             target_ids=target_ids,
             defer_rebalance=defer_rebalance,
         )
+
+
+def finalize_super_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
+    """Turn a complete analysed Super Bot batch into locked submissions."""
+    with _SUPER_BOT_SUBMISSION_LOCK:
+        total = int(one(
+            conn,
+            "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1 AND is_super_bot=1",
+        )["n"])
+        if total <= 0:
+            return 0
+        market_total = int(one(conn, "SELECT COUNT(*) AS n FROM market_config")["n"])
+        ready = int(one(
+            conn,
+            "SELECT COUNT(*) AS n FROM companies c JOIN decisions d ON d.company_id=c.id "
+            "WHERE c.is_bot=1 AND c.is_super_bot=1 AND d.round_no=? "
+            "AND d.submitted_at IS NOT NULL AND (SELECT COUNT(*) FROM city_decisions cd "
+            "WHERE cd.company_id=c.id AND cd.round_no=?)=?",
+            (round_no, round_no, market_total),
+        )["n"])
+        if ready != total:
+            raise ValueError("超级 Bot 草稿尚未全部分析完成，不能正式提交。")
+        conn.execute(
+            "UPDATE decisions SET submitted_at=?,is_draft=0 WHERE round_no=? "
+            "AND company_id IN (SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1)",
+            (now_iso(), round_no),
+        )
+        conn.commit()
+        return total
 
 
 def rebalance_super_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:

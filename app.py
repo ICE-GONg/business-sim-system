@@ -4,6 +4,7 @@ import html
 import importlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -36,13 +37,13 @@ from sim import bots as _bots_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 4
+    or getattr(_db_module, "DB_API_VERSION", 0) < 6
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 4
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 9
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 21
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 10
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 23
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
@@ -50,9 +51,9 @@ if (
     importlib.reload(_engine_module)
     importlib.reload(_bots_module)
 
-from sim.bots import submit_bot_decisions
+from sim.bots import finalize_super_bot_decisions, submit_bot_decisions
 from sim import remote_worker as _remote_worker_module
-if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 3:
+if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 4:
     importlib.invalidate_caches()
     importlib.reload(_remote_worker_module)
 from sim.remote_worker import (
@@ -78,6 +79,7 @@ from sim.db import (
     now_iso,
     one,
     prepare_first_round_after_test,
+    ranked_bot_home_cities,
     reset_competition,
     rollback_latest_settled_round,
     restore_database_bytes,
@@ -1292,13 +1294,15 @@ def render_admin_companies() -> None:
                 initial_cash = get_setting(conn, "initial_cash", 15_000_000.0)
                 requested_count = int(super_bot_count if is_super else bot_count)
                 prefix = "SBOT" if is_super else "BOT"
+                ranked_homes = ranked_bot_home_cities(conn) if is_super else [str(row["city"]) for row in markets]
+                ranked_pool_size = max(1, math.ceil(len(ranked_homes) / 3)) if is_super else len(ranked_homes)
                 for offset in range(requested_count):
                     number_index = existing + offset + 1
                     code_value = f"{prefix}{number_index:02d}"
                     while one(conn, "SELECT 1 FROM companies WHERE code=?", (code_value,)):
                         number_index += 1
                         code_value = f"{prefix}{number_index:02d}"
-                    home = str(markets[(number_index - 1) % len(markets)]["city"])
+                    home = ranked_homes[(number_index - 1) % ranked_pool_size]
                     cursor = conn.execute(
                         "INSERT INTO companies(code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,is_super_bot,bot_profile,created_at) VALUES(?,?,?,?,?,?,1,?,?,?)",
                         (code_value, f"{'Super ' if is_super else ''}Auto Company {number_index}", hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(), int(is_super), number_index, now_iso()),
@@ -1495,17 +1499,29 @@ def render_admin_decisions() -> None:
         "loan_change": 0.0, "worker_delta": 0, "worker_salary": previous_worker_salary,
         "engineer_delta": 0, "engineer_salary": previous_engineer_salary,
         "management_investment": 0.0, "production_volume": 0, "quality_investment": 0.0,
-        "research_investment": 0.0, "submitted_at": None,
+        "research_investment": 0.0, "submitted_at": None, "is_draft": 0,
     }
-    if not decision.get("submitted_at"):
+    is_super_draft = bool(company["is_super_bot"] and decision.get("is_draft"))
+    if not decision.get("submitted_at") and not is_super_draft:
         decision.update({"loan_change": 0.0, "worker_delta": 0, "engineer_delta": 0, "management_investment": 0.0, "production_volume": 0, "quality_investment": 0.0, "research_investment": 0.0})
         city_rows = {}
-    status_text = "已提交" if decision.get("submitted_at") else "未提交"
+    status_text = "分析草稿（未提交）" if is_super_draft else ("已提交" if decision.get("submitted_at") else "未提交")
     st.info(f"第 {round_no} 轮 · {STATUS_LABELS.get(round_row['status'], round_row['status'])} · 玩家状态：{status_text}")
     if not editable:
         st.warning("本轮已经结算，决策仅可查看，不能再修改。")
 
-    mark_submitted = st.checkbox("本轮已提交", value=bool(decision.get("submitted_at")), disabled=not editable, help="未勾选时保存会把本轮所有新增、生产和投资决策归零。")
+    checkbox_label = "正式提交本轮决策" if company["is_super_bot"] else "本轮已提交"
+    checkbox_help = (
+        "不勾选时保存为 Super Bot 草稿；也可修改完后回到“回合控制”统一正式提交。"
+        if company["is_super_bot"]
+        else "未勾选时保存会把本轮所有新增、生产和投资决策归零。"
+    )
+    mark_submitted = st.checkbox(
+        checkbox_label,
+        value=bool(decision.get("submitted_at") and not decision.get("is_draft")),
+        disabled=not editable,
+        help=checkbox_help,
+    )
     worker_low, worker_high = salary_bounds(settings, previous_worker_salary)
     engineer_low, engineer_high = salary_bounds(settings, previous_engineer_salary)
     with connect() as conn:
@@ -1551,13 +1567,15 @@ def render_admin_decisions() -> None:
                     "price": cols[2].number_input("售价", min_value=float(settings["price_min"]), max_value=min(float(settings["price_max"]), float(market["max_price"])), value=float(saved.get("price", market["initial_avg_price"])), step=100.0, key=f"admin_price_{company['id']}_{round_no}_{city}", disabled=not editable),
                     "order_report": cols[3].checkbox("购买市场报告", value=bool(saved.get("order_report", 0)), key=f"admin_report_{company['id']}_{round_no}_{city}", disabled=not editable),
                 }
-        save = st.form_submit_button("保存玩家决策", type="primary", disabled=not editable, use_container_width=True)
+        save_label = "保存 Super Bot 草稿" if company["is_super_bot"] and not mark_submitted else "保存玩家决策"
+        save = st.form_submit_button(save_label, type="primary", disabled=not editable, use_container_width=True)
     if save:
         if mark_submitted and 0 < float(loan_change) < float(home["min_loan"]):
             st.error(f"新增贷款不得低于主场最低贷款 {money(home['min_loan'])}；不贷款请填写 0。")
             return
-        submitted_at = now_iso() if mark_submitted else None
-        if not mark_submitted:
+        save_as_super_draft = bool(company["is_super_bot"] and not mark_submitted)
+        submitted_at = now_iso() if (mark_submitted or save_as_super_draft) else None
+        if not mark_submitted and not save_as_super_draft:
             loan_change = worker_delta = engineer_delta = management = production_volume = quality = research = 0
             for values in city_inputs.values():
                 values["agent_delta"] = 0
@@ -1565,9 +1583,9 @@ def render_admin_decisions() -> None:
                 values["order_report"] = False
         with connect() as conn:
             conn.execute(
-                "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,engineer_salary,management_investment,production_volume,quality_investment,research_investment,submitted_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id,round_no) DO UPDATE SET loan_change=excluded.loan_change,worker_delta=excluded.worker_delta,worker_salary=excluded.worker_salary,engineer_delta=excluded.engineer_delta,engineer_salary=excluded.engineer_salary,management_investment=excluded.management_investment,production_volume=excluded.production_volume,quality_investment=excluded.quality_investment,research_investment=excluded.research_investment,submitted_at=excluded.submitted_at",
-                (company["id"], round_no, loan_change, worker_delta, worker_salary, engineer_delta, engineer_salary, management, production_volume, quality, research, submitted_at),
+                "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,engineer_salary,management_investment,production_volume,quality_investment,research_investment,submitted_at,is_draft) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id,round_no) DO UPDATE SET loan_change=excluded.loan_change,worker_delta=excluded.worker_delta,worker_salary=excluded.worker_salary,engineer_delta=excluded.engineer_delta,engineer_salary=excluded.engineer_salary,management_investment=excluded.management_investment,production_volume=excluded.production_volume,quality_investment=excluded.quality_investment,research_investment=excluded.research_investment,submitted_at=excluded.submitted_at,is_draft=excluded.is_draft",
+                (company["id"], round_no, loan_change, worker_delta, worker_salary, engineer_delta, engineer_salary, management, production_volume, quality, research, submitted_at, int(save_as_super_draft)),
             )
             for city, values in city_inputs.items():
                 conn.execute(
@@ -1721,19 +1739,22 @@ def render_admin_rounds() -> None:
         submission = submission_status(conn, int(round_row["round_no"])) if round_row and round_row["status"] in ("open", "paused") else None
         decisions = all_rows(
             conn,
-            "SELECT c.code,c.name,c.home_city,c.setup_submitted_at,c.is_bot,c.is_super_bot,d.submitted_at,d.production_volume,d.management_investment,d.quality_investment,d.research_investment "
+            "SELECT c.code,c.name,c.home_city,c.setup_submitted_at,c.is_bot,c.is_super_bot,d.submitted_at,d.is_draft,d.production_volume,d.management_investment,d.quality_investment,d.research_investment "
             "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=? ORDER BY c.id",
             (int(round_row["round_no"]),),
         ) if round_row else []
         regular_status = one(
             conn,
-            "SELECT COUNT(*) AS total,SUM(CASE WHEN d.submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted "
+            "SELECT COUNT(*) AS total,SUM(CASE WHEN d.submitted_at IS NOT NULL AND d.is_draft=0 THEN 1 ELSE 0 END) AS submitted "
             "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=? WHERE c.is_super_bot=0",
             (int(round_row["round_no"]),),
         ) if round_row else None
         super_status = one(
             conn,
-            "SELECT COUNT(*) AS total,SUM(CASE WHEN d.submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted "
+            "SELECT COUNT(*) AS total,"
+            "SUM(CASE WHEN d.company_id IS NOT NULL THEN 1 ELSE 0 END) AS saved,"
+            "SUM(CASE WHEN d.is_draft=1 THEN 1 ELSE 0 END) AS drafts,"
+            "SUM(CASE WHEN d.submitted_at IS NOT NULL AND d.is_draft=0 THEN 1 ELSE 0 END) AS submitted "
             "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=? WHERE c.is_super_bot=1",
             (int(round_row["round_no"]),),
         ) if round_row else None
@@ -1796,20 +1817,23 @@ def render_admin_rounds() -> None:
         regular_submitted = int(regular_status["submitted"] or 0) if regular_status else 0
         super_total = int(super_status["total"] or 0) if super_status else 0
         super_submitted = int(super_status["submitted"] or 0) if super_status else 0
+        super_saved = int(super_status["saved"] or 0) if super_status else 0
+        super_drafts = int(super_status["drafts"] or 0) if super_status else 0
         if super_total:
             st.markdown("#### 超级 Bot 决策")
             st.caption(
-                f"真人玩家与普通 Bot：{regular_submitted}/{regular_total} · 超级 Bot：{super_submitted}/{super_total}。"
-                "超级 Bot 只会在其他队伍全部提交后读取本轮决策。"
+                f"真人玩家与普通 Bot：{regular_submitted}/{regular_total} · "
+                f"Super Bot 草稿：{super_drafts}/{super_total} · 正式提交：{super_submitted}/{super_total}。"
+                "先分析并保存草稿；你可在“决策管理”修改数字，最后再统一提交。"
             )
             super_action_label = (
                 "继续分析未完成的超级 Bot"
                 if remote_job_pending
-                else "重新分析并逐个覆盖超级 Bot 决策"
-                if super_submitted >= super_total
-                else "继续分析未完成的超级 Bot"
-                if super_submitted > 0
-                else "超级 Bot 分析并提交"
+                else "重新分析并逐个覆盖 Super Bot 草稿"
+                if super_saved >= super_total
+                else "继续分析未完成的 Super Bot"
+                if super_saved > 0
+                else "分析 Super Bot 并保存草稿"
             )
             if st.button(
                 super_action_label,
@@ -1831,7 +1855,7 @@ def render_admin_rounds() -> None:
                     remote_round = int(round_row["round_no"])
                     if _remote_super_bot_submit(
                         remote_round,
-                        replace_existing=super_submitted >= super_total and not remote_job_pending,
+                        replace_existing=super_saved >= super_total and not remote_job_pending,
                         progress_callback=update_super_progress,
                     ):
                         update_super_progress(super_total, super_total, "远程计算完成")
@@ -1842,17 +1866,37 @@ def render_admin_rounds() -> None:
                                 remote_round,
                                 update_super_progress,
                                 replace_existing=(
-                                    remote_job_pending or super_submitted >= super_total
+                                    remote_job_pending or super_saved >= super_total
                                 ),
                             )
                     super_progress.empty()
-                    flash("success", f"{super_total} 支超级 Bot 已读取全部对手决策并完成提交。")
+                    flash("success", f"{super_total} 支 Super Bot 已完成分析并保存为草稿；现在可修改，尚未正式提交。")
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
                 except sqlite3.OperationalError:
                     LOGGER.exception("Super Bot submission database operation failed")
                     st.error("数据库当前正忙，系统没有结算本轮。请稍等几秒后再次点击超级 Bot 分析。")
+            submit_ready = (
+                regular_submitted >= regular_total
+                and super_saved >= super_total
+                and not remote_job_pending
+            )
+            if st.button(
+                "正式提交全部 Super Bot 决策",
+                type="secondary",
+                disabled=not submit_ready or super_submitted >= super_total,
+                use_container_width=True,
+            ):
+                try:
+                    with connect() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        assert_remote_job_current(conn, int(round_row["round_no"]))
+                        finalized = finalize_super_bot_decisions(conn, int(round_row["round_no"]))
+                    flash("success", f"已正式提交并锁定 {finalized} 支 Super Bot 的本轮决策。")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
         cols = st.columns(4)
         if round_row["status"] == "open":
             if cols[0].button("暂停", use_container_width=True):
@@ -1871,37 +1915,15 @@ def render_admin_rounds() -> None:
                 conn.execute("UPDATE rounds SET ends_at=? WHERE round_no=?", ((old_end + timedelta(minutes=int(extend_minutes))).isoformat(), round_row["round_no"]))
             flash("success", f"已延长 {extend_minutes} 分钟。")
             st.rerun()
-        non_super_ready = regular_submitted >= regular_total
-        needs_super_analysis = super_total and (super_submitted < super_total or remote_job_pending)
-        settlement_label = "超级 Bot 分析并结算" if needs_super_analysis else "结算本轮"
-        if cols[3].button(settlement_label, type="primary", use_container_width=True, disabled=not non_super_ready):
+        all_ready_to_settle = (
+            regular_submitted >= regular_total
+            and (super_total == 0 or super_submitted >= super_total)
+            and not remote_job_pending
+        )
+        if cols[3].button("结算本轮", type="primary", use_container_width=True, disabled=not all_ready_to_settle):
             try:
-                remote_completed = False
                 remote_round = int(round_row["round_no"])
-                if needs_super_analysis:
-                    settlement_progress = st.progress(0.0, text="超级 Bot 正在模拟 CPI 候选方案…")
-                    def update_settlement_progress(done: int, total: int, code: str) -> None:
-                        stage = (
-                            "联合复算完成" if code == "联合复算"
-                            else code if code.endswith("中") else f"{code} 已分析并保存"
-                        )
-                        settlement_progress.progress(
-                            min(1.0, done / max(1, total)),
-                            text=f"{stage} · {done}/{total}",
-                        )
-                    remote_completed = _remote_super_bot_submit(
-                        remote_round, progress_callback=update_settlement_progress,
-                    )
-                    if remote_completed:
-                        settlement_progress.progress(1.0, text="远程计算完成")
                 with connect() as conn:
-                    if needs_super_analysis and not remote_completed:
-                        submit_local_super_bots(
-                            conn,
-                            remote_round,
-                            update_settlement_progress,
-                            replace_existing=remote_job_pending,
-                        )
                     conn.execute("BEGIN IMMEDIATE")
                     if conn.execute(
                         "SELECT 1 FROM companies "
@@ -1909,8 +1931,6 @@ def render_admin_rounds() -> None:
                     ).fetchone():
                         assert_remote_job_current(conn, remote_round)
                     settle_round(conn, int(round_row["round_no"]))
-                if needs_super_analysis:
-                    settlement_progress.empty()
                 completed_label = "测试轮" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
                 flash("success", f"{completed_label}结算完成。")
                 st.rerun()
@@ -1970,7 +1990,18 @@ def render_admin_rounds() -> None:
     if decisions:
         st.subheader("队伍状态")
         status_frame = pd.DataFrame(
-            [{"队伍": row["code"], "公司": row["name"], "类型": "超级 Bot" if row["is_super_bot"] else ("普通 Bot" if row["is_bot"] else "玩家"), "主场": row["home_city"] or "—", "赛前就绪": bool(row["setup_submitted_at"]), "本轮提交": bool(row["submitted_at"]), "计划产量": (row["production_volume"] or 0) if row["submitted_at"] else 0, "MA": (row["management_investment"] or 0) if row["submitted_at"] else 0, "QI": (row["quality_investment"] or 0) if row["submitted_at"] else 0, "专利": (row["research_investment"] or 0) if row["submitted_at"] else 0} for row in decisions]
+            [{
+                "队伍": row["code"],
+                "公司": row["name"],
+                "类型": "超级 Bot" if row["is_super_bot"] else ("普通 Bot" if row["is_bot"] else "玩家"),
+                "主场": row["home_city"] or "—",
+                "赛前就绪": bool(row["setup_submitted_at"]),
+                "决策状态": "草稿" if row["is_draft"] else ("已提交" if row["submitted_at"] else "未提交"),
+                "计划产量": (row["production_volume"] or 0) if row["submitted_at"] else 0,
+                "MA": (row["management_investment"] or 0) if row["submitted_at"] else 0,
+                "QI": (row["quality_investment"] or 0) if row["submitted_at"] else 0,
+                "专利": (row["research_investment"] or 0) if row["submitted_at"] else 0,
+            } for row in decisions]
         )
         st.dataframe(status_frame, hide_index=True, use_container_width=True)
     st.subheader("回合历史")
@@ -2043,7 +2074,7 @@ def render_admin_rounds() -> None:
                     rollback_progress.empty()
                 bot_message = f"普通 Bot 已重新提交 {normal_bot_count} 支"
                 if super_bot_count:
-                    bot_message += f"，超级 Bot 已重新提交 {super_bot_count} 支"
+                    bot_message += f"，Super Bot 已重新生成草稿 {super_bot_count} 支（尚未正式提交）"
                 flash(
                     "success",
                     f"已撤销第 {reopened_round} 轮结算并重新开放；{bot_message}。真人玩家可修改草稿后重新提交。",

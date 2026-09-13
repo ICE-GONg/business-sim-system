@@ -160,7 +160,7 @@ class BotKDSRegressionTest(unittest.TestCase):
         self.assertTrue(self.bots._all_markets_near_capacity(self.conn, 2, markets))
         self.assertFalse(self.bots._all_markets_near_capacity(self.conn, 3, markets))
 
-    def test_joint_strategy_rereads_qi_safety_and_never_overcommits_cash(self):
+    def test_joint_price_pass_preserves_profit_selected_investments(self):
         self.conn.execute("DELETE FROM market_config WHERE city<>'广州'")
         super_id = self.company("SUPER", super_mode=True, cash=1_000_000_000)
         self.conn.execute("UPDATE companies SET bot_profile=2 WHERE id=?", (super_id,))
@@ -179,24 +179,30 @@ class BotKDSRegressionTest(unittest.TestCase):
         markets = [dict(row) for row in self.db.all_rows(
             self.conn, "SELECT * FROM market_config",
         )]
-        indices = []
+        quality_values = []
         for multiplier in (1.20, 1.80):
             self.db.set_setting(self.conn, "qi_safe_multiplier", multiplier)
             self.conn.execute(
-                "UPDATE decisions SET management_investment=0,quality_investment=0 "
+                "UPDATE decisions SET management_investment=654321,quality_investment=123456 "
                 "WHERE company_id=? AND round_no=5", (super_id,),
             )
             self.conn.execute(
-                "UPDATE city_decisions SET price=6000,marketing_investment=0 "
+                "UPDATE city_decisions SET price=6000,marketing_investment=98765 "
                 "WHERE company_id=? AND round_no=5", (super_id,),
             )
             self.assertTrue(self.bots._coordinate_super_bot_prices(self.conn, 5, markets))
             decision = self.db.one(
-                self.conn, "SELECT quality_investment FROM decisions "
+                self.conn, "SELECT management_investment,quality_investment FROM decisions "
                 "WHERE company_id=? AND round_no=5", (super_id,),
             )
-            indices.append(float(decision["quality_investment"]) / 1000.0)
-        self.assertAlmostEqual(indices[1] / indices[0], 1.80 / 1.20, places=6)
+            marketing = self.db.one(
+                self.conn, "SELECT marketing_investment FROM city_decisions "
+                "WHERE company_id=? AND round_no=5", (super_id,),
+            )
+            self.assertEqual(float(decision["management_investment"]), 654321.0)
+            quality_values.append(float(decision["quality_investment"]))
+            self.assertEqual(float(marketing["marketing_investment"]), 98765.0)
+        self.assertEqual(quality_values, [123456.0, 123456.0])
 
         # With production costs already above available cash, the final joint
         # pass must request no CPI investment instead of relying on settlement

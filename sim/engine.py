@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 9
+ENGINE_API_VERSION = 10
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -255,7 +255,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
     missing = [
         company["code"]
         for company in companies
-        if one(conn, "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=? AND submitted_at IS NOT NULL", (company["id"], round_no)) is None
+        if one(conn, "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=? AND submitted_at IS NOT NULL AND is_draft=0", (company["id"], round_no)) is None
     ]
     if missing:
         raise ValueError("仍有队伍未提交：" + "、".join(missing))

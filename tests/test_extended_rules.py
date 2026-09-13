@@ -45,6 +45,27 @@ class ExtendedRulesTest(unittest.TestCase):
         self.assertEqual(group["components"], 105)
         self.assertEqual(group["products"], 21)
 
+    def test_super_bot_home_ranking_balances_cost_and_transport_exposure(self):
+        db = self.fresh("home-ranking.db")
+        with db.connect() as conn:
+            conn.execute("UPDATE market_config SET home_enabled=0")
+            conn.execute(
+                "UPDATE market_config SET home_enabled=1,worker_initial_salary=1000,"
+                "engineer_initial_salary=1000,component_material=1,product_material=1,"
+                "component_storage=1,product_storage=1,population=100,penetration=0.01 "
+                "WHERE city='广州'"
+            )
+            conn.execute(
+                "UPDATE market_config SET home_enabled=1,worker_initial_salary=2000,"
+                "engineer_initial_salary=2000,component_material=100,product_material=100,"
+                "component_storage=10,product_storage=10,population=10000000,penetration=0.10 "
+                "WHERE city='深圳'"
+            )
+            db.set_setting(conn, "transport_cost", 0)
+            self.assertEqual(db.ranked_bot_home_cities(conn)[0], "广州")
+            db.set_setting(conn, "transport_cost", 1_000_000)
+            self.assertEqual(db.ranked_bot_home_cities(conn)[0], "深圳")
+
     def test_hidden_patent_cap_and_threshold(self):
         from sim.engine import effective_research_probability
 
@@ -252,7 +273,7 @@ class ExtendedRulesTest(unittest.TestCase):
             )
             super_id = int(cursor.lastrowid)
             conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'深圳',1)", (super_id,))
-            from sim.bots import submit_bot_decisions, submit_super_bot_decisions
+            from sim.bots import finalize_super_bot_decisions, submit_bot_decisions, submit_super_bot_decisions
             self.assertEqual(submit_bot_decisions(conn, 1), 0)
             with self.assertRaises(ValueError):
                 submit_super_bot_decisions(conn, 1)
@@ -267,6 +288,7 @@ class ExtendedRulesTest(unittest.TestCase):
             )
             self.assertEqual(submit_super_bot_decisions(conn, 1), 1)
             decision = db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1", (super_id,))
+            self.assertEqual(int(decision["is_draft"]), 1)
             self.assertGreaterEqual(decision["loan_change"], 0)
             self.assertGreaterEqual(decision["loan_change"], 3_500_000)
             self.assertIn(decision["research_investment"], (0, 8_150_000))
@@ -285,6 +307,9 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertTrue(all(3_500 <= float(row["price"]) <= 25_000 for row in super_prices))
             from sim.engine import settle_round
             conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+            with self.assertRaises(ValueError):
+                settle_round(conn, 1)
+            self.assertEqual(finalize_super_bot_decisions(conn, 1), 1)
             settle_round(conn, 1)
             result = db.one(conn, "SELECT * FROM results WHERE company_id=? AND round_no=1", (super_id,))
             self.assertGreaterEqual(result["sold"], int(result["produced"] * 0.80))
@@ -329,7 +354,7 @@ class ExtendedRulesTest(unittest.TestCase):
             )
             conn.execute("UPDATE market_config SET min_loan=2000000,max_loan=3500000 WHERE city='广州'")
             conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company_id,))
-            from sim.bots import submit_super_bot_decisions
+            from sim.bots import finalize_super_bot_decisions, submit_super_bot_decisions
 
             self.assertEqual(submit_super_bot_decisions(conn, 1), 1)
             decision = db.one(
@@ -712,7 +737,7 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreaterEqual(min(ratios), 1.0)
             self.assertGreater(max(ratios) / min(ratios), 2.5)
 
-    def test_all_super_bots_use_full_group_budget_seven_rounds(self):
+    def test_all_super_bots_stay_solvent_with_profit_control_seven_rounds(self):
         db = self.fresh("all-super-seven-rounds.db")
         with db.connect() as conn:
             db.set_setting(conn, "total_rounds", 7)
@@ -726,17 +751,13 @@ class ExtendedRulesTest(unittest.TestCase):
                 )
                 conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cursor.lastrowid, markets[profile]))
             conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
-            from sim.bots import _all_markets_near_capacity, submit_super_bot_decisions
+            from sim.bots import finalize_super_bot_decisions, submit_super_bot_decisions
             from sim.engine import settle_round
             for round_no in range(1, 8):
                 if round_no > 1:
                     conn.execute("INSERT INTO rounds(round_no,status) VALUES(?,'open')", (round_no,))
-                all_markets_full = _all_markets_near_capacity(
-                    conn,
-                    round_no,
-                    [dict(row) for row in db.all_rows(conn, "SELECT * FROM market_config ORDER BY city")],
-                )
                 self.assertEqual(submit_super_bot_decisions(conn, round_no), 7)
+                self.assertEqual(finalize_super_bot_decisions(conn, round_no), 7)
                 if round_no == 1:
                     super_decisions = db.all_rows(
                         conn,
@@ -766,6 +787,17 @@ class ExtendedRulesTest(unittest.TestCase):
                         0,
                         f"round={round_no} company={result['company_id']} result={dict(result)}",
                     )
+                    self.assertGreater(
+                        float(result["net_profit"]),
+                        0,
+                        f"unprofitable Super Bot: round={round_no} result={dict(result)}",
+                    )
+                    if round_no == 7:
+                        self.assertLessEqual(
+                            float(result["inventory"]) / max(1, available),
+                            0.08,
+                            f"final-round overproduction: {dict(result)}",
+                        )
                     finance = report["finance"]
                     pre_sales_spending = sum(
                         float(finance[key])
@@ -779,20 +811,9 @@ class ExtendedRulesTest(unittest.TestCase):
                         + float(finance["loan_change"])
                         - pre_sales_spending
                     )
-                    # Under the default KDS a complete group always costs less
-                    # than ¥1m; keeping less than this confirms no second group
-                    # was affordable. Sales/CPI may be lower in a saturated
-                    # market because the organiser explicitly prioritises full
-                    # cash deployment over inventory control.
+                    # Profit control may deliberately retain cash instead of
+                    # manufacturing stock that the forecast cannot sell.
                     self.assertGreaterEqual(remaining_before_sales, -1e-6)
-                    if not all_markets_full:
-                        self.assertLess(
-                            remaining_before_sales,
-                            1_000_000,
-                            f"round={round_no} company={result['company_id']} "
-                            f"decision={dict(db.one(conn, 'SELECT * FROM decisions WHERE company_id=? AND round_no=?', (result['company_id'], round_no)))} "
-                            f"finance={finance}",
-                        )
 
     def test_failed_research_accumulates_into_next_round(self):
         db = self.fresh("research.db")
