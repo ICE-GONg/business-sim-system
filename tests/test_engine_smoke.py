@@ -116,6 +116,7 @@ class SettlementSmokeTest(unittest.TestCase):
         self.assertAlmostEqual(average, 102.0)
         self.assertEqual(weighted_market_average(100, 1_000, []), 100)
         self.assertAlmostEqual(weighted_player_average([(80, 100), (120, 200)], 100), 106.6666666667)
+        self.assertEqual(weighted_player_average([(100, 1), (200, 3), (9_999, 0)], 0), 175)
         self.assertEqual(weighted_player_average([], 100), 100)
 
     def test_cpi_uses_sales_weighted_player_price_not_market_base_price(self) -> None:

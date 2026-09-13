@@ -44,13 +44,24 @@ class CPIGeneratorPortTests(unittest.TestCase):
             self.assertLess(abs(below - above), 1e-7)
 
         # One yuan across either important interval boundary cannot create a
-        # visible CPI jump. The weighted player average remains a small smooth
-        # correction rather than replacing the fitted KDS curve.
+        # visible jump. The original sales-weighted player-average ratio and
+        # the fitted KDS curve are both continuous.
         for boundary in (0.70, 0.85):
             center = maximum * boundary
             below = investment_price_factor(center - 1, center, maximum)
             above = investment_price_factor(center + 1, center, maximum)
             self.assertLess(abs(below - above), 0.001)
+
+    def test_investment_factor_combines_player_average_and_discount_curve(self) -> None:
+        maximum = 25_000.0
+        player_average = 20_000.0
+        price = 17_500.0
+        expected = (player_average / price) * investment_price_curve(price, maximum)
+        self.assertAlmostEqual(
+            investment_price_factor(price, player_average, maximum),
+            expected,
+            places=12,
+        )
 
     def test_minimum_threshold_matches_javascript(self) -> None:
         self.assertEqual(minimum_threshold(500), 1)

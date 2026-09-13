@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import math
 from bisect import bisect_right
 from typing import Any
 
 
-CPI_API_VERSION = 4
+CPI_API_VERSION = 5
 GIFT_CPI = 0.01
 LAYER1_TOTAL_CPI = 5.0
 LAYER2_TOTAL_CPI = 10.0
@@ -116,17 +115,20 @@ def investment_price_curve(price: float, max_price: float) -> float:
 
 
 def investment_price_factor(price: float, average_price: float, max_price: float) -> float:
-    """Blend the fitted KDS curve with a smooth, bounded market correction."""
+    """Apply the original player-average ratio and the fitted discount curve.
+
+    ``average_price`` is the sales-weighted player average for this city:
+    ``sum(player price * player sold units) / sum(player sold units)``.  The
+    original CPI generator used ``average_price / price`` as the investment
+    price factor.  The continuous KDS discount curve multiplies that original
+    factor; it does not replace or compress it.
+    """
     resolved_price = max(float(price), 1e-9)
     curve = investment_price_curve(resolved_price, max_price)
     if average_price <= 0.0:
         return curve
-    # Preserve the agreed sales-weighted player average without multiplying the
-    # new curve by an unbounded average/price ratio. tanh is smooth and limits
-    # this secondary correction to +/-5%; the KDS curve remains the main signal.
-    relative_gap = math.log(max(float(average_price), 1e-9) / resolved_price)
-    market_correction = 1.0 + 0.05 * math.tanh(relative_gap / 0.12)
-    return min(1.75, max(0.60, curve * market_correction))
+    player_average_ratio = max(float(average_price), 1e-9) / resolved_price
+    return player_average_ratio * curve
 
 
 def _investment_price_factors(
