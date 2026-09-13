@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
+from bisect import bisect_right
 from typing import Any
 
 
-CPI_API_VERSION = 3
+CPI_API_VERSION = 4
 GIFT_CPI = 0.01
 LAYER1_TOTAL_CPI = 5.0
 LAYER2_TOTAL_CPI = 10.0
@@ -11,6 +13,133 @@ WELFARE_PART1_BASE = 1.5
 WELFARE_PART2_BASE = 3.5
 PRICE_CPI_TOTAL = 40.0
 INDEX_CPI_TOTAL = LAYER1_TOTAL_CPI + LAYER2_TOTAL_CPI + WELFARE_PART1_BASE + WELFARE_PART2_BASE
+
+# Continuous, monotone price-efficiency fit. The x values are sale price as a
+# fraction of the city's KDS maximum price. Below 70% the multiplier continues
+# to rise, but increasingly slowly towards 1.70 instead of jumping or falling.
+_PRICE_EFFICIENCY_RATIOS = (0.0, 0.40, 0.55, 0.70, 0.85, 1.0)
+_PRICE_EFFICIENCY_FACTORS = (1.70, 1.68, 1.64, 1.50, 1.00, 0.65)
+
+
+def _pchip_slopes(xs: tuple[float, ...], ys: tuple[float, ...]) -> tuple[float, ...]:
+    """Return shape-preserving cubic slopes for a strictly increasing grid."""
+    size = len(xs)
+    if size != len(ys) or size < 2:
+        raise ValueError("PCHIP requires equally sized x/y grids")
+    widths = [xs[index + 1] - xs[index] for index in range(size - 1)]
+    if any(width <= 0 for width in widths):
+        raise ValueError("PCHIP x grid must be strictly increasing")
+    secants = [
+        (ys[index + 1] - ys[index]) / widths[index]
+        for index in range(size - 1)
+    ]
+    if size == 2:
+        return (secants[0], secants[0])
+
+    slopes = [0.0] * size
+    for index in range(1, size - 1):
+        before, after = secants[index - 1], secants[index]
+        if before == 0.0 or after == 0.0 or before * after <= 0.0:
+            slopes[index] = 0.0
+            continue
+        before_width, after_width = widths[index - 1], widths[index]
+        weight_before = 2.0 * after_width + before_width
+        weight_after = after_width + 2.0 * before_width
+        slopes[index] = (weight_before + weight_after) / (
+            weight_before / before + weight_after / after
+        )
+
+    first = (
+        (2.0 * widths[0] + widths[1]) * secants[0]
+        - widths[0] * secants[1]
+    ) / (widths[0] + widths[1])
+    if first * secants[0] <= 0.0:
+        first = 0.0
+    elif secants[0] * secants[1] < 0.0 and abs(first) > abs(3.0 * secants[0]):
+        first = 3.0 * secants[0]
+    slopes[0] = first
+
+    last = (
+        (2.0 * widths[-1] + widths[-2]) * secants[-1]
+        - widths[-1] * secants[-2]
+    ) / (widths[-1] + widths[-2])
+    if last * secants[-1] <= 0.0:
+        last = 0.0
+    elif secants[-1] * secants[-2] < 0.0 and abs(last) > abs(3.0 * secants[-1]):
+        last = 3.0 * secants[-1]
+    slopes[-1] = last
+    return tuple(slopes)
+
+
+_PRICE_EFFICIENCY_SLOPES = _pchip_slopes(
+    _PRICE_EFFICIENCY_RATIOS,
+    _PRICE_EFFICIENCY_FACTORS,
+)
+
+
+def investment_price_curve(price: float, max_price: float) -> float:
+    """Return the continuous KDS-price multiplier with diminishing returns.
+
+    Anchors: 100% -> 0.65, 85% -> 1.00, 70% -> 1.50, then a slow rise
+    towards 1.70. Monotone cubic Hermite interpolation makes every boundary
+    C1-continuous, so crossing a segment by one yuan cannot jump CPI.
+    """
+    ceiling = max(0.0, float(max_price))
+    if ceiling <= 0.0:
+        return 1.0
+    ratio = min(1.0, max(0.0, float(price) / ceiling))
+    segment = min(
+        len(_PRICE_EFFICIENCY_RATIOS) - 2,
+        max(0, bisect_right(_PRICE_EFFICIENCY_RATIOS, ratio) - 1),
+    )
+    left, right = (
+        _PRICE_EFFICIENCY_RATIOS[segment],
+        _PRICE_EFFICIENCY_RATIOS[segment + 1],
+    )
+    width = right - left
+    position = (ratio - left) / width
+    position2, position3 = position * position, position * position * position
+    left_value, right_value = (
+        _PRICE_EFFICIENCY_FACTORS[segment],
+        _PRICE_EFFICIENCY_FACTORS[segment + 1],
+    )
+    left_slope, right_slope = (
+        _PRICE_EFFICIENCY_SLOPES[segment],
+        _PRICE_EFFICIENCY_SLOPES[segment + 1],
+    )
+    return (
+        (2.0 * position3 - 3.0 * position2 + 1.0) * left_value
+        + (position3 - 2.0 * position2 + position) * width * left_slope
+        + (-2.0 * position3 + 3.0 * position2) * right_value
+        + (position3 - position2) * width * right_slope
+    )
+
+
+def investment_price_factor(price: float, average_price: float, max_price: float) -> float:
+    """Blend the fitted KDS curve with a smooth, bounded market correction."""
+    resolved_price = max(float(price), 1e-9)
+    curve = investment_price_curve(resolved_price, max_price)
+    if average_price <= 0.0:
+        return curve
+    # Preserve the agreed sales-weighted player average without multiplying the
+    # new curve by an unbounded average/price ratio. tanh is smooth and limits
+    # this secondary correction to +/-5%; the KDS curve remains the main signal.
+    relative_gap = math.log(max(float(average_price), 1e-9) / resolved_price)
+    market_correction = 1.0 + 0.05 * math.tanh(relative_gap / 0.12)
+    return min(1.75, max(0.60, curve * market_correction))
+
+
+def _investment_price_factors(
+    prices: list[float], average_price: float, max_price: float | None,
+) -> list[float]:
+    reference_max = float(max_price or 0.0)
+    if reference_max <= 0.0:
+        reference_max = max([float(average_price), *prices, 1.0])
+    return [
+        investment_price_factor(price, average_price, reference_max)
+        if price > 0.0 else 1.0
+        for price in prices
+    ]
 
 
 def agent_mi_benefit(agent_count: int | float) -> float:
@@ -29,18 +158,28 @@ def allocate_index_cpi(
     investments: list[float],
     prices: list[float],
     average_price: float,
+    max_price: float | None = None,
 ) -> list[dict[str, Any]]:
     """Python port of calculateCPIAlgorithm from the supplied admin.js.
 
     The intentionally unusual adjusted-threshold comparisons are retained so
     the Streamlit settlement produces the same results as the source simulator.
     """
+    resolved_prices = [
+        float(prices[index]) if index < len(prices) else 0.0
+        for index in range(len(investments))
+    ]
+    price_factors = _investment_price_factors(
+        resolved_prices,
+        float(average_price),
+        max_price,
+    )
     max_price_factor = 1.0
     players: list[dict[str, Any]] = []
     for index, raw_investment in enumerate(investments):
         investment = max(0.0, float(raw_investment))
-        price = float(prices[index]) if index < len(prices) else 0.0
-        price_factor = average_price / price if average_price > 0 and price > 0 else 1.0
+        price = resolved_prices[index]
+        price_factor = price_factors[index]
         max_price_factor = max(max_price_factor, price_factor or 1.0)
         players.append(
             {
@@ -189,6 +328,7 @@ def _allocate_index_cpi_for_target(
     prices: list[float],
     average_price: float,
     target_index: int,
+    max_price: float | None = None,
 ) -> float:
     """Return one player's index CPI without building every breakdown.
 
@@ -201,10 +341,11 @@ def _allocate_index_cpi_for_target(
         float(prices[index]) if index < len(prices) else 0.0
         for index in range(len(originals))
     ]
-    factors = [
-        average_price / price if average_price > 0 and price > 0 else 1.0
-        for price in resolved_prices
-    ]
+    factors = _investment_price_factors(
+        resolved_prices,
+        float(average_price),
+        max_price,
+    )
     adjusted = [value * factors[index] for index, value in enumerate(originals)]
     max_price_factor = max([1.0, *factors])
     adjusted_min = min_threshold * max_price_factor
@@ -321,18 +462,21 @@ def allocate_city_cpi_for_company(
 
     qi_cpi = _allocate_index_cpi_for_target(
         minimum_threshold(qi_large), qi_large,
-        [float(entry["qi_index"]) for entry in entries], prices, average_price, target_index,
+        [float(entry["qi_index"]) for entry in entries], prices, average_price,
+        target_index, max_price,
     )
     ma_cpi = _allocate_index_cpi_for_target(
         minimum_threshold(ma_large), ma_large,
-        [float(entry["ma_index"]) for entry in entries], prices, average_price, target_index,
+        [float(entry["ma_index"]) for entry in entries], prices, average_price,
+        target_index, max_price,
     )
     effective_mi = [
         float(entry["mi_investment"]) * agent_mi_benefit(entry.get("agents", 0))
         for entry in entries
     ]
     mi_cpi = _allocate_index_cpi_for_target(
-        minimum_threshold(mi_large), mi_large, effective_mi, prices, average_price, target_index,
+        minimum_threshold(mi_large), mi_large, effective_mi, prices, average_price,
+        target_index, max_price,
     )
 
     price_weights = [0.0] * len(entries)
@@ -468,6 +612,7 @@ class PreparedCityCPI:
             None,
         )
         self.prices = [max(0.0, float(entry["price"])) for entry in entries]
+        self.max_price = max(0.0, float(max_price))
         self.market_average = market_average_price
         self.power = max(1, int(price_power))
         if self.target is None:
@@ -497,7 +642,7 @@ class PreparedCityCPI:
         prices[target] = price
         average = sum(prices) / len(prices) if average_price is None else float(average_price)
         market_average = sum(prices) / len(prices) if self.market_average is None else float(self.market_average)
-        factors = [average / value if average > 0 and value > 0 else 1.0 for value in prices]
+        factors = _investment_price_factors(prices, average, self.max_price)
         max_factor = max([1.0, *factors])
         qi_cpi = self.qi.evaluate(qi_index, factors, max_factor)
         ma_cpi = self.ma.evaluate(ma_index, factors, max_factor)
@@ -557,11 +702,19 @@ def allocate_city_cpi(
     mi_large_base = qi_large * market_size * 0.20 / 1.5 / 2.0
     mi_min_base = minimum_threshold(mi_large_base)
 
-    qi_results = allocate_index_cpi(qi_min, qi_large, [float(e["qi_index"]) for e in entries], prices, average_price)
-    ma_results = allocate_index_cpi(ma_min, ma_large, [float(e["ma_index"]) for e in entries], prices, average_price)
+    qi_results = allocate_index_cpi(
+        qi_min, qi_large, [float(e["qi_index"]) for e in entries],
+        prices, average_price, max_price,
+    )
+    ma_results = allocate_index_cpi(
+        ma_min, ma_large, [float(e["ma_index"]) for e in entries],
+        prices, average_price, max_price,
+    )
     agent_benefits = [agent_mi_benefit(e.get("agents", 0)) for e in entries]
     effective_mi = [float(entry["mi_investment"]) * agent_benefits[index] for index, entry in enumerate(entries)]
-    mi_results = allocate_index_cpi(mi_min_base, mi_large_base, effective_mi, prices, average_price)
+    mi_results = allocate_index_cpi(
+        mi_min_base, mi_large_base, effective_mi, prices, average_price, max_price,
+    )
 
     price_cpis = [0.0] * len(entries)
     eligible: list[tuple[int, float]] = []

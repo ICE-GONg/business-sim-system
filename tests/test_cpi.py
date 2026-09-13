@@ -8,11 +8,50 @@ from sim.cpi import (
     allocate_city_cpi,
     allocate_city_cpi_for_company,
     allocate_index_cpi,
+    investment_price_curve,
+    investment_price_factor,
     minimum_threshold,
 )
 
 
 class CPIGeneratorPortTests(unittest.TestCase):
+    def test_investment_price_curve_is_continuous_monotone_and_hits_anchors(self) -> None:
+        maximum = 25_000.0
+        anchors = {
+            1.00: 0.65,
+            0.85: 1.00,
+            0.70: 1.50,
+            0.55: 1.64,
+            0.40: 1.68,
+            0.00: 1.70,
+        }
+        for ratio, expected in anchors.items():
+            self.assertAlmostEqual(
+                investment_price_curve(maximum * ratio, maximum),
+                expected,
+                places=12,
+            )
+
+        ratios = [index / 1000 for index in range(1001)]
+        factors = [investment_price_curve(maximum * ratio, maximum) for ratio in ratios]
+        self.assertTrue(
+            all(left >= right for left, right in zip(factors, factors[1:])),
+            "raising price must never improve investment efficiency",
+        )
+        for boundary in (0.40, 0.55, 0.70, 0.85):
+            below = investment_price_curve(maximum * (boundary - 1e-9), maximum)
+            above = investment_price_curve(maximum * (boundary + 1e-9), maximum)
+            self.assertLess(abs(below - above), 1e-7)
+
+        # One yuan across either important interval boundary cannot create a
+        # visible CPI jump. The weighted player average remains a small smooth
+        # correction rather than replacing the fitted KDS curve.
+        for boundary in (0.70, 0.85):
+            center = maximum * boundary
+            below = investment_price_factor(center - 1, center, maximum)
+            above = investment_price_factor(center + 1, center, maximum)
+            self.assertLess(abs(below - above), 0.001)
+
     def test_minimum_threshold_matches_javascript(self) -> None:
         self.assertEqual(minimum_threshold(500), 1)
 
