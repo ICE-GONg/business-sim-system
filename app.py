@@ -188,6 +188,19 @@ st.markdown(
     .round-strip .eyebrow { font-size:.7rem; letter-spacing:.11em; text-transform:uppercase; opacity:.82; }
     .round-strip .value { font-size:1.42rem; font-weight:750; }
     .round-strip .right { text-align:right; }
+    .round-countdown-overlay { position:fixed; inset:0; z-index:999999; display:flex; align-items:center; justify-content:center;
+                               background:rgba(20,22,27,.76); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px);
+                               animation:countdown-dismiss .22s ease 3s forwards; }
+    .round-countdown-content { text-align:center; transform:translateY(-3vh); }
+    .round-countdown-number { position:relative; width:clamp(8rem,24vw,14rem); height:clamp(7rem,22vw,13rem); margin:auto;
+                              color:var(--brand); font-size:clamp(7rem,22vw,13rem); line-height:.9; font-weight:900;
+                              letter-spacing:-.055em; text-shadow:0 8px 30px rgba(0,0,0,.34); }
+    .round-countdown-number span { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; opacity:0;
+                                   animation:countdown-step 1s ease both; }
+    .round-countdown-number span:nth-child(2) { animation-delay:1s; }
+    .round-countdown-number span:nth-child(3) { animation-delay:2s; }
+    .round-countdown-label { margin-top:1.1rem; color:#fff; font-size:clamp(1.65rem,5vw,3rem); font-weight:800;
+                             letter-spacing:.045em; text-shadow:0 4px 16px rgba(0,0,0,.35); }
     .player-meta { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:.88rem; padding:.35rem 0 .55rem; }
     .player-meta::before { content:""; width:8px; height:8px; flex:0 0 auto; border-radius:50%; background:var(--success); box-shadow:0 0 0 3px #eef8e9; }
     .st-key-player_navigation [data-testid="stSegmentedControl"] { background:#fff; border:1px solid var(--line); border-radius:8px; padding:4px; box-shadow:0 3px 10px rgba(31,45,61,.035); }
@@ -210,6 +223,12 @@ st.markdown(
     .podium-item.rank-1 .podium-bar { height:88px; }
     .podium-item.rank-2 .podium-bar { height:68px; opacity:.90; }
     .podium-item.rank-3 .podium-bar { height:54px; opacity:.80; }
+    .overview-card.reveal .podium-bar { transform-origin:center bottom; animation:podium-rise .95s cubic-bezier(.2,.8,.25,1) 3.05s both; }
+    .overview-card.reveal .asset-value, .overview-card.reveal .current-rank .position { animation:result-reveal .75s ease-out 3.05s both; }
+    @keyframes countdown-step { 0% { opacity:0; transform:scale(.72); } 15%,72% { opacity:1; transform:scale(1); } 100% { opacity:0; transform:scale(1.12); } }
+    @keyframes countdown-dismiss { to { opacity:0; visibility:hidden; } }
+    @keyframes podium-rise { from { transform:scaleY(0); } to { transform:scaleY(1); } }
+    @keyframes result-reveal { from { opacity:0; transform:translateY(9px); } to { opacity:1; transform:translateY(0); } }
     .company-profile { text-align:center; padding:4px 24px 28px; }
     .company-profile h2 { margin:0 0 12px; font-size:1.8rem; }
     .company-meta { display:flex; flex-wrap:wrap; justify-content:center; gap:10px; }
@@ -295,6 +314,41 @@ st.markdown(
 
 
 STATUS_LABELS = {"waiting": "等待赛前设置", "open": "决策开放", "paused": "已暂停", "settled": "已结算"}
+
+
+def show_round_start_countdown(round_row: sqlite3.Row | None) -> bool:
+    """Show one full-screen 3-2-1 sequence per player session and round start."""
+    if not round_row or str(round_row["status"]) != "open":
+        return False
+    round_no = int(round_row["round_no"])
+    countdown_id = f"{round_no}:{round_row['starts_at'] or ''}"
+    if st.session_state.get("player_round_countdown_id") == countdown_id:
+        return False
+    st.session_state["player_round_countdown_id"] = countdown_id
+    round_label = "Test Round" if round_no < 0 else f"Round {round_no}"
+    st.markdown(
+        f'<div class="round-countdown-overlay" role="status" aria-label="{round_label} countdown">'
+        '<div class="round-countdown-content"><div class="round-countdown-number">'
+        '<span>3</span><span>2</span><span>1</span></div>'
+        f'<div class="round-countdown-label">{round_label}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    return True
+
+
+def player_visible_round(conn: sqlite3.Connection) -> int:
+    """Latest formal result released to players; admins always see settled data."""
+    round_row = current_round(conn)
+    if not round_row:
+        return 0
+    round_no = int(round_row["round_no"])
+    status = str(round_row["status"])
+    total_rounds = int(float(get_setting(conn, "total_rounds", 7)))
+    if round_no < 0:
+        return round_no - 1
+    if status == "settled" and round_no >= total_rounds:
+        return round_no
+    return max(0, round_no - 1)
 
 
 def money(value: float | int | None) -> str:
@@ -561,19 +615,28 @@ def player_setup_header(company: sqlite3.Row) -> None:
         st.rerun()
 
 
-def render_player_overview(company: sqlite3.Row) -> None:
+def render_player_overview(company: sqlite3.Row, animate_reveal: bool = False) -> None:
     with connect() as conn:
         round_row = current_round(conn)
-        latest = one(conn, "SELECT * FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no DESC LIMIT 1", (company["id"],))
+        visible_round = player_visible_round(conn)
+        initial_cash = float(get_setting(conn, "initial_cash", 6_500_000.0))
+        latest = one(
+            conn,
+            "SELECT * FROM results WHERE company_id=? AND round_no>=1 AND round_no<=? ORDER BY round_no DESC LIMIT 1",
+            (company["id"], visible_round),
+        )
+        pending_release = one(
+            conn,
+            "SELECT 1 FROM results WHERE company_id=? AND round_no>? LIMIT 1",
+            (company["id"], visible_round),
+        )
         ranking = rank_rows(conn, int(latest["round_no"]) if latest else 0)
         my_rank = next((row["rank"] for row in ranking if row["id"] == company["id"]), None)
-        workers = employee_count(conn, company["id"], "worker")
-        engineers = employee_count(conn, company["id"], "engineer")
         ready = setup_status(conn)
         wealth_rows = all_rows(
             conn,
-            "SELECT round_no,net_assets FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no",
-            (company["id"],),
+            "SELECT round_no,net_assets FROM results WHERE company_id=? AND round_no>=1 AND round_no<=? ORDER BY round_no",
+            (company["id"], visible_round),
         )
 
     podium_items = []
@@ -585,18 +648,27 @@ def render_player_overview(company: sqlite3.Row) -> None:
             f'<div class="podium-bar">第 {position} 名</div></div>'
         )
     if latest:
+        latest_report = json.loads(latest["report_json"])
+        latest_hr = latest_report.get("human_resources", {})
         summary_title = f"Round {int(latest['round_no'])} Summary"
         total_assets = float(latest["total_assets"])
         debt = float(latest["debt"])
         net_assets = float(latest["net_assets"])
+        workers = int(latest_hr.get("workers", 0))
+        engineers = int(latest_hr.get("engineers", 0))
+        inventory = int(latest["inventory"])
     else:
         summary_title = "Initial Assets"
-        total_assets = float(company["cash"])
-        debt = float(company["debt"])
+        total_assets = initial_cash
+        debt = 0.0
         net_assets = total_assets - debt
+        workers = 0
+        engineers = 0
+        inventory = 0
     rank_display = f"{my_rank}" if my_rank else "—"
+    reveal_class = " reveal" if animate_reveal else ""
     st.markdown(
-        '<div class="overview-card">'
+        f'<div class="overview-card{reveal_class}">'
         '<div class="overview-main">'
         f'<div class="current-rank"><div class="label">CURRENTLY · 当前</div><div class="position">#{rank_display}</div></div>'
         f'<div class="podium">{"".join(podium_items)}</div>'
@@ -607,7 +679,7 @@ def render_player_overview(company: sqlite3.Row) -> None:
         f'<span class="company-pill">🪪 {html.escape(str(company["code"]))}</span>'
         f'<span class="company-pill">🏠 {html.escape(str(company["home_city"] or "未选择"))}</span>'
         f'<span class="company-pill">👥 员工 {workers + engineers:,}</span>'
-        f'<span class="company-pill">📦 库存 {int(company["product_inventory"]):,}</span>'
+        f'<span class="company-pill">📦 库存 {inventory:,}</span>'
         '</div></div>'
         f'<div class="summary-title">{html.escape(summary_title)}</div>'
         '<div class="asset-summary">'
@@ -620,6 +692,8 @@ def render_player_overview(company: sqlite3.Row) -> None:
     st.markdown('<div class="reports-strip">Reports · 赛后报表</div><div class="reports-note">完整回合报表请在顶部“报表”页面直接查看。</div>', unsafe_allow_html=True)
     if round_row and round_row["status"] == "waiting":
         st.info(f"已有 {ready['ready']}/{ready['total']} 支队伍完成赛前设置。全部就绪后管理员才能开始第一轮。")
+    if pending_release:
+        st.info("本轮已经结算，排名、资产变化和报表将在管理员确认开启下一轮后揭晓。")
     if wealth_rows:
         with st.expander("查看资产变化", expanded=False):
             wealth_frame = pd.DataFrame([dict(row) for row in wealth_rows]).rename(
@@ -979,12 +1053,25 @@ def render_ranking(admin: bool = False) -> None:
     if admin:
         hero("财富排行榜", "按当轮结束后的 Net Assets 排序；Net Assets = 总资产（含期末库存价值）− 负债，所有费用均已计入。")
     with connect() as conn:
-        latest = one(conn, "SELECT MAX(round_no) AS n FROM results")
+        visible_round = player_visible_round(conn) if not admin else None
+        latest = one(
+            conn,
+            "SELECT MAX(round_no) AS n FROM results" if admin else "SELECT MAX(round_no) AS n FROM results WHERE round_no<=?",
+            () if admin else (visible_round,),
+        )
         latest_round = int(latest["n"] or 0) if latest else 0
         if not latest_round:
-            st.info("暂无已结算回合。")
+            st.info("暂无已公开排名；本轮结果会在管理员开启下一轮后揭晓。" if not admin else "暂无已结算回合。")
             return
-        round_numbers = [int(row["round_no"]) for row in all_rows(conn, "SELECT DISTINCT round_no FROM results ORDER BY round_no DESC")]
+        round_numbers = [
+            int(row["round_no"])
+            for row in all_rows(
+                conn,
+                "SELECT DISTINCT round_no FROM results ORDER BY round_no DESC"
+                if admin else "SELECT DISTINCT round_no FROM results WHERE round_no<=? ORDER BY round_no DESC",
+                () if admin else (visible_round,),
+            )
+        ]
         selected = st.selectbox("选择轮次", round_numbers, index=0)
         rows = rank_rows(conn, selected)
     if not admin:
@@ -1213,9 +1300,21 @@ def render_reports(company: sqlite3.Row | None, admin: bool = False) -> None:
             selected_company = companies[labels.index(selected_label)]
         else:
             selected_company = company
-        rounds = all_rows(conn, "SELECT round_no FROM results WHERE company_id=? ORDER BY round_no DESC", (selected_company["id"],))
+        if admin:
+            rounds = all_rows(
+                conn,
+                "SELECT round_no FROM results WHERE company_id=? ORDER BY round_no DESC",
+                (selected_company["id"],),
+            )
+        else:
+            visible_round = player_visible_round(conn)
+            rounds = all_rows(
+                conn,
+                "SELECT round_no FROM results WHERE company_id=? AND round_no<=? ORDER BY round_no DESC",
+                (selected_company["id"], visible_round),
+            )
         if not rounds:
-            st.info("暂无已结算报表。")
+            st.info("暂无已公开报表；本轮报表会在管理员开启下一轮后解锁。" if not admin else "暂无已结算报表。")
             return
         round_no = st.selectbox("轮次", [int(row["round_no"]) for row in rounds])
         render_report_detail(conn, int(selected_company["id"]), int(round_no), admin)
@@ -2250,6 +2349,7 @@ def main() -> None:
     company_id = int(auth.get("company_id", 0))
     with connect() as conn:
         company = one(conn, "SELECT * FROM companies WHERE id=?", (company_id,))
+        round_row = current_round(conn)
     if not company:
         st.session_state.clear()
         st.rerun()
@@ -2257,9 +2357,10 @@ def main() -> None:
         player_setup_header(company)
         render_setup(company)
         return
+    countdown_played = show_round_start_countdown(round_row)
     page = player_navigation(company)
     {
-        "概览": lambda: render_player_overview(company),
+        "概览": lambda: render_player_overview(company, animate_reveal=countdown_played),
         "决策": lambda: render_player_decision(company),
         "排名": render_ranking,
         "报表": lambda: render_reports(company),
