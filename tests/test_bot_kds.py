@@ -41,6 +41,50 @@ class BotKDSRegressionTest(unittest.TestCase):
         )
         return int(cursor.lastrowid)
 
+    def test_empirical_super_profiles_diversify_only_within_safe_profit_band(self):
+        def candidate(name, *, profit, risk, ma=1, qi=1, mi=0, price=.9, sold=100, coverage=.8):
+            return {
+                "name": name,
+                "predicted_profit": profit,
+                "risk_profit": risk,
+                "ma": ma,
+                "qi": qi,
+                "marketing_total": mi,
+                "price_ratio": price,
+                "predicted_sold": sold,
+                "sell_ratio": min(1.0, sold / 200),
+                "coverage": coverage,
+                "score": (1, profit, risk),
+            }
+
+        choices = [
+            candidate("high", profit=1000, risk=900, ma=10, price=.97, coverage=.7),
+            candidate("ma", profit=980, risk=875, ma=100, price=.9, coverage=.8),
+            candidate("qi", profit=980, risk=875, qi=100, price=.9, coverage=.8),
+            candidate("mi", profit=980, risk=875, mi=100, price=.9, coverage=.8),
+            candidate("balanced", profit=975, risk=870, ma=50, qi=50, mi=50, coverage=.82),
+            candidate("fit", profit=970, risk=865, ma=20, qi=20, mi=20, coverage=1.0),
+            candidate("low", profit=970, risk=865, price=.60, sold=300, coverage=1.2),
+            candidate("too-costly", profit=900, risk=850, ma=1000, qi=1000, mi=1000, sold=1000),
+            candidate("unsafe", profit=1100, risk=-1, price=.99, sold=1000),
+        ]
+        expected = ["high", "ma", "qi", "mi", "balanced", "fit", "low"]
+        for profile, name in enumerate(expected):
+            with self.subTest(profile=profile):
+                selected = self.bots._select_empirical_super_candidate(
+                    choices,
+                    profile,
+                    tactical_price_allowed=True,
+                )
+                self.assertEqual(selected["name"], name)
+
+        early_price_profile = self.bots._select_empirical_super_candidate(
+            choices,
+            6,
+            tactical_price_allowed=False,
+        )
+        self.assertEqual(early_price_profile["name"], "high")
+
     def submitted_seller(self, code, price):
         company_id = self.company(code)
         self.conn.execute(

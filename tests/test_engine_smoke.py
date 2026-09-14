@@ -13,6 +13,7 @@ class SettlementSmokeTest(unittest.TestCase):
             os.environ["SIM_DB_PATH"] = str(Path(temp_dir) / "smoke.db")
             from sim import db
             from sim.engine import settle_round, weighted_market_average
+            from sim.report_image import build_round_report_jpg
             from sim.report_pdf import build_round_report_pdf
 
             db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
@@ -85,6 +86,9 @@ class SettlementSmokeTest(unittest.TestCase):
                 pdf_bytes = build_round_report_pdf(dict(companies[0]), 1, report, 1, [])
                 self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
                 self.assertGreater(len(pdf_bytes), 7_000)
+                jpg_bytes = build_round_report_jpg(dict(companies[0]), 1, report, 1, [])
+                self.assertTrue(jpg_bytes.startswith(b"\xff\xd8"))
+                self.assertGreater(len(jpg_bytes), 30_000)
                 finance = report["finance"]
                 self.assertEqual(finance["project_bonus"], project_bonus)
                 self.assertEqual(finance["round_begins"], companies[0]["cash"])

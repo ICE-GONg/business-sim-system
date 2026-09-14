@@ -15,7 +15,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 25
+BOT_API_VERSION = 26
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -58,6 +58,98 @@ NORMAL_INVESTMENT_MIXES = (
     {"ma": 1.11, "qi": 1.11, "mi": 2.65},
     {"ma": 1.27, "qi": 1.25, "mi": 2.00},
 )
+
+
+def _select_empirical_super_candidate(
+    candidates: list[dict[str, Any]],
+    profile: int,
+    *,
+    tactical_price_allowed: bool,
+) -> dict[str, Any] | None:
+    """Choose a distinct, safe style without changing any engine mechanism.
+
+    Official reports show several profitable playbooks rather than one magic
+    investment mix.  The expensive search has already evaluated every item
+    here with the live KDS and CPI allocator.  We first retain only safe plans
+    within 3.5% of the best forecast profit, then let each profile express a
+    different playbook inside that near-optimal set.  This adds no CPI search
+    calls and never imports old report formulas into settlement.
+    """
+    valid = [
+        candidate for candidate in candidates
+        if math.isfinite(float(candidate.get("predicted_profit", -math.inf)))
+    ]
+    if not valid:
+        return None
+    non_loss = [candidate for candidate in valid if float(candidate.get("predicted_profit", -math.inf)) >= 0]
+    if not non_loss:
+        return max(valid, key=lambda candidate: candidate.get("score", ()))
+    safe = [candidate for candidate in non_loss if float(candidate.get("risk_profit", -math.inf)) >= 0]
+    base_pool = safe or non_loss
+    best_profit = max(float(candidate["predicted_profit"]) for candidate in base_pool)
+    near = [
+        candidate for candidate in base_pool
+        if float(candidate["predicted_profit"]) >= best_profit * 0.965
+    ] or base_pool
+
+    max_ma = max(1.0, max(float(candidate.get("ma", 1.0)) for candidate in near))
+    max_qi = max(1.0, max(float(candidate.get("qi", 1.0)) for candidate in near))
+    max_mi = max(1.0, max(float(candidate.get("marketing_total", 0.0)) for candidate in near))
+
+    def normalized(candidate: dict[str, Any]) -> tuple[float, float, float]:
+        return (
+            float(candidate.get("ma", 1.0)) / max_ma,
+            float(candidate.get("qi", 1.0)) / max_qi,
+            float(candidate.get("marketing_total", 0.0)) / max_mi,
+        )
+
+    style = int(profile) % 7
+    if style == 0:  # high-price, high-margin expansion
+        key = lambda candidate: (
+            float(candidate.get("price_ratio", 0.0)),
+            float(candidate.get("risk_profit", -math.inf)),
+            float(candidate.get("sell_ratio", 0.0)),
+        )
+    elif style == 1:  # management-led
+        key = lambda candidate: (
+            normalized(candidate)[0] - 0.12 * normalized(candidate)[1] - 0.08 * normalized(candidate)[2],
+            float(candidate.get("predicted_profit", -math.inf)),
+        )
+    elif style == 2:  # quality-led
+        key = lambda candidate: (
+            normalized(candidate)[1] - 0.10 * normalized(candidate)[0] - 0.08 * normalized(candidate)[2],
+            float(candidate.get("predicted_profit", -math.inf)),
+        )
+    elif style == 3:  # marketing-led in every opened city
+        key = lambda candidate: (
+            normalized(candidate)[2] - 0.08 * normalized(candidate)[0] - 0.08 * normalized(candidate)[1],
+            float(candidate.get("sell_ratio", 0.0)),
+            float(candidate.get("predicted_profit", -math.inf)),
+        )
+    elif style == 4:  # balanced three-pool investment
+        key = lambda candidate: (
+            min(normalized(candidate)),
+            -max(normalized(candidate)) + min(normalized(candidate)),
+            float(candidate.get("predicted_profit", -math.inf)),
+        )
+    elif style == 5:  # controlled output and CPI-to-stock fit
+        key = lambda candidate: (
+            -abs(float(candidate.get("coverage", 0.0)) - 1.0),
+            float(candidate.get("risk_profit", -math.inf)),
+            float(candidate.get("price_ratio", 0.0)),
+        )
+    elif tactical_price_allowed:  # late/distressed tactical undercut
+        key = lambda candidate: (
+            float(candidate.get("predicted_sold", 0.0)),
+            -float(candidate.get("price_ratio", 1.0)),
+            float(candidate.get("predicted_profit", -math.inf)),
+        )
+    else:
+        key = lambda candidate: (
+            float(candidate.get("price_ratio", 0.0)),
+            float(candidate.get("predicted_profit", -math.inf)),
+        )
+    return max(near, key=key)
 
 
 def _previous_report(conn: sqlite3.Connection, company_id: int, round_no: int) -> dict[str, Any]:
@@ -1873,7 +1965,9 @@ def _submit_bots(
                         "ma": candidate_ma, "qi": candidate_qi,
                         "marketing": candidate_marketing, "groups": candidate_groups,
                         "price_ratio": candidate_price_ratio, "coverage": 0.0,
-                        "predicted_profit": -math.inf, "sell_ratio": 0.0,
+                        "predicted_profit": -math.inf, "risk_profit": -math.inf,
+                        "predicted_sold": 0.0, "sell_ratio": 0.0,
+                        "marketing_total": sum(candidate_marketing.values()),
                     }
 
                 city_capacities: list[tuple[int, float, float]] = []
@@ -1987,8 +2081,10 @@ def _submit_bots(
                     "price_ratio": candidate_price_ratio,
                     "coverage": cpi_coverage,
                     "predicted_profit": predicted_profit,
+                    "risk_profit": risk_profit,
                     "predicted_sold": predicted_sold,
                     "sell_ratio": sell_ratio,
+                    "marketing_total": sum(candidate_marketing.values()),
                 }
 
             # Use field-informed upper bounds plus deliberately high legal
@@ -2071,6 +2167,21 @@ def _submit_bots(
                         else:
                             low_scale = scale
 
+            # The reports show that equally strong teams can win with very
+            # different mixes. Select a profile-specific plan only among the
+            # safe, near-maximum-profit candidates already evaluated above.
+            empirical_candidate = _select_empirical_super_candidate(
+                list(candidate_cache.values()),
+                profile,
+                tactical_price_allowed=bool(
+                    late_game_low_price
+                    or saturated_low_price_indices
+                    or prior_surplus_ratio >= 0.50
+                ),
+            )
+            if empirical_candidate is not None:
+                best_candidate = empirical_candidate
+
             # The last sequential Super Bot may take a genuine price-led route
             # when it captures materially more demand and still keeps most of
             # the maximum-profit plan. It may be aggressive, never suicidal.
@@ -2092,9 +2203,11 @@ def _submit_bots(
                     for later in bots[bot_position + 1:]
                 )
                 if (
-                    is_last_pending_super
+                    profile == 6
+                    and is_last_pending_super
                     and deep_sold >= best_sold * 1.20
-                    and (best_profit <= 0 or deep_profit >= best_profit * 0.72)
+                    and float(best_deep_price_candidate.get("risk_profit", -math.inf)) >= 0
+                    and (best_profit <= 0 or deep_profit >= best_profit * 0.94)
                 ):
                     best_candidate = best_deep_price_candidate
 
