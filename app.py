@@ -146,28 +146,55 @@ st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial
 st.markdown(
     """
     <style>
-    :root { --brand:#d94141; --brand-dark:#b82f35; --ink:#252a34; --muted:#727782; --line:#e8e6e3; }
-    .stApp { background: #f7f7f6; color: var(--ink); }
-    .block-container { max-width: 1180px; padding-top: 2.5rem; padding-bottom: 3rem; }
-    [data-testid="stSidebar"] { background: #2b303a; }
-    [data-testid="stSidebar"] * { color: #f7f7f6; }
-    [data-testid="stMetric"] { background: white; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; box-shadow: 0 2px 8px rgba(25,25,25,.035); }
+    :root {
+      --brand:#eb3f3b;
+      --brand-dark:#cf302d;
+      --brand-soft:#fff2f0;
+      --ink:#252a34;
+      --muted:#727782;
+      --line:#ebeef5;
+      --canvas:#f7f8fc;
+      --success:#67c23a;
+    }
+    html, body, [class*="css"] { font-family:"Helvetica Neue",Helvetica,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",Arial,sans-serif; }
+    .stApp { background: var(--canvas); color: var(--ink); }
+    .block-container { max-width: 1240px; padding-top: 1.6rem; padding-bottom: 3rem; }
+    [data-testid="stSidebar"] { background: #fff; border-right:1px solid var(--line); }
+    [data-testid="stSidebar"] * { color: var(--ink); }
+    [data-testid="stSidebar"] [aria-checked="true"] { background:var(--brand-soft); color:var(--brand); }
+    [data-testid="stSidebar"] hr { border-color:var(--line); }
+    [data-testid="stMetric"] { background:#fff; border:1px solid var(--line); border-radius:10px; padding:13px 15px; box-shadow:0 4px 14px rgba(31,45,61,.045); }
+    [data-testid="stMetricLabel"] { color:var(--muted); }
     div[data-testid="stForm"] { background: transparent; border: 0; padding: 0; }
-    [data-testid="stExpander"] { background: white; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: .65rem; }
-    [data-testid="stExpander"] summary { font-weight: 650; color: #85464b; }
-    div[data-baseweb="input"] > div, div[data-baseweb="select"] > div { background: #f1f1ef; border-color: transparent; }
-    .hero { padding: 18px 20px; border-radius: 12px; color: var(--ink); background: white;
-            border: 1px solid var(--line); border-left: 5px solid var(--brand); margin-bottom: 14px; }
-    .hero h1 { margin: 0 0 3px 0; font-size: 1.55rem; }
+    [data-testid="stExpander"] { background:#fff; border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:.7rem; box-shadow:0 3px 12px rgba(31,45,61,.035); }
+    [data-testid="stExpander"] summary { font-weight:650; color:var(--ink); min-height:54px; }
+    [data-testid="stExpander"] summary:hover { color:var(--brand); }
+    div[data-baseweb="input"] > div, div[data-baseweb="select"] > div { background:#fafafa; border-color:#dcdfe6; }
+    div[data-baseweb="input"] > div:focus-within, div[data-baseweb="select"] > div:focus-within { border-color:var(--brand); box-shadow:0 0 0 1px var(--brand); }
+    .stButton button, .stFormSubmitButton button { border-radius:999px; min-height:40px; font-weight:650; }
+    .stButton button[kind="primary"], .stFormSubmitButton button[kind="primary"] { background:var(--brand); border-color:var(--brand); }
+    .stButton button[kind="primary"]:hover, .stFormSubmitButton button[kind="primary"]:hover { background:var(--brand-dark); border-color:var(--brand-dark); }
+    .hero { padding:17px 20px; border-radius:8px; color:var(--ink); background:#fff;
+            border:1px solid var(--line); border-top:4px solid var(--brand); margin-bottom:14px; box-shadow:0 3px 12px rgba(31,45,61,.035); }
+    .hero h1 { margin:0 0 3px 0; font-size:1.5rem; letter-spacing:.01em; }
     .hero p { margin: 0; color: var(--muted); }
-    .round-strip { display:flex; align-items:center; justify-content:space-between; gap:18px; padding:15px 18px;
-                   color:white; background:linear-gradient(100deg,var(--brand-dark),var(--brand)); border-radius:12px; margin-bottom:10px; }
-    .round-strip .eyebrow { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; opacity:.8; }
-    .round-strip .value { font-size:1.35rem; font-weight:750; }
+    .app-wordmark { display:flex; align-items:center; justify-content:space-between; padding:0 2px 12px; color:var(--ink); font-size:.93rem; font-weight:760; letter-spacing:.055em; }
+    .app-wordmark .brand-word { color:var(--brand); }
+    .app-wordmark .app-mode { color:var(--muted); font-size:.73rem; font-weight:600; letter-spacing:.03em; }
+    .brand-mark { display:inline-block; width:17px; height:17px; margin-right:8px; vertical-align:-3px; border:2px solid var(--brand); border-radius:3px; transform:skewY(-12deg); position:relative; }
+    .brand-mark::after { content:""; position:absolute; left:3px; right:2px; bottom:3px; height:6px; border-bottom:2px solid var(--brand); border-right:2px solid var(--brand); border-radius:0 0 5px 0; }
+    .round-strip { display:flex; align-items:center; justify-content:space-between; gap:18px; padding:17px 22px;
+                   color:#fff; background:var(--brand); border-radius:7px 7px 2px 2px; margin-bottom:8px; box-shadow:0 5px 14px rgba(235,63,59,.15); }
+    .round-strip .eyebrow { font-size:.7rem; letter-spacing:.11em; text-transform:uppercase; opacity:.82; }
+    .round-strip .value { font-size:1.42rem; font-weight:750; }
     .round-strip .right { text-align:right; }
-    .player-meta { color:var(--muted); font-size:.88rem; padding:.25rem 0 .5rem; }
+    .player-meta { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:.88rem; padding:.35rem 0 .55rem; }
+    .player-meta::before { content:""; width:8px; height:8px; flex:0 0 auto; border-radius:50%; background:var(--success); box-shadow:0 0 0 3px #eef8e9; }
+    .st-key-player_navigation [data-testid="stSegmentedControl"] { background:#fff; border:1px solid var(--line); border-radius:8px; padding:4px; box-shadow:0 3px 10px rgba(31,45,61,.035); }
+    .st-key-player_navigation button { min-height:43px; border-radius:6px; color:var(--muted); font-weight:700; }
+    .st-key-player_navigation button[aria-pressed="true"] { background:var(--brand-soft); color:var(--brand); box-shadow:inset 0 -3px 0 var(--brand); }
     .section-note { color:var(--muted); font-size:.88rem; margin-top:-.35rem; margin-bottom:.7rem; }
-    .hint { background:#fff4f2; border-left:4px solid var(--brand); padding:11px 13px; border-radius:8px; }
+    .hint { background:var(--brand-soft); border-left:4px solid var(--brand); padding:11px 13px; border-radius:7px; }
     .danger { background:#fff1f2; border-left:4px solid #e11d48; padding:12px 14px; border-radius:8px; }
     .report-title { border-bottom:2px solid #3f4650; padding-bottom:.35rem; margin:1.25rem 0 .6rem; font-weight:750; font-size:1.05rem; }
     .report-note { color:var(--muted); font-size:.82rem; margin:.25rem 0 .7rem; }
@@ -206,6 +233,34 @@ st.markdown(
     .ranking-position { font-size:1.18rem; font-weight:800; color:var(--brand); }
     .ranking-team { font-weight:720; }
     .ranking-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:620; }
+    .abs-login-marker { display:none; }
+    .login-copy { min-height:540px; position:relative; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; overflow:hidden; }
+    .login-copy::before, .login-copy::after { content:""; position:absolute; z-index:0; left:-35%; width:170%; height:54px; background:var(--brand-soft); transform:rotate(-1.5deg); }
+    .login-copy::before { bottom:150px; }
+    .login-copy::after { bottom:58px; }
+    .login-copy > * { position:relative; z-index:1; }
+    .login-brand { color:var(--ink); font-size:1.72rem; font-weight:760; letter-spacing:.025em; }
+    .login-brand span { color:var(--brand); }
+    .login-welcome { color:#c8c9cc; font-size:.73rem; letter-spacing:.22em; margin-top:5px; padding-bottom:19px; position:relative; }
+    .login-welcome::after { content:""; width:22px; height:3px; background:var(--brand); position:absolute; left:50%; bottom:7px; transform:translateX(-50%); }
+    .login-subtitle { color:#514f7f; font-size:.98rem; font-weight:700; margin-top:10px; }
+    .sim-visual { width:350px; height:250px; margin-top:28px; position:relative; }
+    .sim-board { width:178px; height:126px; position:absolute; left:86px; top:42px; background:#fff; border:4px solid #153e98; border-radius:14px; transform:rotate(-5deg); box-shadow:0 12px 25px rgba(21,62,152,.12); }
+    .sim-board::before { content:""; position:absolute; left:25px; right:25px; top:25px; height:12px; border-radius:10px; background:#eb3f3b; box-shadow:0 28px 0 #0d87e9, 0 56px 0 #c9dcfa; }
+    .sim-token { position:absolute; display:flex; align-items:center; justify-content:center; border:4px solid #153e98; border-radius:50%; color:#153e98; background:#fff; font-weight:800; box-shadow:0 9px 18px rgba(21,62,152,.12); }
+    .sim-token.one { width:88px; height:88px; left:18px; top:112px; transform:rotate(-11deg); font-size:2rem; }
+    .sim-token.two { width:106px; height:106px; right:12px; top:8px; color:var(--brand); font-size:2.1rem; }
+    .sim-arrow { position:absolute; width:88px; height:56px; left:132px; bottom:18px; border-left:12px solid #0d87e9; border-bottom:12px solid #0d87e9; transform:skew(-24deg) rotate(-7deg); border-radius:0 0 0 14px; }
+    .sim-arrow::after { content:""; position:absolute; right:-16px; top:-17px; width:0; height:0; border-left:25px solid #0d87e9; border-top:16px solid transparent; border-bottom:16px solid transparent; transform:rotate(8deg); }
+    .login-card-title { display:inline-block; color:var(--brand); font-size:1.1rem; font-weight:800; letter-spacing:.06em; border-bottom:5px solid var(--brand); padding-bottom:8px; margin:8px 0 18px; }
+    .login-card-copy { color:var(--muted); font-size:.85rem; margin:-7px 0 8px; }
+    .login-version { color:var(--muted); font-size:.73rem; margin-top:10px; letter-spacing:.05em; }
+    body:has(.abs-login-marker) [data-testid="stHeader"], body:has(.abs-login-marker) [data-testid="stToolbar"] { display:none; }
+    body:has(.abs-login-marker) .stApp { background:#fff; }
+    body:has(.abs-login-marker) .block-container { max-width:1120px; padding-top:8vh; }
+    body:has(.abs-login-marker) div[data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"]:has(.login-card-title) { background:rgba(255,255,255,.97); border:1px solid var(--line); border-radius:12px; padding:18px 28px 22px; box-shadow:6px 8px 24px rgba(31,45,61,.14); }
+    body:has(.abs-login-marker) [data-testid="stForm"] label { color:var(--muted); font-size:.83rem; }
+    body:has(.abs-login-marker) [data-testid="stFormSubmitButton"] button { min-height:49px; }
     @media (max-width: 720px) {
       .block-container { padding-left: .75rem; padding-right: .75rem; }
       .block-container h2 { font-size:1.65rem; }
@@ -224,6 +279,14 @@ st.markdown(
       .ranking-head { font-size:.73rem; }
       .ranking-row { min-height:62px; font-size:.9rem; }
       .ranking-avatar { width:30px; height:30px; }
+      .app-wordmark { font-size:.78rem; }
+      .app-wordmark .app-mode { display:none; }
+      .round-strip { padding:14px 15px; }
+      .login-copy { min-height:315px; }
+      .login-brand { font-size:1.35rem; }
+      .sim-visual { transform:scale(.72); margin-top:-4px; margin-bottom:-34px; }
+      body:has(.abs-login-marker) .block-container { padding-top:1.25rem; }
+      body:has(.abs-login-marker) div[data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"]:has(.login-card-title) { padding:12px 16px 16px; }
     }
     </style>
     """,
@@ -300,34 +363,54 @@ def rank_rows(conn: sqlite3.Connection, round_no: int | None = None) -> list[dic
 
 
 def render_login() -> None:
-    left, center, right = st.columns([1, 1.25, 1])
-    with center:
-        st.markdown("## 📈 阿思丹商赛模拟系统")
-        st.caption("玩家决策 · 多城市 CPI 结算 · 管理员控制台")
-        with st.form("login_form"):
-            role_label = st.segmented_control("登录身份", ["玩家", "管理员"], default="玩家")
-            account = st.text_input("账号", placeholder="例如 C01")
-            password = st.text_input("密码", type="password")
-            submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
-        if submitted:
-            if role_label == "管理员":
-                expected_user = secret_value("SIM_ADMIN_USER")
-                expected_password = secret_value("SIM_ADMIN_PASSWORD")
-                if not expected_user or not expected_password:
-                    st.error("管理员登录尚未安全配置，请在部署后台设置管理员账号和密码。")
-                    return
-                if account == expected_user and password == expected_password:
-                    st.session_state["auth"] = {"role": "admin"}
-                    st.rerun()
-                st.error("管理员账号或密码错误。")
-            else:
-                with connect() as conn:
-                    company = one(conn, "SELECT * FROM companies WHERE code=?", (account.strip(),))
-                    if company and verify_password(password, company["password_hash"]):
-                        st.session_state["auth"] = {"role": "player", "company_id": int(company["id"])}
+    st.markdown('<div class="abs-login-marker" aria-hidden="true"></div>', unsafe_allow_html=True)
+    left, right = st.columns([1.3, 1], gap="large", vertical_alignment="center")
+    with left:
+        st.markdown(
+            """
+            <div class="login-copy">
+              <div class="login-brand"><span>ASIA</span> BUSINESS SIMULATION</div>
+              <div class="login-welcome">WELCOME</div>
+              <div class="login-subtitle">全新商业挑战 · 多城市经营决策系统</div>
+              <div class="sim-visual" aria-hidden="true">
+                <div class="sim-board"></div>
+                <div class="sim-token one">¥</div>
+                <div class="sim-token two">%</div>
+                <div class="sim-arrow"></div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        with st.container(border=True):
+            st.markdown('<div class="login-card-title">LOG IN</div>', unsafe_allow_html=True)
+            st.markdown('<div class="login-card-copy">输入比赛账号与密码进入系统</div>', unsafe_allow_html=True)
+            with st.form("login_form"):
+                role_label = st.segmented_control("登录身份", ["玩家", "管理员"], default="玩家")
+                account = st.text_input("账号 / ACCOUNT", placeholder="例如 C01", autocomplete="username")
+                password = st.text_input("密码 / PASSWORD", type="password", autocomplete="current-password")
+                submitted = st.form_submit_button("登 录  ·  LOG IN", type="primary", use_container_width=True)
+            if submitted:
+                if role_label == "管理员":
+                    expected_user = secret_value("SIM_ADMIN_USER")
+                    expected_password = secret_value("SIM_ADMIN_PASSWORD")
+                    if not expected_user or not expected_password:
+                        st.error("管理员登录尚未安全配置，请在部署后台设置管理员账号和密码。")
+                        return
+                    if account == expected_user and password == expected_password:
+                        st.session_state["auth"] = {"role": "admin"}
                         st.rerun()
-                st.error("玩家账号或密码错误。")
-        st.caption("初始玩家账号：C01–C04；初始密码：1234。部署前请在 Secrets 中修改管理员密码。")
+                    st.error("管理员账号或密码错误。")
+                else:
+                    with connect() as conn:
+                        company = one(conn, "SELECT * FROM companies WHERE code=?", (account.strip(),))
+                        if company and verify_password(password, company["password_hash"]):
+                            st.session_state["auth"] = {"role": "player", "company_id": int(company["id"])}
+                            st.rerun()
+                    st.error("玩家账号或密码错误。")
+            st.caption("初始玩家账号：C01-C04；初始密码：1234。")
+        st.markdown('<div class="login-version">BUSINESS SIMULATION WEB · SECURE ACCESS</div>', unsafe_allow_html=True)
 
 
 def sidebar(role: str, company: sqlite3.Row | None = None) -> str:
@@ -420,6 +503,7 @@ def round_banner(round_row: sqlite3.Row | None) -> None:
 def player_navigation(company: sqlite3.Row) -> str:
     with connect() as conn:
         round_row = current_round(conn)
+        total_rounds = int(float(get_setting(conn, "total_rounds", 7)))
     if round_row:
         end = parse_time(round_row["ends_at"])
         if end and round_row["status"] == "open":
@@ -429,9 +513,14 @@ def player_navigation(company: sqlite3.Row) -> str:
         else:
             time_value = STATUS_LABELS.get(round_row["status"], str(round_row["status"]))
             time_label = "回合状态"
-        round_value = "测试轮 -1" if int(round_row["round_no"]) < 0 else f"第 {round_row['round_no']} 轮"
+        round_value = "TEST ROUND -1" if int(round_row["round_no"]) < 0 else f"ROUND {round_row['round_no']}/{total_rounds}"
     else:
         round_value, time_label, time_value = "未开始", "回合状态", "等待管理员"
+    st.markdown(
+        '<div class="app-wordmark"><div><span class="brand-mark"></span><span class="brand-word">ASIA</span> BUSINESS SIMULATION</div>'
+        '<div class="app-mode">PLAYER OPERATION SYSTEM</div></div>',
+        unsafe_allow_html=True,
+    )
     st.markdown(
         '<div class="round-strip">'
         f'<div><div class="eyebrow">Round</div><div class="value">{html.escape(round_value)}</div></div>'
@@ -460,6 +549,11 @@ def player_navigation(company: sqlite3.Row) -> str:
 
 
 def player_setup_header(company: sqlite3.Row) -> None:
+    st.markdown(
+        '<div class="app-wordmark"><div><span class="brand-mark"></span><span class="brand-word">ASIA</span> BUSINESS SIMULATION</div>'
+        '<div class="app-mode">PLAYER SETUP</div></div>',
+        unsafe_allow_html=True,
+    )
     left, right = st.columns([6, 1])
     left.caption(f"{company['code']} · 赛前设置")
     if right.button("退出", use_container_width=True, key="setup_logout"):
