@@ -194,6 +194,19 @@ st.markdown(
     .round-countdown-number { position:relative; width:clamp(8rem,24vw,14rem); height:clamp(7rem,22vw,13rem); margin:auto;
                               color:var(--brand); font-size:clamp(7rem,22vw,13rem); line-height:.9; font-weight:900;
                               letter-spacing:-.055em; text-shadow:0 8px 30px rgba(0,0,0,.34); }
+    .round-countdown-number span { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+                                   opacity:0; animation:round-countdown-step 1.08s ease-in-out both; }
+    .round-countdown-number span:nth-child(2) { animation-delay:.96s; }
+    .round-countdown-number span:nth-child(3) { animation-name:round-countdown-last; animation-delay:1.92s; }
+    @keyframes round-countdown-step {
+        0% { opacity:0; transform:scale(.86); }
+        10%, 88% { opacity:1; transform:scale(1); }
+        100% { opacity:0; transform:scale(1.06); }
+    }
+    @keyframes round-countdown-last {
+        0% { opacity:0; transform:scale(.86); }
+        10%, 100% { opacity:1; transform:scale(1); }
+    }
     .round-countdown-label { margin-top:1.1rem; color:#fff; font-size:clamp(1.65rem,5vw,3rem); font-weight:800;
                              letter-spacing:.045em; text-shadow:0 4px 16px rgba(0,0,0,.35); }
     .round-end-overlay { position:fixed; inset:0; z-index:999999; display:flex; align-items:center; justify-content:center;
@@ -343,12 +356,21 @@ def show_round_start_countdown(round_row: sqlite3.Row | None) -> tuple[bool, str
     pending = st.session_state.get("player_round_countdown_pending_id") == countdown_id
     if not is_new and not pending:
         return False, countdown_id
+    if pending:
+        round_label = "Test Round" if round_no < 0 else f"Round {round_no}"
+        st.markdown(
+            f'<div class="round-countdown-overlay" role="status" aria-label="{round_label} countdown">'
+            '<div class="round-countdown-content"><div class="round-countdown-number">'
+            '<span>3</span><span>2</span><span>1</span></div>'
+            f'<div class="round-countdown-label">{round_label}</div></div></div>',
+            unsafe_allow_html=True,
+        )
     return pending, countdown_id
 
 
-def show_round_end_lock(round_row: sqlite3.Row | None) -> bool:
+def show_round_end_lock(round_row: sqlite3.Row | None, final_results_released: bool = False) -> bool:
     """Block the player UI after settlement until the administrator starts the next round."""
-    if not round_row or str(round_row["status"]) != "settled":
+    if not round_row or str(round_row["status"]) != "settled" or final_results_released:
         return False
     round_no = int(round_row["round_no"])
     round_label = "Test Round" if round_no < 0 else f"Round {round_no}"
@@ -361,10 +383,10 @@ def show_round_end_lock(round_row: sqlite3.Row | None) -> bool:
     return True
 
 
-def _round_state_token(round_row: sqlite3.Row | None) -> str:
+def _round_state_token(round_row: sqlite3.Row | None, final_release_round: int = 0) -> str:
     if not round_row:
-        return "none"
-    return f"{round_row['round_no']}:{round_row['status']}:{round_row['starts_at'] or ''}"
+        return f"none:{final_release_round}"
+    return f"{round_row['round_no']}:{round_row['status']}:{round_row['starts_at'] or ''}:{final_release_round}"
 
 
 @st.fragment(run_every=1.0)
@@ -373,13 +395,14 @@ def watch_player_round(observed_token: str) -> None:
     st.markdown('<span class="round-poll-anchor" aria-hidden="true">.</span>', unsafe_allow_html=True)
     with connect() as conn:
         latest = current_round(conn)
-    if _round_state_token(latest) != observed_token:
+        final_release_round = get_setting(conn, "final_results_release_round", 0, int)
+    if _round_state_token(latest, final_release_round) != observed_token:
         st.rerun()
 
 
-@st.fragment(run_every=1.0)
-def render_round_countdown(countdown_id: str, round_label: str) -> None:
-    """Advance one visible countdown frame per second, then release the new results."""
+@st.fragment(run_every=0.5)
+def wait_for_countdown_completion(countdown_id: str) -> None:
+    """Keep a hidden heartbeat until the browser-rendered countdown has finished."""
     if st.session_state.get("player_round_countdown_pending_id") != countdown_id:
         return
     st.markdown('<span class="round-poll-anchor" aria-hidden="true">.</span>', unsafe_allow_html=True)
@@ -393,20 +416,13 @@ def render_round_countdown(countdown_id: str, round_label: str) -> None:
     elapsed = datetime.now(timezone.utc).timestamp() - float(
         st.session_state.get("player_round_countdown_started_at", 0.0)
     )
-    if latest_id != countdown_id or elapsed >= 3.0:
+    if latest_id != countdown_id or elapsed >= 3.05:
         st.session_state.pop("player_round_countdown_pending_id", None)
         st.session_state.pop("player_round_countdown_pending_round", None)
         st.session_state.pop("player_round_countdown_started_at", None)
         if latest_id == countdown_id:
             st.session_state["player_round_reveal_animation"] = True
         st.rerun()
-    count = max(1, 3 - int(elapsed))
-    st.markdown(
-        f'<div class="round-countdown-overlay" role="status" aria-label="{round_label} countdown {count}">'
-        f'<div class="round-countdown-content"><div class="round-countdown-number">{count}</div>'
-        f'<div class="round-countdown-label">{round_label}</div></div></div>',
-        unsafe_allow_html=True,
-    )
 
 
 def player_visible_round(conn: sqlite3.Connection) -> int:
@@ -417,6 +433,14 @@ def player_visible_round(conn: sqlite3.Connection) -> int:
     round_no = int(round_row["round_no"])
     if round_no < 0:
         return round_no - 1
+    total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
+    final_release_round = get_setting(conn, "final_results_release_round", 0, int)
+    if (
+        str(round_row["status"]) == "settled"
+        and round_no >= total_rounds
+        and final_release_round == round_no
+    ):
+        return round_no
     pending_round = st.session_state.get("player_round_countdown_pending_round")
     if str(round_row["status"]) == "open" and pending_round is not None and int(pending_round) == round_no:
         return max(0, round_no - 2)
@@ -2219,7 +2243,19 @@ def render_admin_rounds() -> None:
                 except ValueError as exc:
                     st.error(str(exc))
         elif int(round_row["round_no"]) >= total_rounds:
-            st.success(f"全部 {total_rounds} 轮已经结束。")
+            final_round_no = int(round_row["round_no"])
+            with connect() as conn:
+                final_release_round = get_setting(conn, "final_results_release_round", 0, int)
+            if final_release_round == final_round_no:
+                st.success(f"全部 {total_rounds} 轮已经结束，最终结果、排名与报表已向玩家开放。")
+            else:
+                st.success(f"全部 {total_rounds} 轮已经结束。")
+                st.info("玩家当前仍停留在 The End 锁定画面。确认无误后，再释放完整比赛结果。")
+                if st.button("释放最终结果、排名与报表", type="primary", use_container_width=True):
+                    with connect() as conn:
+                        set_setting(conn, "final_results_release_round", final_round_no)
+                    flash("success", "最终结果已释放；玩家端会自动显示最后一轮报表与最终排名。")
+                    st.rerun()
         else:
             next_round = int(round_row["round_no"]) + 1
             st.markdown("#### 下一轮 Bonus")
@@ -2422,6 +2458,8 @@ def main() -> None:
     with connect() as conn:
         company = one(conn, "SELECT * FROM companies WHERE id=?", (company_id,))
         round_row = current_round(conn)
+        final_release_round = get_setting(conn, "final_results_release_round", 0, int)
+        total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
     if not company:
         st.session_state.clear()
         st.rerun()
@@ -2430,12 +2468,17 @@ def main() -> None:
         render_setup(company)
         return
     if not _running_under_app_test():
-        watch_player_round(_round_state_token(round_row))
-    show_round_end_lock(round_row)
+        watch_player_round(_round_state_token(round_row, final_release_round))
+    final_results_released = bool(
+        round_row
+        and str(round_row["status"]) == "settled"
+        and int(round_row["round_no"]) >= total_rounds
+        and final_release_round == int(round_row["round_no"])
+    )
+    show_round_end_lock(round_row, final_results_released)
     countdown_running, countdown_id = show_round_start_countdown(round_row)
     if countdown_running:
-        round_no = int(round_row["round_no"])
-        render_round_countdown(countdown_id, "Test Round" if round_no < 0 else f"Round {round_no}")
+        wait_for_countdown_completion(countdown_id)
     animate_reveal = bool(st.session_state.pop("player_round_reveal_animation", False))
     page = player_navigation(company)
     {

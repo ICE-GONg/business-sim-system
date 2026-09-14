@@ -34,6 +34,7 @@ DEFAULT_SETTINGS: dict[str, float | int | str] = {
     "loan_asset_threshold": 15_000_000,
     "global_max_loan": 10_000_000,
     "test_round_enabled": 0,
+    "final_results_release_round": 0,
     "qi_safe_multiplier": 1.10,
     "cpi_ma_large_threshold": 1_300,
     "cpi_price_power": 8,

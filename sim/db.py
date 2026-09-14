@@ -528,6 +528,7 @@ def start_competition(conn: sqlite3.Connection, duration_minutes: int, use_test_
     start = datetime.now(timezone.utc)
     end = start + timedelta(minutes=max(1, int(duration_minutes)))
     set_setting(conn, "test_round_enabled", int(bool(use_test_round)))
+    set_setting(conn, "final_results_release_round", 0)
     if use_test_round:
         conn.execute("DELETE FROM rounds WHERE round_no=1")
         conn.execute(
@@ -567,6 +568,7 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
     if latest is None or latest["round_no"] is None:
         raise ValueError("还没有已结算回合，无法回退。")
     target_round = int(latest["round_no"])
+    set_setting(conn, "final_results_release_round", 0)
     snapshot_row = one(conn, "SELECT snapshot_json FROM round_snapshots WHERE round_no=?", (target_round,))
     snapshot = json.loads(snapshot_row["snapshot_json"]) if snapshot_row else _reconstruct_pre_round_snapshot(conn, target_round)
 
@@ -604,6 +606,7 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
 
 
 def reset_competition(conn: sqlite3.Connection) -> None:
+    set_setting(conn, "final_results_release_round", 0)
     for table in ("round_bonuses", "round_snapshots", "market_round_stats", "city_results", "results", "city_decisions", "decisions", "agents", "employee_cohorts", "rounds"):
         conn.execute(f"DELETE FROM {table}")
     initial_cash = get_setting(conn, "initial_cash", 15_000_000)
