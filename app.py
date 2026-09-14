@@ -2397,6 +2397,7 @@ def main() -> None:
     end_locked = show_round_end_lock(round_row)
     if end_locked:
         wait_for_round_release(int(round_row["round_no"]), str(round_row["starts_at"] or ""))
+        return
     countdown_played = show_round_start_countdown(round_row)
     page = player_navigation(company)
     {
