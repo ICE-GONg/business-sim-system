@@ -15,7 +15,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 26
+BOT_API_VERSION = 27
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -65,6 +65,7 @@ def _select_empirical_super_candidate(
     profile: int,
     *,
     tactical_price_allowed: bool,
+    profit_target: float = 0.0,
 ) -> dict[str, Any] | None:
     """Choose a distinct, safe style without changing any engine mechanism.
 
@@ -86,6 +87,22 @@ def _select_empirical_super_candidate(
         return max(valid, key=lambda candidate: candidate.get("score", ()))
     safe = [candidate for candidate in non_loss if float(candidate.get("risk_profit", -math.inf)) >= 0]
     base_pool = safe or non_loss
+    target_pool = [
+        candidate for candidate in base_pool
+        if float(candidate["predicted_profit"]) > float(profit_target)
+    ]
+    if target_pool:
+        base_pool = target_pool
+    elif profit_target > 0:
+        # When the benchmark is not realistically reachable, style must not
+        # sacrifice profit. Take the strongest safe attempt instead.
+        return max(
+            base_pool,
+            key=lambda candidate: (
+                float(candidate.get("predicted_profit", -math.inf)),
+                float(candidate.get("risk_profit", -math.inf)),
+            ),
+        )
     best_profit = max(float(candidate["predicted_profit"]) for candidate in base_pool)
     near = [
         candidate for candidate in base_pool
@@ -150,6 +167,54 @@ def _select_empirical_super_candidate(
             float(candidate.get("predicted_profit", -math.inf)),
         )
     return max(near, key=key)
+
+
+def _strict_profit_improvement(value: float, rate: float) -> float:
+    value = float(value)
+    return value + max(1.0, abs(value) * rate)
+
+
+def _super_profit_target(
+    conn: sqlite3.Connection,
+    company_id: int,
+    round_no: int,
+    previous_super_id: int | None = None,
+) -> float:
+    """Benchmark against own growth, the preceding Bot and higher ranks.
+
+    Rankings and profits are taken from the latest completed official round;
+    current submitted decisions are still read separately by the CPI forecast.
+    This keeps the benchmark deterministic for local and remote/split analysis.
+    """
+    if round_no <= 1:
+        return 0.0
+    own = one(
+        conn,
+        "SELECT round_no,net_assets,net_profit FROM results WHERE company_id=? "
+        "AND round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 1",
+        (company_id, round_no),
+    )
+    if not own:
+        return 0.0
+    benchmark_round = int(own["round_no"])
+    targets = [_strict_profit_improvement(float(own["net_profit"] or 0.0), 0.03)]
+    higher = one(
+        conn,
+        "SELECT MAX(net_profit) AS profit FROM results WHERE round_no=? AND company_id<>? "
+        "AND (net_assets>? OR (net_assets=? AND company_id<?))",
+        (benchmark_round, company_id, own["net_assets"], own["net_assets"], company_id),
+    )
+    if higher and higher["profit"] is not None:
+        targets.append(_strict_profit_improvement(float(higher["profit"]), 0.01))
+    if previous_super_id is not None:
+        previous_bot = one(
+            conn,
+            "SELECT net_profit FROM results WHERE company_id=? AND round_no=?",
+            (previous_super_id, benchmark_round),
+        )
+        if previous_bot:
+            targets.append(_strict_profit_improvement(float(previous_bot["net_profit"] or 0.0), 0.01))
+    return max(0.0, *targets)
 
 
 def _previous_report(conn: sqlite3.Connection, company_id: int, round_no: int) -> dict[str, Any]:
@@ -926,6 +991,7 @@ def _submit_bots(
     remove_agent_cost = setting("agent_remove_cost", 100000)
     transport_cost = setting("transport_cost", 0)
     patent_factor = setting("patent_factor", 0.70)
+    tax_rate = min(1.0, max(0.0, setting("tax_rate", 0.20)))
     ma_threshold = setting("cpi_ma_large_threshold", 1300)
     qi_safe_multiplier = max(1.0, setting("qi_safe_multiplier", 1.10))
     initial_cash = max(1.0, setting("initial_cash", 15_000_000))
@@ -1041,6 +1107,13 @@ def _submit_bots(
         if existing_decision and not replace_existing:
             continue
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
+        profit_target = 0.0
+        if super_mode:
+            previous_super_id = int(bots[bot_position - 1]["id"]) if bot_position > 0 else None
+            profit_target = _super_profit_target(
+                conn, company_id, round_no, previous_super_id,
+            )
+        chosen_predicted_profit: float | None = None
         style = BOT_STYLES[profile]
         rng = _bot_rng(bot, round_no, super_mode)
         variation = rng.uniform(0.88, 1.14)
@@ -1847,6 +1920,10 @@ def _submit_bots(
             # every candidate/CPI calculation used by the original search.
             active_market_count = max(1, sum(1 for index in selected if agent_plan[index][1] > 0))
             candidate_city_data: list[tuple[Any, ...]] = []
+            forecast_interest = (
+                max(0.0, float(bot["debt"] or 0) + float(loan_change))
+                * float(home_market["interest_rate"] or 0)
+            )
             component_labor = component_need * worker_need * worker_hours / 504.0 * worker_salary * 3
             product_labor = engineer_need * engineer_hours / 504.0 * engineer_salary * 3
             for index in selected:
@@ -2057,12 +2134,15 @@ def _submit_bots(
                     + predicted_transport
                 )
                 predicted_revenue = predicted_sold * predicted_price
-                predicted_profit = predicted_revenue - predicted_cost
+                predicted_pre_tax = predicted_revenue - predicted_cost - forecast_interest
+                predicted_tax = max(0.0, predicted_pre_tax * tax_rate)
+                predicted_profit = predicted_pre_tax - predicted_tax
                 # A conservative revenue haircut protects the late-game
                 # strategy from a later undercut or small CPI forecast error.
                 # Safe profit wins first; near break-even market filling is
                 # allowed only when no safely profitable candidate exists.
-                risk_profit = predicted_revenue * 0.92 - predicted_cost
+                risk_pre_tax = predicted_revenue * 0.92 - predicted_cost - forecast_interest
+                risk_profit = risk_pre_tax - max(0.0, risk_pre_tax * tax_rate)
                 non_loss = int(predicted_profit >= 0)
                 # Profit is the primary objective. Sell-through and CPI/stock
                 # fit break ties between similarly profitable strategies, so a
@@ -2178,6 +2258,7 @@ def _submit_bots(
                     or saturated_low_price_indices
                     or prior_surplus_ratio >= 0.50
                 ),
+                profit_target=profit_target,
             )
             if empirical_candidate is not None:
                 best_candidate = empirical_candidate
@@ -2212,6 +2293,7 @@ def _submit_bots(
                     best_candidate = best_deep_price_candidate
 
             if best_candidate is not None:
+                chosen_predicted_profit = float(best_candidate.get("predicted_profit", 0.0))
                 ma_index_target = float(best_candidate["ma"])
                 qi_index_target = float(best_candidate["qi"])
                 marketing_targets = dict(best_candidate["marketing"])
@@ -2263,6 +2345,10 @@ def _submit_bots(
                     official_round >= 4
                     and cash_budget >= research_goal * 4.0
                     and projected_cash - research_needed >= cash_budget * 1.05
+                    and (
+                        chosen_predicted_profit is None
+                        or chosen_predicted_profit - research_needed > profit_target
+                    )
                 )
             )
         )

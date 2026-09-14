@@ -85,6 +85,47 @@ class BotKDSRegressionTest(unittest.TestCase):
         )
         self.assertEqual(early_price_profile["name"], "high")
 
+        # A style may diversify only after clearing the growth benchmark. If
+        # the target is unreachable, it makes the highest-profit safe attempt.
+        targeted = self.bots._select_empirical_super_candidate(
+            choices,
+            1,
+            tactical_price_allowed=True,
+            profit_target=985,
+        )
+        unreachable = self.bots._select_empirical_super_candidate(
+            choices,
+            6,
+            tactical_price_allowed=True,
+            profit_target=2_000,
+        )
+        self.assertEqual(targeted["name"], "high")
+        self.assertEqual(unreachable["name"], "high")
+
+    def test_super_profit_target_uses_self_higher_rank_and_previous_bot(self):
+        leader_id = self.company("HUMAN")
+        previous_bot_id = self.company("SUPER-A", super_mode=True)
+        target_bot_id = self.company("SUPER-B", super_mode=True)
+
+        def result(company_id, assets, profit):
+            self.conn.execute(
+                "INSERT INTO results(company_id,round_no,total_assets,debt,net_assets,cash,"
+                "sales_revenue,total_cost,net_profit,produced,sold,inventory,ma_index,qi_index,"
+                "research_success,report_json) VALUES(?,1,?,0,?,?,?,0,?,0,0,0,0,0,0,'{}')",
+                (company_id, assets, assets, assets, profit, profit),
+            )
+
+        result(leader_id, 300, 150)
+        result(previous_bot_id, 100, 175)
+        result(target_bot_id, 200, 100)
+        target = self.bots._super_profit_target(
+            self.conn,
+            target_bot_id,
+            2,
+            previous_bot_id,
+        )
+        self.assertAlmostEqual(target, 176.75)
+
     def submitted_seller(self, code, price):
         company_id = self.company(code)
         self.conn.execute(
