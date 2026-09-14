@@ -743,6 +743,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
             "research_investment": 0.0,
             "submitted_at": None,
         }
+        settings = settings_dict(conn)
         city_values: dict[str, dict[str, Any]] = {}
         for market in markets:
             city = str(market["city"])
@@ -751,12 +752,11 @@ def render_player_decision(company: sqlite3.Row) -> None:
             city_values[city] = dict(saved) if saved else {
                 "agent_delta": 0,
                 "marketing_investment": 0.0,
-                "price": float(market["initial_avg_price"]),
+                "price": min(float(settings["price_max"]), float(market["max_price"])),
                 "order_report": 0,
             }
             city_values[city]["current_agents"] = int(agent["count"]) if agent else 0
         helper = decision_helper(conn, company, round_no)
-        settings = settings_dict(conn)
         worker_salary_low, worker_salary_high = salary_bounds(settings, previous_worker_salary)
         engineer_salary_low, engineer_salary_high = salary_bounds(settings, previous_engineer_salary)
         loan_base_net_assets = current_company_net_assets(conn, company)
@@ -787,7 +787,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
     with st.form(f"decision_{round_no}"):
         loan_min = -float(company["debt"])
         loan_max = max(0.0, loan_limit)
-        with st.expander("💰 银行贷款", expanded=False):
+        with st.expander("💰 银行贷款", expanded=True):
             st.markdown(
                 f'<div class="section-note">计算净资产 {money(loan_base_net_assets)} ÷ 阈值 {money(settings["loan_asset_threshold"])} '
                 f'× 本轮封顶基数 {money(loan_ceiling)}；本轮可新增至多 {money(loan_limit)}，新增贷款最少 {money(minimum_new_loan)}。负数为还款。</div>',
@@ -1626,7 +1626,7 @@ def render_admin_decisions() -> None:
         loan_base_net_assets, float(settings["loan_asset_threshold"]), float(home["min_loan"]), loan_ceiling
     )
     with st.form(f"admin_decision_{round_no}_{company['id']}"):
-        with st.expander("💰 银行贷款", expanded=False):
+        with st.expander("💰 银行贷款", expanded=True):
             st.caption(
                 f"计算净资产 {money(loan_base_net_assets)}；本轮最高新增 {money(loan_limit)}；"
                 f"新增贷款最少 {money(home['min_loan'])}；本轮公式封顶基数 {money(loan_ceiling)}。"
@@ -1659,7 +1659,7 @@ def render_admin_decisions() -> None:
                 city_inputs[city] = {
                     "agent_delta": cols[0].number_input("Agent 增减", min_value=-current_agents, max_value=int(settings["max_agent_add_per_city_round"]), value=min(int(saved.get("agent_delta", 0)), int(settings["max_agent_add_per_city_round"])), step=1, key=f"admin_agent_{company['id']}_{round_no}_{city}", disabled=not editable),
                     "marketing_investment": cols[1].number_input("营销投入（MI）", min_value=0.0, value=float(saved.get("marketing_investment", 0.0)), step=10_000.0, key=f"admin_mi_{company['id']}_{round_no}_{city}", disabled=not editable),
-                    "price": cols[2].number_input("售价", min_value=float(settings["price_min"]), max_value=min(float(settings["price_max"]), float(market["max_price"])), value=float(saved.get("price", market["initial_avg_price"])), step=100.0, key=f"admin_price_{company['id']}_{round_no}_{city}", disabled=not editable),
+                    "price": cols[2].number_input("售价", min_value=float(settings["price_min"]), max_value=min(float(settings["price_max"]), float(market["max_price"])), value=float(saved.get("price", min(float(settings["price_max"]), float(market["max_price"])))), step=100.0, key=f"admin_price_{company['id']}_{round_no}_{city}", disabled=not editable),
                     "order_report": cols[3].checkbox("购买市场报告", value=bool(saved.get("order_report", 0)), key=f"admin_report_{company['id']}_{round_no}_{city}", disabled=not editable),
                 }
         save_label = "保存 Super Bot 草稿" if company["is_super_bot"] and not mark_submitted else "保存玩家决策"
