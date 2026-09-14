@@ -1206,6 +1206,80 @@ def render_ranking(admin: bool = False) -> None:
     )
 
 
+def _official_market_sections(
+    conn: sqlite3.Connection,
+    company_id: int,
+    round_no: int,
+    report: dict[str, Any],
+    admin: bool,
+) -> list[dict[str, Any]]:
+    """Map the live KDS/result rows into the shared screen/download template."""
+    if admin:
+        visible_cities = [str(item["city"]) for item in all_rows(conn, "SELECT city FROM market_config ORDER BY city")]
+    else:
+        visible_cities = [str(item["city"]) for item in report["sales"] if item.get("report_purchased")]
+        if not any("report_purchased" in item for item in report["sales"]):
+            visible_cities = [
+                str(item["city"])
+                for item in all_rows(
+                    conn,
+                    "SELECT city FROM city_decisions WHERE company_id=? AND round_no=? "
+                    "AND order_report=1 ORDER BY city",
+                    (company_id, round_no),
+                )
+            ]
+
+    sections: list[dict[str, Any]] = []
+    for city in dict.fromkeys(visible_cities):
+        result_rows = all_rows(
+            conn,
+            "SELECT c.code,c.name,cr.*,r.ma_index,r.qi_index,a.count AS current_agents "
+            "FROM city_results cr JOIN companies c ON c.id=cr.company_id "
+            "JOIN results r ON r.company_id=cr.company_id AND r.round_no=cr.round_no "
+            "LEFT JOIN agents a ON a.company_id=cr.company_id AND a.city=cr.city "
+            "WHERE cr.round_no=? AND cr.city=? ORDER BY cr.market_share DESC",
+            (round_no, city),
+        )
+        visible_rows: list[dict[str, Any]] = []
+        for item in result_rows:
+            breakdown = json.loads(item["breakdown_json"]) if item["breakdown_json"] else {}
+            agents = int(breakdown.get("agents", item["current_agents"] or 0))
+            if agents <= 0:
+                continue
+            visible_rows.append({
+                "code": item["code"],
+                "ma_index": item["ma_index"],
+                "agents": agents,
+                "marketing": item["marketing"],
+                "qi_index": item["qi_index"],
+                "cpi": item["cpi"],
+                "price": item["price"],
+                "sold": item["sold"],
+                "market_share": item["market_share"],
+            })
+        stats = one(conn, "SELECT * FROM market_round_stats WHERE round_no=? AND city=?", (round_no, city))
+        market = one(conn, "SELECT * FROM market_config WHERE city=?", (city,))
+        city_sale = next((item for item in report["sales"] if str(item["city"]) == city), {})
+        market_size_value = float(stats["market_size"]) if stats else float(city_sale.get("market_size", 0.0))
+        total_volume = float(stats["player_total_volume"]) if stats else float(sum(int(item["sold"]) for item in visible_rows))
+        base_average = float(stats["base_average_price"]) if stats else float(market["initial_avg_price"] if market else 0.0)
+        average_price = float(stats["average_price"]) if stats else weighted_market_average(
+            base_average,
+            market_size_value,
+            [(float(item["price"]), float(item["sold"])) for item in visible_rows],
+        )
+        sections.append({
+            "city": city,
+            "population": market["population"] if market else 0,
+            "penetration": market["penetration"] if market else 0,
+            "market_size": market_size_value,
+            "total_volume": total_volume,
+            "average_price": average_price,
+            "rows": visible_rows,
+        })
+    return sections
+
+
 def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: int, admin: bool) -> None:
     company = one(conn, "SELECT * FROM companies WHERE id=?", (company_id,))
     row = one(conn, "SELECT * FROM results WHERE company_id=? AND round_no=?", (company_id, round_no))
@@ -1215,6 +1289,34 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     report = json.loads(row["report_json"])
     ranking = rank_rows(conn, round_no)
     my_rank = next((item["rank"] for item in ranking if item["id"] == company_id), "—")
+    official_market_sections = _official_market_sections(conn, company_id, round_no, report, admin)
+    try:
+        jpg_bytes = build_round_report_jpg(
+            dict(company), round_no, report, my_rank, official_market_sections,
+        )
+        # Screen and download deliberately share the same rendered artifact so
+        # typography, field order and dynamic KDS values can never drift apart.
+        st.image(jpg_bytes, use_container_width=True)
+        st.download_button(
+            "下载本轮官方格式 JPG 长图",
+            jpg_bytes,
+            file_name=f"Round_{round_no}_{company['code']}_Report.jpg",
+            mime="image/jpeg",
+            use_container_width=True,
+        )
+        if admin:
+            research = report.get("research", {})
+            with st.expander("管理员结算信息"):
+                st.write(f"专利真实成功概率：{float(research.get('probability', 0.0)) * 100:.2f}%")
+                bottleneck = report.get("production", {}).get("bottleneck")
+                if bottleneck:
+                    st.write(f"生产限制：{bottleneck}")
+        return
+    except Exception:
+        LOGGER.exception("Official report image generation failed")
+        st.error("官方格式报表生成失败，请联系管理员查看后台日志。")
+        return
+
     metrics = report["key_metrics"]
     st.markdown(f"### {company['code']} · {company['name']}　｜　第 {round_no} 轮报表")
     st.markdown('<div class="report-title">关键指标 Key Metrics</div>', unsafe_allow_html=True)

@@ -108,7 +108,7 @@ class _LongReport:
     muted = "#61686d"
     line = "#9ca3a7"
     faint = "#d9dddf"
-    pale = "#f3f5f5"
+    pale = "#ffffff"
     brand = "#e34a43"
 
     def __init__(self, estimated_height: int) -> None:
@@ -276,14 +276,14 @@ def build_round_report_jpg(
 
     canvas.section("Key Metrics")
     canvas.table(
-        ["Total Assets", "Debt", "Net Assets", "Rank"],
-        [[_money(metrics.get("total_assets")), _money(metrics.get("debt")), _money(metrics.get("net_assets")), rank]],
-        [1, 1, 1, 0.48],
+        ["Total Assets", "", "Debt", "", "Net Assets", "", "Rank"],
+        [[_money(metrics.get("total_assets")), "-", _money(metrics.get("debt")), "+", _money(metrics.get("net_assets")), "", rank]],
+        [1.15, 0.16, 1.05, 0.16, 1.15, 0.08, 0.46],
     )
     canvas.table(
-        ["Sales Revenue", "Cost", "Net Profit"],
-        [[_money(metrics.get("sales_revenue")), _money(metrics.get("cost")), _money(metrics.get("net_profit"))]],
-        [1, 1, 1],
+        ["Sales Revenue", "", "Cost", "", "Net Profit"],
+        [[_money(metrics.get("sales_revenue")), "-", _money(metrics.get("cost")), "+", _money(metrics.get("net_profit"))]],
+        [1.2, 0.16, 1.05, 0.16, 1.2],
     )
     canvas.note("Net Profit = Sales Revenue - All Costs. This is the direct indicator of your achievement in this round.")
     canvas.note("Net Assets = Total Assets - Debt. Your result through this round is used for ranking.")
