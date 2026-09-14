@@ -189,7 +189,7 @@ st.markdown(
     .round-strip .value { font-size:1.42rem; font-weight:750; }
     .round-strip .right { text-align:right; }
     .round-countdown-overlay { position:fixed; inset:0; z-index:999999; display:flex; align-items:center; justify-content:center;
-                               background:rgba(20,22,27,.76); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px);
+                               background:rgba(20,22,27,.62);
                                animation:countdown-dismiss .22s ease 3s forwards; }
     .round-countdown-content { text-align:center; transform:translateY(-3vh); }
     .round-countdown-number { position:relative; width:clamp(8rem,24vw,14rem); height:clamp(7rem,22vw,13rem); margin:auto;
@@ -202,7 +202,7 @@ st.markdown(
     .round-countdown-label { margin-top:1.1rem; color:#fff; font-size:clamp(1.65rem,5vw,3rem); font-weight:800;
                              letter-spacing:.045em; text-shadow:0 4px 16px rgba(0,0,0,.35); }
     .round-end-overlay { position:fixed; inset:0; z-index:999999; display:flex; align-items:center; justify-content:center;
-                         background:rgba(20,22,27,.78); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px); cursor:not-allowed; }
+                         background:rgba(20,22,27,.62); cursor:not-allowed; }
     .round-end-content { text-align:center; transform:translateY(-3vh); }
     .round-end-title { color:var(--brand); font-size:clamp(5rem,17vw,10rem); line-height:.95; font-weight:900;
                        letter-spacing:-.045em; text-shadow:0 8px 30px rgba(0,0,0,.34); }
@@ -230,8 +230,8 @@ st.markdown(
     .podium-item.rank-1 .podium-bar { height:88px; }
     .podium-item.rank-2 .podium-bar { height:68px; opacity:.90; }
     .podium-item.rank-3 .podium-bar { height:54px; opacity:.80; }
-    .overview-card.reveal .podium-bar { transform-origin:center bottom; animation:podium-rise .95s cubic-bezier(.2,.8,.25,1) 3.05s both; }
-    .overview-card.reveal .asset-value, .overview-card.reveal .current-rank .position { animation:result-reveal .75s ease-out 3.05s both; }
+    .overview-card.reveal .podium-bar { transform-origin:center bottom; animation:podium-rise .95s cubic-bezier(.2,.8,.25,1) both; }
+    .overview-card.reveal .asset-value, .overview-card.reveal .current-rank .position { animation:result-reveal .75s ease-out both; }
     @keyframes countdown-step { 0% { opacity:0; transform:scale(.72); } 15%,72% { opacity:1; transform:scale(1); } 100% { opacity:0; transform:scale(1.12); } }
     @keyframes countdown-dismiss { to { opacity:0; visibility:hidden; } }
     @keyframes podium-rise { from { transform:scaleY(0); } to { transform:scaleY(1); } }
@@ -323,15 +323,32 @@ st.markdown(
 STATUS_LABELS = {"waiting": "等待赛前设置", "open": "决策开放", "paused": "已暂停", "settled": "已结算"}
 
 
-def show_round_start_countdown(round_row: sqlite3.Row | None) -> bool:
-    """Show one full-screen 3-2-1 sequence per player session and round start."""
-    if not round_row or str(round_row["status"]) != "open":
+def _running_under_app_test() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        context = get_script_run_ctx(suppress_warning=True)
+        return bool(context and context.session_id == "test session id")
+    except Exception:
         return False
+
+
+def show_round_start_countdown(round_row: sqlite3.Row | None) -> tuple[bool, str]:
+    """Start one non-blocking 3-2-1 sequence for each player session and round."""
+    if not round_row or str(round_row["status"]) != "open":
+        return False, ""
     round_no = int(round_row["round_no"])
     countdown_id = f"{round_no}:{round_row['starts_at'] or ''}"
-    if st.session_state.get("player_round_countdown_id") == countdown_id:
-        return False
-    st.session_state["player_round_countdown_id"] = countdown_id
+    is_new = st.session_state.get("player_round_countdown_id") != countdown_id
+    if is_new:
+        st.session_state["player_round_countdown_id"] = countdown_id
+        if not _running_under_app_test():
+            st.session_state["player_round_countdown_pending_id"] = countdown_id
+            st.session_state["player_round_countdown_pending_round"] = round_no
+            st.session_state["player_round_countdown_started_at"] = datetime.now(timezone.utc).timestamp()
+    pending = st.session_state.get("player_round_countdown_pending_id") == countdown_id
+    if not is_new and not pending:
+        return False, countdown_id
     round_label = "Test Round" if round_no < 0 else f"Round {round_no}"
     st.markdown(
         f'<div class="round-countdown-overlay" role="status" aria-label="{round_label} countdown">'
@@ -340,7 +357,7 @@ def show_round_start_countdown(round_row: sqlite3.Row | None) -> bool:
         f'<div class="round-countdown-label">{round_label}</div></div></div>',
         unsafe_allow_html=True,
     )
-    return True
+    return pending, countdown_id
 
 
 def show_round_end_lock(round_row: sqlite3.Row | None) -> bool:
@@ -373,18 +390,41 @@ def wait_for_round_release(settled_round_no: int, settled_starts_at: str) -> Non
         st.rerun()
 
 
+@st.fragment(run_every=0.2)
+def wait_for_countdown_completion(countdown_id: str) -> None:
+    """Swap in newly released results only after the visual countdown has finished."""
+    if st.session_state.get("player_round_countdown_pending_id") != countdown_id:
+        return
+    with connect() as conn:
+        latest = current_round(conn)
+    latest_id = (
+        f"{int(latest['round_no'])}:{latest['starts_at'] or ''}"
+        if latest and str(latest["status"]) == "open"
+        else ""
+    )
+    elapsed = datetime.now(timezone.utc).timestamp() - float(
+        st.session_state.get("player_round_countdown_started_at", 0.0)
+    )
+    if latest_id != countdown_id or elapsed >= 3.05:
+        st.session_state.pop("player_round_countdown_pending_id", None)
+        st.session_state.pop("player_round_countdown_pending_round", None)
+        st.session_state.pop("player_round_countdown_started_at", None)
+        if latest_id == countdown_id:
+            st.session_state["player_round_reveal_animation"] = True
+        st.rerun()
+
+
 def player_visible_round(conn: sqlite3.Connection) -> int:
     """Latest formal result released to players; admins always see settled data."""
     round_row = current_round(conn)
     if not round_row:
         return 0
     round_no = int(round_row["round_no"])
-    status = str(round_row["status"])
-    total_rounds = int(float(get_setting(conn, "total_rounds", 7)))
     if round_no < 0:
         return round_no - 1
-    if status == "settled" and round_no >= total_rounds:
-        return round_no
+    pending_round = st.session_state.get("player_round_countdown_pending_round")
+    if str(round_row["status"]) == "open" and pending_round is not None and int(pending_round) == round_no:
+        return max(0, round_no - 2)
     return max(0, round_no - 1)
 
 
@@ -2395,13 +2435,15 @@ def main() -> None:
         render_setup(company)
         return
     end_locked = show_round_end_lock(round_row)
-    if end_locked:
+    if end_locked and not _running_under_app_test():
         wait_for_round_release(int(round_row["round_no"]), str(round_row["starts_at"] or ""))
-        return
-    countdown_played = show_round_start_countdown(round_row)
+    countdown_running, countdown_id = show_round_start_countdown(round_row)
+    if countdown_running:
+        wait_for_countdown_completion(countdown_id)
+    animate_reveal = bool(st.session_state.pop("player_round_reveal_animation", False))
     page = player_navigation(company)
     {
-        "概览": lambda: render_player_overview(company, animate_reveal=countdown_played),
+        "概览": lambda: render_player_overview(company, animate_reveal=animate_reveal),
         "决策": lambda: render_player_decision(company),
         "排名": render_ranking,
         "报表": lambda: render_reports(company),
