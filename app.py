@@ -201,6 +201,13 @@ st.markdown(
     .round-countdown-number span:nth-child(3) { animation-delay:2s; }
     .round-countdown-label { margin-top:1.1rem; color:#fff; font-size:clamp(1.65rem,5vw,3rem); font-weight:800;
                              letter-spacing:.045em; text-shadow:0 4px 16px rgba(0,0,0,.35); }
+    .round-end-overlay { position:fixed; inset:0; z-index:999999; display:flex; align-items:center; justify-content:center;
+                         background:rgba(20,22,27,.78); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px); cursor:not-allowed; }
+    .round-end-content { text-align:center; transform:translateY(-3vh); }
+    .round-end-title { color:var(--brand); font-size:clamp(5rem,17vw,10rem); line-height:.95; font-weight:900;
+                       letter-spacing:-.045em; text-shadow:0 8px 30px rgba(0,0,0,.34); }
+    .round-end-label { margin-top:1.25rem; color:#fff; font-size:clamp(1.65rem,5vw,3rem); font-weight:800;
+                       letter-spacing:.045em; text-shadow:0 4px 16px rgba(0,0,0,.35); }
     .player-meta { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:.88rem; padding:.35rem 0 .55rem; }
     .player-meta::before { content:""; width:8px; height:8px; flex:0 0 auto; border-radius:50%; background:var(--success); box-shadow:0 0 0 3px #eef8e9; }
     .st-key-player_navigation [data-testid="stSegmentedControl"] { background:#fff; border:1px solid var(--line); border-radius:8px; padding:4px; box-shadow:0 3px 10px rgba(31,45,61,.035); }
@@ -334,6 +341,36 @@ def show_round_start_countdown(round_row: sqlite3.Row | None) -> bool:
         unsafe_allow_html=True,
     )
     return True
+
+
+def show_round_end_lock(round_row: sqlite3.Row | None) -> bool:
+    """Block the player UI after settlement until the administrator starts the next round."""
+    if not round_row or str(round_row["status"]) != "settled":
+        return False
+    round_no = int(round_row["round_no"])
+    round_label = "Test Round" if round_no < 0 else f"Round {round_no}"
+    st.markdown(
+        '<div class="round-end-overlay" role="dialog" aria-modal="true" aria-label="Round ended">'
+        '<div class="round-end-content"><div class="round-end-title">The End</div>'
+        f'<div class="round-end-label">{round_label}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    return True
+
+
+@st.fragment(run_every=1.0)
+def wait_for_round_release(settled_round_no: int, settled_starts_at: str) -> None:
+    """Poll only while the end screen is visible, then refresh the Streamlit view in place."""
+    with connect() as conn:
+        latest = current_round(conn)
+    still_locked = bool(
+        latest
+        and int(latest["round_no"]) == int(settled_round_no)
+        and str(latest["status"]) == "settled"
+        and str(latest["starts_at"] or "") == settled_starts_at
+    )
+    if not still_locked:
+        st.rerun()
 
 
 def player_visible_round(conn: sqlite3.Connection) -> int:
@@ -2357,6 +2394,9 @@ def main() -> None:
         player_setup_header(company)
         render_setup(company)
         return
+    end_locked = show_round_end_lock(round_row)
+    if end_locked:
+        wait_for_round_release(int(round_row["round_no"]), str(round_row["starts_at"] or ""))
     countdown_played = show_round_start_countdown(round_row)
     page = player_navigation(company)
     {
