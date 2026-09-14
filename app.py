@@ -92,7 +92,7 @@ from sim.db import (
 )
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
-from sim.report_image import build_round_report_jpg
+from sim.report_pdf import build_round_report_pdf
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1376,11 +1376,11 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         })
         st.caption("均价 = [Σ(玩家价格 × 对应售货量) + 基准均价 × (市场大小 − 玩家总售货量)] ÷ 市场大小")
     try:
-        jpg_bytes = build_round_report_jpg(dict(company), round_no, report, my_rank, pdf_market_sections)
-        st.download_button("下载官方格式 JPG 长图", jpg_bytes, file_name=f"Round_{round_no}_{company['code']}_Report.jpg", mime="image/jpeg", use_container_width=True)
+        pdf_bytes = build_round_report_pdf(dict(company), round_no, report, my_rank, pdf_market_sections)
+        st.download_button("下载官方格式 PDF 报表", pdf_bytes, file_name=f"Round_{round_no}_{company['code']}_Report.pdf", mime="application/pdf", use_container_width=True)
     except Exception:
-        LOGGER.exception("JPG report generation failed")
-        st.error("JPG 长图报表生成失败，请联系管理员查看后台日志。")
+        LOGGER.exception("PDF report generation failed")
+        st.error("PDF 报表生成失败，请联系管理员查看后台日志。")
 
 
 def render_reports(company: sqlite3.Row | None, admin: bool = False) -> None:
