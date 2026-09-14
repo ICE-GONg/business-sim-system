@@ -189,16 +189,11 @@ st.markdown(
     .round-strip .value { font-size:1.42rem; font-weight:750; }
     .round-strip .right { text-align:right; }
     .round-countdown-overlay { position:fixed; inset:0; z-index:999999; display:flex; align-items:center; justify-content:center;
-                               background:rgba(20,22,27,.62);
-                               animation:countdown-dismiss .22s ease 3s forwards; }
+                               background:rgba(20,22,27,.62); }
     .round-countdown-content { text-align:center; transform:translateY(-3vh); }
     .round-countdown-number { position:relative; width:clamp(8rem,24vw,14rem); height:clamp(7rem,22vw,13rem); margin:auto;
                               color:var(--brand); font-size:clamp(7rem,22vw,13rem); line-height:.9; font-weight:900;
                               letter-spacing:-.055em; text-shadow:0 8px 30px rgba(0,0,0,.34); }
-    .round-countdown-number span { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; opacity:0;
-                                   animation:countdown-step 1s ease both; }
-    .round-countdown-number span:nth-child(2) { animation-delay:1s; }
-    .round-countdown-number span:nth-child(3) { animation-delay:2s; }
     .round-countdown-label { margin-top:1.1rem; color:#fff; font-size:clamp(1.65rem,5vw,3rem); font-weight:800;
                              letter-spacing:.045em; text-shadow:0 4px 16px rgba(0,0,0,.35); }
     .round-end-overlay { position:fixed; inset:0; z-index:999999; display:flex; align-items:center; justify-content:center;
@@ -232,10 +227,9 @@ st.markdown(
     .podium-item.rank-3 .podium-bar { height:54px; opacity:.80; }
     .overview-card.reveal .podium-bar { transform-origin:center bottom; animation:podium-rise .95s cubic-bezier(.2,.8,.25,1) both; }
     .overview-card.reveal .asset-value, .overview-card.reveal .current-rank .position { animation:result-reveal .75s ease-out both; }
-    @keyframes countdown-step { 0% { opacity:0; transform:scale(.72); } 15%,72% { opacity:1; transform:scale(1); } 100% { opacity:0; transform:scale(1.12); } }
-    @keyframes countdown-dismiss { to { opacity:0; visibility:hidden; } }
     @keyframes podium-rise { from { transform:scaleY(0); } to { transform:scaleY(1); } }
     @keyframes result-reveal { from { opacity:0; transform:translateY(9px); } to { opacity:1; transform:translateY(0); } }
+    .round-poll-anchor { position:fixed; width:1px; height:1px; left:-10px; top:-10px; overflow:hidden; opacity:0; pointer-events:none; }
     .company-profile { text-align:center; padding:4px 24px 28px; }
     .company-profile h2 { margin:0 0 12px; font-size:1.8rem; }
     .company-meta { display:flex; flex-wrap:wrap; justify-content:center; gap:10px; }
@@ -349,14 +343,6 @@ def show_round_start_countdown(round_row: sqlite3.Row | None) -> tuple[bool, str
     pending = st.session_state.get("player_round_countdown_pending_id") == countdown_id
     if not is_new and not pending:
         return False, countdown_id
-    round_label = "Test Round" if round_no < 0 else f"Round {round_no}"
-    st.markdown(
-        f'<div class="round-countdown-overlay" role="status" aria-label="{round_label} countdown">'
-        '<div class="round-countdown-content"><div class="round-countdown-number">'
-        '<span>3</span><span>2</span><span>1</span></div>'
-        f'<div class="round-countdown-label">{round_label}</div></div></div>',
-        unsafe_allow_html=True,
-    )
     return pending, countdown_id
 
 
@@ -375,26 +361,28 @@ def show_round_end_lock(round_row: sqlite3.Row | None) -> bool:
     return True
 
 
+def _round_state_token(round_row: sqlite3.Row | None) -> str:
+    if not round_row:
+        return "none"
+    return f"{round_row['round_no']}:{round_row['status']}:{round_row['starts_at'] or ''}"
+
+
 @st.fragment(run_every=1.0)
-def wait_for_round_release(settled_round_no: int, settled_starts_at: str) -> None:
-    """Poll only while the end screen is visible, then refresh the Streamlit view in place."""
+def watch_player_round(observed_token: str) -> None:
+    """Keep a mounted one-second heartbeat and redraw only when the round changes."""
+    st.markdown('<span class="round-poll-anchor" aria-hidden="true">.</span>', unsafe_allow_html=True)
     with connect() as conn:
         latest = current_round(conn)
-    still_locked = bool(
-        latest
-        and int(latest["round_no"]) == int(settled_round_no)
-        and str(latest["status"]) == "settled"
-        and str(latest["starts_at"] or "") == settled_starts_at
-    )
-    if not still_locked:
+    if _round_state_token(latest) != observed_token:
         st.rerun()
 
 
-@st.fragment(run_every=0.2)
-def wait_for_countdown_completion(countdown_id: str) -> None:
-    """Swap in newly released results only after the visual countdown has finished."""
+@st.fragment(run_every=1.0)
+def render_round_countdown(countdown_id: str, round_label: str) -> None:
+    """Advance one visible countdown frame per second, then release the new results."""
     if st.session_state.get("player_round_countdown_pending_id") != countdown_id:
         return
+    st.markdown('<span class="round-poll-anchor" aria-hidden="true">.</span>', unsafe_allow_html=True)
     with connect() as conn:
         latest = current_round(conn)
     latest_id = (
@@ -405,13 +393,20 @@ def wait_for_countdown_completion(countdown_id: str) -> None:
     elapsed = datetime.now(timezone.utc).timestamp() - float(
         st.session_state.get("player_round_countdown_started_at", 0.0)
     )
-    if latest_id != countdown_id or elapsed >= 3.05:
+    if latest_id != countdown_id or elapsed >= 3.0:
         st.session_state.pop("player_round_countdown_pending_id", None)
         st.session_state.pop("player_round_countdown_pending_round", None)
         st.session_state.pop("player_round_countdown_started_at", None)
         if latest_id == countdown_id:
             st.session_state["player_round_reveal_animation"] = True
         st.rerun()
+    count = max(1, 3 - int(elapsed))
+    st.markdown(
+        f'<div class="round-countdown-overlay" role="status" aria-label="{round_label} countdown {count}">'
+        f'<div class="round-countdown-content"><div class="round-countdown-number">{count}</div>'
+        f'<div class="round-countdown-label">{round_label}</div></div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def player_visible_round(conn: sqlite3.Connection) -> int:
@@ -2434,12 +2429,13 @@ def main() -> None:
         player_setup_header(company)
         render_setup(company)
         return
-    end_locked = show_round_end_lock(round_row)
-    if end_locked and not _running_under_app_test():
-        wait_for_round_release(int(round_row["round_no"]), str(round_row["starts_at"] or ""))
+    if not _running_under_app_test():
+        watch_player_round(_round_state_token(round_row))
+    show_round_end_lock(round_row)
     countdown_running, countdown_id = show_round_start_countdown(round_row)
     if countdown_running:
-        wait_for_countdown_completion(countdown_id)
+        round_no = int(round_row["round_no"])
+        render_round_countdown(countdown_id, "Test Round" if round_no < 0 else f"Round {round_no}")
     animate_reveal = bool(st.session_state.pop("player_round_reveal_animation", False))
     page = player_navigation(company)
     {
