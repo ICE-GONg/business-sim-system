@@ -153,6 +153,36 @@ class RemoteRollbackAppTests(unittest.TestCase):
         ):
             self.at.button(key="check_compute_health").click().run()
         self.assertFalse(self.at.exception)
-        health.assert_called_once_with(endpoints, timeout=4.0)
+        health.assert_called_once_with(endpoints, timeout=2.5)
         self.assertTrue(any("第 1 线路" in row.value and "已连通" in row.value for row in self.at.success))
         self.assertTrue(any("第 2 线路" in row.value and "连接失败" in row.value for row in self.at.warning))
+
+    def test_admin_can_pair_local_worker_as_first_line(self):
+        self.prepare(super_bot=False)
+        local_url = "https://fresh-local.trycloudflare.com"
+        self.at.text_input(key="local_compute_url_input").set_value(local_url).run()
+        status = [{"line": 1, "ok": True, "message": "已连通", "seconds": 0.02}]
+        with patch("sim.remote_worker.remote_health", return_value=status) as health:
+            self.at.button(key="connect_local_compute").click().run()
+        self.assertFalse(self.at.exception)
+        health.assert_called_once_with([local_url], timeout=2.5)
+        with self.db.connect() as conn:
+            self.assertEqual(
+                self.db.get_setting(conn, "super_bot_local_worker_url", "", str),
+                local_url,
+            )
+        self.assertTrue(any("本地算力已连接" in row.value for row in self.at.success))
+
+    def test_offline_saved_local_line_is_skipped_before_long_compute_request(self):
+        self.prepare()
+        local_url = "https://expired-local.trycloudflare.com"
+        with self.db.connect() as conn:
+            self.db.set_setting(conn, "super_bot_local_worker_url", local_url)
+        offline = [{"line": 1, "ok": False, "message": "连接失败或超时", "seconds": 2.5}]
+        with patch("sim.remote_worker.remote_health", return_value=offline) as health, patch(
+            "sim.remote_worker._post", self.post,
+        ):
+            self.at.button(key="round_rollback_button").click().run()
+        self.assertFalse(self.at.exception)
+        health.assert_called_once_with([local_url], timeout=2.5)
+        self.assertEqual(self.calls, ["bot", "rebalance"])

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import html
 import importlib
+import io
 import json
 import logging
 import math
 import os
+import shlex
 import sqlite3
 import sys
 import typing
+import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -96,6 +99,7 @@ from sim.report_pdf import build_round_report_pdf
 
 
 LOGGER = logging.getLogger(__name__)
+LOCAL_WORKER_URL_SETTING = "super_bot_local_worker_url"
 
 
 def _deployment_secret(name: str) -> str:
@@ -115,6 +119,13 @@ def _remote_super_bot_submit(
 ) -> bool:
     """Compute and durably save one remote Super Bot at a time."""
     endpoints = _remote_super_bot_endpoints()
+    saved_local_url = _saved_local_worker_url()
+    if saved_local_url and endpoints and endpoints[0] == saved_local_url:
+        # A quick public GET prevents an expired temporary tunnel from making
+        # every Bot wait for the much longer computation-request timeout.
+        local_status = remote_health([saved_local_url], timeout=2.5)
+        if not local_status or not local_status[0]["ok"]:
+            endpoints = endpoints[1:]
     if not endpoints:
         return False
     with connect() as conn:
@@ -137,10 +148,108 @@ def _remote_super_bot_endpoints() -> list[str]:
             urls = st.secrets.get("SUPER_BOT_REMOTE_URLS", [])
         except Exception:
             urls = []
-    return resolve_remote_endpoints(
+    configured = resolve_remote_endpoints(
         _deployment_secret("SUPER_BOT_REMOTE_URL"), urls=urls,
         fallback=_deployment_secret("SUPER_BOT_FALLBACK_URL"),
     )
+    # This admin-only setting is deliberately outside DEFAULT_SETTINGS, so it
+    # is never included in a competition snapshot sent to a worker.
+    local_url = _saved_local_worker_url()
+    return resolve_remote_endpoints(urls=[local_url, *configured])
+
+
+def _saved_local_worker_url() -> str:
+    try:
+        with connect() as conn:
+            return str(get_setting(conn, LOCAL_WORKER_URL_SETTING, "", str)).strip()
+    except (OSError, sqlite3.Error):
+        return ""
+
+
+def _normalise_local_worker_url(value: str) -> str:
+    url = str(value or "").strip().rstrip("/")
+    if not url.startswith("https://") or "." not in url.removeprefix("https://"):
+        raise ValueError("请输入启动器生成的完整 HTTPS 地址。")
+    if any(character.isspace() for character in url):
+        raise ValueError("本地算力地址不能包含空格。")
+    return url
+
+
+def _local_worker_launcher_zip(token: str) -> bytes:
+    """Build an admin-only Mac launcher; its token is never committed."""
+    quoted_token = shlex.quote(token)
+    script = f'''#!/bin/zsh
+set -eu
+
+WORKER_DIR="$HOME/.business-sim-local-worker"
+RUNTIME_DIR="$HOME/.business-sim-local-worker-runtime"
+REPOSITORY="https://github.com/ICE-GONg/business-sim-system.git"
+mkdir -p "$RUNTIME_DIR"
+
+if [[ -d "$WORKER_DIR/.git" ]]; then
+  git -C "$WORKER_DIR" pull --ff-only
+else
+  git clone --depth 1 "$REPOSITORY" "$WORKER_DIR"
+fi
+
+if ! command -v cloudflared >/dev/null 2>&1; then
+  if ! command -v brew >/dev/null 2>&1; then
+    osascript -e 'display dialog "未找到 Homebrew。请先安装 Homebrew，再重新双击启动器。" buttons {{"好"}} default button 1'
+    exit 1
+  fi
+  brew install cloudflared
+fi
+
+for NAME in worker tunnel; do
+  PID_FILE="$RUNTIME_DIR/$NAME.pid"
+  if [[ -f "$PID_FILE" ]]; then
+    OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$OLD_PID" ]]; then kill "$OLD_PID" 2>/dev/null || true; fi
+  fi
+done
+
+export SUPER_BOT_REMOTE_TOKEN={quoted_token}
+export SUPER_BOT_LOCAL_PORT=8765
+nohup python3 "$WORKER_DIR/local_worker_server.py" >"$RUNTIME_DIR/worker.log" 2>&1 &
+echo $! >"$RUNTIME_DIR/worker.pid"
+
+for ATTEMPT in {{1..20}}; do
+  if curl -fsS --max-time 1 http://127.0.0.1:8765 >/dev/null 2>&1; then break; fi
+  sleep 0.5
+done
+if ! curl -fsS --max-time 2 http://127.0.0.1:8765 >/dev/null 2>&1; then
+  open -a TextEdit "$RUNTIME_DIR/worker.log"
+  osascript -e 'display dialog "本地计算服务启动失败，已经打开日志。" buttons {{"好"}} default button 1'
+  exit 1
+fi
+
+: >"$RUNTIME_DIR/tunnel.log"
+nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >"$RUNTIME_DIR/tunnel.log" 2>&1 &
+echo $! >"$RUNTIME_DIR/tunnel.pid"
+
+PUBLIC_URL=""
+for ATTEMPT in {{1..40}}; do
+  PUBLIC_URL="$(grep -Eo 'https://[-a-z0-9]+\\.trycloudflare\\.com' "$RUNTIME_DIR/tunnel.log" | tail -1 || true)"
+  if [[ -n "$PUBLIC_URL" ]]; then break; fi
+  sleep 0.5
+done
+if [[ -z "$PUBLIC_URL" ]]; then
+  open -a TextEdit "$RUNTIME_DIR/tunnel.log"
+  osascript -e 'display dialog "公网线路启动失败，已经打开日志。" buttons {{"好"}} default button 1'
+  exit 1
+fi
+
+print -n "$PUBLIC_URL" | pbcopy
+osascript -e "display dialog \"本地算力已启动，HTTPS 地址已复制：\\n$PUBLIC_URL\\n\\n回到管理员回合控制页面，粘贴后点击‘连接本地算力’。\" buttons {{\"好\"}} default button 1"
+'''
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        info = zipfile.ZipInfo("启动本地算力.command")
+        info.create_system = 3
+        info.external_attr = 0o755 << 16
+        info.compress_type = zipfile.ZIP_DEFLATED
+        archive.writestr(info, script.encode("utf-8"))
+    return buffer.getvalue()
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -2021,6 +2130,7 @@ def render_admin_rounds() -> None:
         remote_config_error = str(exc)
     with connect() as conn:
         round_row = current_round(conn)
+        saved_local_worker_url = str(get_setting(conn, LOCAL_WORKER_URL_SETTING, "", str)).strip()
         total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
         default_minutes = max(1, get_setting(conn, "round_duration_minutes", 30, int))
         default_test_round = bool(get_setting(conn, "test_round_enabled", 0, int))
@@ -2053,6 +2163,60 @@ def render_admin_rounds() -> None:
             round_row and remote_pending(conn, int(round_row["round_no"]))
         )
     round_banner(round_row)
+    st.markdown("#### 本地算力")
+    st.caption(
+        "下载并双击 Mac 启动器后，地址会自动复制到剪贴板。粘贴到下方并连接，"
+        "连通后会自动成为第 1 线路；本地线路离线时仍可使用云端备用线路。"
+    )
+    remote_token = _deployment_secret("SUPER_BOT_REMOTE_TOKEN")
+    if remote_token:
+        st.download_button(
+            "下载 Mac 一键启动器",
+            data=_local_worker_launcher_zip(remote_token),
+            file_name="business-sim-local-worker.zip",
+            mime="application/zip",
+            key="download_local_compute_launcher",
+            use_container_width=True,
+        )
+    else:
+        st.warning("尚未配置计算令牌，暂时不能生成本地算力启动器。")
+    local_worker_input = st.text_input(
+        "本地算力 HTTPS 地址",
+        value=saved_local_worker_url,
+        placeholder="https://xxxxxxxx.trycloudflare.com",
+        key="local_compute_url_input",
+        help="不要填写 127.0.0.1；线上 Streamlit 无法直接访问你 Mac 的本机地址。",
+    )
+    local_connect_col, local_disconnect_col = st.columns(2)
+    if local_connect_col.button(
+        "连接本地算力",
+        type="primary",
+        key="connect_local_compute",
+        use_container_width=True,
+    ):
+        try:
+            candidate_url = _normalise_local_worker_url(local_worker_input)
+            status = remote_health([candidate_url], timeout=2.5)[0]
+            if not status["ok"]:
+                raise ValueError("没有收到本地计算服务响应。请重新双击启动器，再粘贴新地址。")
+            with connect() as conn:
+                set_setting(conn, LOCAL_WORKER_URL_SETTING, candidate_url)
+            flash("success", f"本地算力已连接并设为第 1 线路（{status['seconds']:.2f} 秒）。")
+            st.rerun()
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            st.error(str(exc))
+    if local_disconnect_col.button(
+        "停用本地线路",
+        key="disconnect_local_compute",
+        disabled=not bool(saved_local_worker_url),
+        use_container_width=True,
+    ):
+        with connect() as conn:
+            conn.execute("DELETE FROM settings WHERE key=?", (LOCAL_WORKER_URL_SETTING,))
+        flash("success", "本地算力线路已停用，云端备用线路保持不变。")
+        st.rerun()
+    if saved_local_worker_url:
+        st.info("本地算力已保存为第 1 线路。启动器关闭或 Mac 休眠后，需要重新启动并连接新地址。")
     if remote_config_error:
         st.warning(remote_config_error)
     elif compute_endpoints:
@@ -2060,7 +2224,7 @@ def render_admin_rounds() -> None:
         if st.button("检测计算线路", key="check_compute_health"):
             with st.spinner("检测计算线路连通性…"):
                 try:
-                    statuses = remote_health(compute_endpoints, timeout=4.0)
+                    statuses = remote_health(compute_endpoints, timeout=2.5)
                 except Exception:
                     statuses = []
                     st.warning("暂时无法检测计算线路，请稍后重试。")
