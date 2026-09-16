@@ -737,7 +737,7 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreaterEqual(min(ratios), 1.0)
             self.assertGreater(max(ratios) / min(ratios), 2.5)
 
-    def test_all_super_bots_stay_solvent_with_profit_control_seven_rounds(self):
+    def test_all_super_bots_balance_relative_pressure_and_stability_seven_rounds(self):
         db = self.fresh("all-super-seven-rounds.db")
         with db.connect() as conn:
             db.set_setting(conn, "total_rounds", 7)
@@ -778,7 +778,19 @@ class ExtendedRulesTest(unittest.TestCase):
                         6,
                     )
                 settle_round(conn, round_no)
-                for result in db.all_rows(conn, "SELECT * FROM results WHERE round_no=?", (round_no,)):
+                round_results = db.all_rows(
+                    conn, "SELECT * FROM results WHERE round_no=?", (round_no,),
+                )
+                profitable = sum(float(result["net_profit"]) > 0 for result in round_results)
+                # Limited attack rounds may lose money, but the field must not
+                # turn into collective suicide. At least five of seven remain
+                # profitable while laggards may spend to damage richer rivals.
+                self.assertGreaterEqual(profitable, max(1, len(round_results) - 2))
+                assets = sorted(float(result["net_assets"]) for result in round_results)
+                if assets:
+                    median_assets = assets[len(assets) // 2]
+                    self.assertGreaterEqual(assets[0], median_assets * 0.20)
+                for result in round_results:
                     report = json.loads(result["report_json"])
                     available = int(result["produced"]) + int(report["production"]["old_products"])
                     self.assertGreaterEqual(float(result["cash"]), 0)
@@ -786,11 +798,6 @@ class ExtendedRulesTest(unittest.TestCase):
                         float(result["net_assets"]),
                         0,
                         f"round={round_no} company={result['company_id']} result={dict(result)}",
-                    )
-                    self.assertGreater(
-                        float(result["net_profit"]),
-                        0,
-                        f"unprofitable Super Bot: round={round_no} result={dict(result)}",
                     )
                     if round_no == 7:
                         self.assertLessEqual(

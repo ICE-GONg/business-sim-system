@@ -41,8 +41,8 @@ class BotKDSRegressionTest(unittest.TestCase):
         )
         return int(cursor.lastrowid)
 
-    def test_empirical_super_profiles_diversify_only_within_safe_profit_band(self):
-        def candidate(name, *, profit, risk, ma=1, qi=1, mi=0, price=.9, sold=100, coverage=.8):
+    def test_super_selector_maximizes_relative_advantage(self):
+        def candidate(name, *, profit, risk, damage=0, ma=1, qi=1, mi=0, price=.9, sold=100, coverage=.8):
             return {
                 "name": name,
                 "predicted_profit": profit,
@@ -54,6 +54,9 @@ class BotKDSRegressionTest(unittest.TestCase):
                 "predicted_sold": sold,
                 "sell_ratio": min(1.0, sold / 200),
                 "coverage": coverage,
+                "rival_damage": damage,
+                "starting_assets": 10_000,
+                "ending_assets": 10_000 + profit,
                 "score": (1, profit, risk),
             }
 
@@ -68,22 +71,21 @@ class BotKDSRegressionTest(unittest.TestCase):
             candidate("too-costly", profit=900, risk=850, ma=1000, qi=1000, mi=1000, sold=1000),
             candidate("unsafe", profit=1100, risk=-1, price=.99, sold=1000),
         ]
-        expected = ["high", "ma", "qi", "mi", "balanced", "fit", "low"]
-        for profile, name in enumerate(expected):
+        for profile in range(7):
             with self.subTest(profile=profile):
                 selected = self.bots._select_empirical_super_candidate(
                     choices,
                     profile,
                     tactical_price_allowed=True,
                 )
-                self.assertEqual(selected["name"], name)
+                self.assertEqual(selected["name"], "unsafe")
 
         early_price_profile = self.bots._select_empirical_super_candidate(
             choices,
             6,
             tactical_price_allowed=False,
         )
-        self.assertEqual(early_price_profile["name"], "high")
+        self.assertEqual(early_price_profile["name"], "unsafe")
 
         # A style may diversify only after clearing the growth benchmark. If
         # the target is unreachable, it makes the highest-profit safe attempt.
@@ -99,8 +101,19 @@ class BotKDSRegressionTest(unittest.TestCase):
             tactical_price_allowed=True,
             profit_target=2_000,
         )
-        self.assertEqual(targeted["name"], "high")
-        self.assertEqual(unreachable["name"], "high")
+        self.assertEqual(targeted["name"], "unsafe")
+        self.assertEqual(unreachable["name"], "unsafe")
+
+        destructive = candidate(
+            "destructive", profit=-1_900, risk=-2_100,
+            damage=3_600, price=.45, sold=500,
+        )
+        strategic = self.bots._select_empirical_super_candidate(
+            [*choices, destructive],
+            0,
+            tactical_price_allowed=True,
+        )
+        self.assertEqual(strategic["name"], "destructive")
 
     def test_super_profit_target_uses_self_higher_rank_and_previous_bot(self):
         leader_id = self.company("HUMAN")
