@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import unittest
 
+from sim import cpi as cpi_module
 from sim.cpi import (
     agent_mi_benefit,
     allocate_city_cpi,
@@ -10,11 +11,89 @@ from sim.cpi import (
     allocate_index_cpi,
     investment_price_curve,
     investment_price_factor,
+    investment_average_prices,
     minimum_threshold,
 )
 
 
 class CPIGeneratorPortTests(unittest.TestCase):
+    def test_zero_investment_low_price_cannot_move_investment_pools(self) -> None:
+        active = {
+            "company_id": 1, "qi_index": 800, "ma_index": 2_000,
+            "mi_investment": 4_000_000, "price": 12_000, "agents": 2,
+        }
+        inactive = {
+            "company_id": 2, "qi_index": 0, "ma_index": 0,
+            "mi_investment": 0, "price": 1_000, "agents": 5,
+        }
+        kwargs = {
+            "market_size": 80_000, "max_price": 25_000,
+            "ma_large_threshold": 1_300, "average_price": 12_000,
+            "market_average_price": 12_000,
+        }
+        low = allocate_city_cpi([active, inactive], **kwargs)[0]
+        inactive["price"] = 25_000
+        high = allocate_city_cpi([active, inactive], **kwargs)[0]
+        for key in ("ma_cpi", "qi_cpi", "mi_cpi"):
+            self.assertAlmostEqual(low[key], high[key], places=12)
+
+    def test_half_threshold_controls_each_pool_player_average(self) -> None:
+        market_size = 80_000
+        max_price = 25_000
+        ma_large = 1_300
+        mi_large = (max_price / 50) * market_size * 0.20 / 1.5 / 2.0
+        entries = [
+            {
+                "company_id": 1, "price": 20_000, "agents": 1,
+                "ma_index": ma_large / 2, "qi_index": 1,
+                "mi_investment": mi_large / 2 / 1.1,
+            },
+            {
+                "company_id": 2, "price": 5_000, "agents": 1,
+                "ma_index": ma_large / 2 - 1, "qi_index": (max_price / 50) / 2,
+                "mi_investment": mi_large / 2 / 1.1 - 1,
+            },
+        ]
+        averages = investment_average_prices(
+            entries, [100, 300], fallback=9_000, market_size=market_size,
+            max_price=max_price, ma_large_threshold=ma_large,
+        )
+        self.assertEqual(averages["ma"], 20_000)
+        self.assertEqual(averages["mi"], 20_000)
+        self.assertEqual(averages["qi"], 5_000)
+
+    def test_ma_qi_post_cap_is_smooth_positive_and_diminishing(self) -> None:
+        large = 500.0
+        boundary = large * 4.0
+        epsilon = 1e-4
+        function = lambda value: cpi_module._post_large_effective(
+            value, large, unlimited=False,
+        )
+        self.assertAlmostEqual(
+            function(boundary + epsilon) - function(boundary),
+            function(boundary) - function(boundary - epsilon),
+            delta=1e-8,
+        )
+        gains = [
+            function(boundary + large * (step + 1))
+            - function(boundary + large * step)
+            for step in range(5)
+        ]
+        self.assertTrue(all(gain > 0 for gain in gains))
+        self.assertTrue(all(left > right for left, right in zip(gains, gains[1:])))
+
+    def test_mi_has_no_post_cap_efficiency_limit(self) -> None:
+        large = 1_000.0
+        linear = lambda value: cpi_module._post_large_effective(
+            value, large, unlimited=True,
+        )
+        self.assertEqual(linear(4 * large), 3 * large)
+        self.assertEqual(linear(100 * large), 99 * large)
+        self.assertEqual(
+            linear(101 * large) - linear(100 * large),
+            large,
+        )
+
     def test_investment_price_curve_is_continuous_monotone_and_hits_anchors(self) -> None:
         maximum = 25_000.0
         anchors = {

@@ -161,7 +161,10 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertEqual(len(rows), 2)
                 for row in rows:
                     breakdown = json.loads(row["breakdown_json"])
-                    self.assertAlmostEqual(breakdown["average_price"], 24_888)
+                    self.assertEqual(
+                        breakdown["investment_average_prices"],
+                        {"ma": 7_600, "qi": 7_600, "mi": 7_600},
+                    )
                     self.assertAlmostEqual(breakdown["market_average_price"], 7_600)
 
     def test_one_product_split_across_positive_cpi_markets_is_not_lost(self) -> None:

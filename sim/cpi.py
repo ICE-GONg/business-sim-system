@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+import math
 from typing import Any
 
 
-CPI_API_VERSION = 5
+CPI_API_VERSION = 6
 GIFT_CPI = 0.01
 LAYER1_TOTAL_CPI = 5.0
 LAYER2_TOTAL_CPI = 10.0
@@ -154,6 +155,87 @@ def minimum_threshold(large_threshold: float) -> float:
     return large_threshold / 500.0 if large_threshold > 0 else 0.0
 
 
+def _post_large_effective(
+    investment: float, large_threshold: float, *, unlimited: bool,
+) -> float:
+    """Effective second-layer investment above the large threshold.
+
+    MI has no upper efficiency cap and therefore remains linear. MA and QI
+    remain linear through four times the large threshold (the historical
+    upper boundary), then follow a C1-continuous logarithmic extension. Its
+    marginal return is ``1 / (1 + excess / threshold)``: always positive and
+    smoothly diminishing instead of the old permanent 10% conversion.
+    """
+    large = max(0.0, float(large_threshold))
+    remaining = max(0.0, float(investment) - large)
+    if unlimited or large <= 0.0:
+        return remaining
+    linear_span = large * 3.0
+    if remaining <= linear_span:
+        return remaining
+    excess = remaining - linear_span
+    return linear_span + large * math.log1p(excess / large)
+
+
+def investment_average_prices(
+    entries: list[dict[str, Any]],
+    quantities: list[float],
+    *,
+    fallback: float,
+    market_size: float,
+    max_price: float,
+    ma_large_threshold: float,
+) -> dict[str, float]:
+    """Sales-weighted player averages for MA, QI and MI independently.
+
+    A player's price enters a pool average only when that player's investment
+    reaches half of that pool's large threshold. Zero and small investments
+    therefore cannot use a low price to move other players' investment CPI.
+    The broader market average used by the 40-CPI price pool is separate.
+    """
+    qi_large = max(0.0, float(max_price) / 50.0)
+    ma_large = max(0.0, float(ma_large_threshold))
+    mi_large = qi_large * max(0.0, float(market_size)) * 0.20 / 1.5 / 2.0
+    pool_values = {
+        "ma": [max(0.0, float(entry.get("ma_index", 0.0))) for entry in entries],
+        "qi": [max(0.0, float(entry.get("qi_index", 0.0))) for entry in entries],
+        "mi": [
+            max(0.0, float(entry.get("mi_investment", 0.0)))
+            * agent_mi_benefit(entry.get("agents", 0))
+            for entry in entries
+        ],
+    }
+    thresholds = {"ma": ma_large, "qi": qi_large, "mi": mi_large}
+    resolved: dict[str, float] = {}
+    for pool, values in pool_values.items():
+        pairs: list[tuple[float, float]] = []
+        qualifying = thresholds[pool] * 0.5
+        for index, entry in enumerate(entries):
+            value = values[index]
+            quantity = max(0.0, float(quantities[index] if index < len(quantities) else 0.0))
+            if value <= 0.0 or value + 1e-12 < qualifying or quantity <= 0.0:
+                continue
+            pairs.append((max(0.0, float(entry.get("price", 0.0))), quantity))
+        total = sum(quantity for _, quantity in pairs)
+        resolved[pool] = (
+            sum(price * quantity for price, quantity in pairs) / total
+            if total > 0.0 else max(0.0, float(fallback))
+        )
+    return resolved
+
+
+def _pool_average(
+    average_price: float | dict[str, float] | None,
+    pool: str,
+    fallback: float,
+) -> float:
+    if isinstance(average_price, dict):
+        return max(0.0, float(average_price.get(pool, fallback)))
+    if average_price is None:
+        return max(0.0, float(fallback))
+    return max(0.0, float(average_price))
+
+
 def allocate_index_cpi(
     min_threshold: float,
     large_threshold: float,
@@ -161,6 +243,8 @@ def allocate_index_cpi(
     prices: list[float],
     average_price: float,
     max_price: float | None = None,
+    *,
+    unlimited_above_cap: bool = False,
 ) -> list[dict[str, Any]]:
     """Python port of calculateCPIAlgorithm from the supplied admin.js.
 
@@ -181,8 +265,11 @@ def allocate_index_cpi(
     for index, raw_investment in enumerate(investments):
         investment = max(0.0, float(raw_investment))
         price = resolved_prices[index]
-        price_factor = price_factors[index]
-        max_price_factor = max(max_price_factor, price_factor or 1.0)
+        # An inactive player cannot move this pool's adjusted thresholds. This
+        # is what prevents a pure low-price route from changing rivals' MA/QI/MI.
+        price_factor = price_factors[index] if investment > 0.0 else 1.0
+        if investment > 0.0:
+            max_price_factor = max(max_price_factor, price_factor or 1.0)
         players.append(
             {
                 "player_index": index + 1,
@@ -247,19 +334,19 @@ def allocate_index_cpi(
     for player in players:
         adjusted_value = 0.0
         if not player["below_min_adjusted"] and player["above_large_adjusted"]:
-            remaining = max(player["adjusted"] - layer2_threshold, 0.0)
-            base_cap = min(remaining, layer2_threshold * 3.0)
-            extra = max(remaining - base_cap, 0.0)
-            adjusted_value = base_cap + extra * 0.1
+            adjusted_value = _post_large_effective(
+                player["adjusted"], layer2_threshold,
+                unlimited=unlimited_above_cap,
+            )
         layer2_adjusted.append(adjusted_value)
         layer2_total_adjusted += adjusted_value
 
         original_value = 0.0
         if not player["below_min_original"] and player["above_large_original"]:
-            remaining = max(player["original"] - large_threshold, 0.0)
-            base_cap = min(remaining, large_threshold * 3.0)
-            extra = max(remaining - base_cap, 0.0)
-            original_value = base_cap + extra * 0.1
+            original_value = _post_large_effective(
+                player["original"], large_threshold,
+                unlimited=unlimited_above_cap,
+            )
         layer2_original.append(original_value)
         layer2_total_original += original_value
 
@@ -331,6 +418,8 @@ def _allocate_index_cpi_for_target(
     average_price: float,
     target_index: int,
     max_price: float | None = None,
+    *,
+    unlimited_above_cap: bool = False,
 ) -> float:
     """Return one player's index CPI without building every breakdown.
 
@@ -348,8 +437,9 @@ def _allocate_index_cpi_for_target(
         float(average_price),
         max_price,
     )
+    factors = [factors[index] if value > 0.0 else 1.0 for index, value in enumerate(originals)]
     adjusted = [value * factors[index] for index, value in enumerate(originals)]
-    max_price_factor = max([1.0, *factors])
+    max_price_factor = max([1.0, *[factor for value, factor in zip(originals, factors) if value > 0.0]])
     adjusted_min = min_threshold * max_price_factor
     adjusted_large = large_threshold * max_price_factor
 
@@ -386,16 +476,18 @@ def _allocate_index_cpi_for_target(
     for index in range(len(originals)):
         adjusted_value = 0.0
         if not below_min_adjusted[index] and above_large_adjusted[index]:
-            remaining = max(adjusted[index] - large_threshold, 0.0)
-            base_cap = min(remaining, large_threshold * 3.0)
-            adjusted_value = base_cap + max(remaining - base_cap, 0.0) * 0.1
+            adjusted_value = _post_large_effective(
+                adjusted[index], large_threshold,
+                unlimited=unlimited_above_cap,
+            )
         layer2_adjusted.append(adjusted_value)
 
         original_value = 0.0
         if not below_min_original[index] and above_large_original[index]:
-            remaining = max(originals[index] - large_threshold, 0.0)
-            base_cap = min(remaining, large_threshold * 3.0)
-            original_value = base_cap + max(remaining - base_cap, 0.0) * 0.1
+            original_value = _post_large_effective(
+                originals[index], large_threshold,
+                unlimited=unlimited_above_cap,
+            )
         layer2_original.append(original_value)
     layer2_total_adjusted = sum(layer2_adjusted)
     layer2_total_original = sum(layer2_original)
@@ -441,7 +533,7 @@ def allocate_city_cpi_for_company(
     max_price: float,
     ma_large_threshold: float,
     price_power: int = 8,
-    average_price: float | None = None,
+    average_price: float | dict[str, float] | None = None,
     market_average_price: float | None = None,
 ) -> float:
     """Return only one company's total CPI using the canonical city formula."""
@@ -456,7 +548,10 @@ def allocate_city_cpi_for_company(
 
     prices = [max(0.0, float(entry["price"])) for entry in entries]
     current_average = sum(prices) / len(prices) if prices else 0.0
-    average_price = current_average if average_price is None else float(average_price)
+    resolved_averages = {
+        pool: _pool_average(average_price, pool, current_average)
+        for pool in ("ma", "qi", "mi")
+    }
     market_average_price = current_average if market_average_price is None else float(market_average_price)
     qi_large = max(0.0, max_price / 50.0)
     ma_large = max(0.0, float(ma_large_threshold))
@@ -464,12 +559,12 @@ def allocate_city_cpi_for_company(
 
     qi_cpi = _allocate_index_cpi_for_target(
         minimum_threshold(qi_large), qi_large,
-        [float(entry["qi_index"]) for entry in entries], prices, average_price,
+        [float(entry["qi_index"]) for entry in entries], prices, resolved_averages["qi"],
         target_index, max_price,
     )
     ma_cpi = _allocate_index_cpi_for_target(
         minimum_threshold(ma_large), ma_large,
-        [float(entry["ma_index"]) for entry in entries], prices, average_price,
+        [float(entry["ma_index"]) for entry in entries], prices, resolved_averages["ma"],
         target_index, max_price,
     )
     effective_mi = [
@@ -477,8 +572,8 @@ def allocate_city_cpi_for_company(
         for entry in entries
     ]
     mi_cpi = _allocate_index_cpi_for_target(
-        minimum_threshold(mi_large), mi_large, effective_mi, prices, average_price,
-        target_index, max_price,
+        minimum_threshold(mi_large), mi_large, effective_mi, prices, resolved_averages["mi"],
+        target_index, max_price, unlimited_above_cap=True,
     )
 
     price_weights = [0.0] * len(entries)
@@ -496,10 +591,14 @@ def allocate_city_cpi_for_company(
 class _PreparedIndexCPI:
     """Invariant rival work for repeated evaluations of one index pool."""
 
-    def __init__(self, originals: list[float], large: float, target: int):
+    def __init__(
+        self, originals: list[float], large: float, target: int, *,
+        unlimited_above_cap: bool = False,
+    ):
         self.large = large
         self.minimum = minimum_threshold(large)
         self.target = target
+        self.unlimited_above_cap = unlimited_above_cap
         self.originals = [max(0.0, value) for value in originals]
         self.layer1_original = [
             min(value, large) if value >= self.minimum else 0.0
@@ -514,11 +613,11 @@ class _PreparedIndexCPI:
     def _layer2(self, value: float) -> float:
         if value < self.minimum or value < self.large:
             return 0.0
-        remaining = max(value - self.large, 0.0)
-        base_cap = min(remaining, self.large * 3.0)
-        return base_cap + max(remaining - base_cap, 0.0) * 0.1
+        return _post_large_effective(
+            value, self.large, unlimited=self.unlimited_above_cap,
+        )
 
-    def evaluate(self, original: float, factors: list[float], max_factor: float) -> float:
+    def evaluate(self, original: float, factors: list[float]) -> float:
         original = max(0.0, float(original))
         # A zero investment receives none of this pool, regardless of rivals.
         if original == 0.0:
@@ -526,10 +625,18 @@ class _PreparedIndexCPI:
         target = self.target
         large = self.large
         minimum = self.minimum
-        adjusted_min = minimum * max_factor
-        adjusted_large = large * max_factor
         originals = self.originals.copy()
         originals[target] = original
+        factors = [
+            factors[index] if value > 0.0 else 1.0
+            for index, value in enumerate(originals)
+        ]
+        max_factor = max([
+            1.0,
+            *[factor for value, factor in zip(originals, factors) if value > 0.0],
+        ])
+        adjusted_min = minimum * max_factor
+        adjusted_large = large * max_factor
         layer1: list[float] = []
         layer2: list[float] = []
         gifts: list[float] = []
@@ -546,9 +653,9 @@ class _PreparedIndexCPI:
             max_layer1 = max(max_layer1, first)
             second = 0.0
             if not below_min and above_large:
-                remaining = max(adjusted - large, 0.0)
-                base_cap = min(remaining, large * 3.0)
-                second = base_cap + max(remaining - base_cap, 0.0) * 0.1
+                second = _post_large_effective(
+                    adjusted, large, unlimited=self.unlimited_above_cap,
+                )
             layer2.append(second)
 
         layer1_total = sum(layer1)
@@ -626,7 +733,7 @@ class PreparedCityCPI:
         self.ma = _PreparedIndexCPI([float(e["ma_index"]) for e in entries], max(0.0, float(ma_large_threshold)), self.target)
         self.mi = _PreparedIndexCPI([
             float(e["mi_investment"]) * agent_mi_benefit(e.get("agents", 0)) for e in entries
-        ], mi_large, self.target)
+        ], mi_large, self.target, unlimited_above_cap=True)
         self.price_weights = self._price_weights(float(market_average_price)) if market_average_price is not None else []
 
     def _price_weights(self, average: float) -> list[float]:
@@ -634,7 +741,8 @@ class PreparedCityCPI:
 
     def evaluate(
         self, *, ma_index: float, qi_index: float, mi_investment: float,
-        price: float, average_price: float | None = None, agents: int | float | None = None,
+        price: float, average_price: float | dict[str, float] | None = None,
+        agents: int | float | None = None,
     ) -> float:
         if self.target is None:
             return 0.0
@@ -642,14 +750,19 @@ class PreparedCityCPI:
         price = max(0.0, float(price))
         prices = self.prices.copy()
         prices[target] = price
-        average = sum(prices) / len(prices) if average_price is None else float(average_price)
+        current_average = sum(prices) / len(prices) if prices else 0.0
+        averages = {
+            pool: _pool_average(average_price, pool, current_average)
+            for pool in ("ma", "qi", "mi")
+        }
         market_average = sum(prices) / len(prices) if self.market_average is None else float(self.market_average)
-        factors = _investment_price_factors(prices, average, self.max_price)
-        max_factor = max([1.0, *factors])
-        qi_cpi = self.qi.evaluate(qi_index, factors, max_factor)
-        ma_cpi = self.ma.evaluate(ma_index, factors, max_factor)
+        qi_factors = _investment_price_factors(prices, averages["qi"], self.max_price)
+        ma_factors = _investment_price_factors(prices, averages["ma"], self.max_price)
+        mi_factors = _investment_price_factors(prices, averages["mi"], self.max_price)
+        qi_cpi = self.qi.evaluate(qi_index, qi_factors)
+        ma_cpi = self.ma.evaluate(ma_index, ma_factors)
         benefit = self.agent_benefit if agents is None else agent_mi_benefit(agents)
-        mi_cpi = self.mi.evaluate(float(mi_investment) * benefit, factors, max_factor)
+        mi_cpi = self.mi.evaluate(float(mi_investment) * benefit, mi_factors)
         price_cpi = 0.0
         if price > 0 and price <= market_average:
             weights = self.price_weights.copy() if self.market_average is not None else [
@@ -682,7 +795,7 @@ def allocate_city_cpi(
     max_price: float,
     ma_large_threshold: float,
     price_power: int = 8,
-    average_price: float | None = None,
+    average_price: float | dict[str, float] | None = None,
     market_average_price: float | None = None,
 ) -> list[dict[str, Any]]:
     """Apply the supplied admin simulator independently inside one city."""
@@ -690,7 +803,10 @@ def allocate_city_cpi(
         return []
     prices = [max(0.0, float(entry["price"])) for entry in entries]
     current_average = sum(prices) / len(prices) if prices else 0.0
-    average_price = current_average if average_price is None else float(average_price)
+    resolved_averages = {
+        pool: _pool_average(average_price, pool, current_average)
+        for pool in ("ma", "qi", "mi")
+    }
     market_average_price = current_average if market_average_price is None else float(market_average_price)
 
     qi_large = max(0.0, max_price / 50.0)
@@ -706,16 +822,17 @@ def allocate_city_cpi(
 
     qi_results = allocate_index_cpi(
         qi_min, qi_large, [float(e["qi_index"]) for e in entries],
-        prices, average_price, max_price,
+        prices, resolved_averages["qi"], max_price,
     )
     ma_results = allocate_index_cpi(
         ma_min, ma_large, [float(e["ma_index"]) for e in entries],
-        prices, average_price, max_price,
+        prices, resolved_averages["ma"], max_price,
     )
     agent_benefits = [agent_mi_benefit(e.get("agents", 0)) for e in entries]
     effective_mi = [float(entry["mi_investment"]) * agent_benefits[index] for index, entry in enumerate(entries)]
     mi_results = allocate_index_cpi(
-        mi_min_base, mi_large_base, effective_mi, prices, average_price, max_price,
+        mi_min_base, mi_large_base, effective_mi, prices, resolved_averages["mi"], max_price,
+        unlimited_above_cap=True,
     )
 
     price_cpis = [0.0] * len(entries)
@@ -757,7 +874,8 @@ def allocate_city_cpi(
                     "mi_base_large": mi_large_base,
                     "mi_agent_benefit": agent_benefits[index],
                 },
-                "average_price": average_price,
+                "average_price": resolved_averages,
+                "investment_average_prices": resolved_averages,
                 "market_average_price": market_average_price,
             }
         )

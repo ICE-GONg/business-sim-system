@@ -10,12 +10,17 @@ from typing import Any, Callable
 
 from .bot_joint_pricing import JointPriceTarget, solve_joint_prices
 from .bot_market_forecast import forecast_market_sales
-from .cpi import PRICE_CPI_TOTAL, allocate_city_cpi_for_company, prepare_city_cpi_for_company
+from .cpi import (
+    PRICE_CPI_TOTAL,
+    allocate_city_cpi_for_company,
+    investment_average_prices,
+    prepare_city_cpi_for_company,
+)
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 28
+BOT_API_VERSION = 29
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -1848,10 +1853,16 @@ def _submit_bots(
                     "agents": int(row["agents_after"]),
                 })
                 weighted_prices.append((float(row["price"]), max(1.0, old_products + production)))
-                weighted_total = sum(weight for _, weight in weighted_prices)
-                average_price = sum(price * weight for price, weight in weighted_prices) / max(1.0, weighted_total)
                 market = markets[index]
                 size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
+                average_price = investment_average_prices(
+                    entries,
+                    [weight for _, weight in weighted_prices],
+                    fallback=previous_prices[index],
+                    market_size=size,
+                    max_price=float(market["max_price"]),
+                    ma_large_threshold=ma_threshold,
+                )
                 own_cpi = allocate_city_cpi_for_company(
                     entries, market_size=size, max_price=float(market["max_price"]),
                     ma_large_threshold=ma_threshold, average_price=average_price,
@@ -2046,7 +2057,7 @@ def _submit_bots(
                 )
                 candidate_city_data.append((
                     index, cap, low_price_unlocked, direct_unit_cost,
-                    rival_weights, rival_weighted_prices, size, cpi_evaluator,
+                    rival_weights, rival_weighted_prices, entries, size, cpi_evaluator,
                     shadow_price_competitors, aggregate_rival_weight,
                 ))
 
@@ -2123,7 +2134,7 @@ def _submit_bots(
                 rival_damage = 0.0
                 for (
                     index, cap, low_price_unlocked, direct_unit_cost,
-                    rival_weights, rival_weighted_prices, size, cpi_evaluator,
+                    rival_weights, rival_weighted_prices, average_entries, size, cpi_evaluator,
                     shadow_price_competitors, aggregate_rival_weight,
                 ) in candidate_city_data:
                     effective_ratio = (
@@ -2134,8 +2145,22 @@ def _submit_bots(
                     candidate_price = cap * effective_ratio
                     candidate_price = min(cap, max(price_min, candidate_price, direct_unit_cost * 1.03))
                     own_weight = max(1.0, candidate_available / active_market_count)
-                    weighted_total = sum([*rival_weights, own_weight])
-                    average_price = sum([*rival_weighted_prices, candidate_price * own_weight]) / max(1.0, weighted_total)
+                    average_entries = [dict(entry) for entry in average_entries]
+                    average_entries[-1].update({
+                        "ma_index": candidate_ma,
+                        "qi_index": candidate_qi,
+                        "mi_investment": candidate_marketing[index],
+                        "price": candidate_price,
+                        "agents": agent_plan[index][1],
+                    })
+                    average_price = investment_average_prices(
+                        average_entries,
+                        [*rival_weights, own_weight],
+                        fallback=previous_prices[index],
+                        market_size=size,
+                        max_price=cap,
+                        ma_large_threshold=ma_threshold,
+                    )
                     own_cpi = cpi_evaluator.evaluate(
                         ma_index=candidate_ma, qi_index=candidate_qi,
                         mi_investment=candidate_marketing[index],

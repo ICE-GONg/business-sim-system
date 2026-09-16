@@ -6,7 +6,7 @@ import random
 import sqlite3
 from typing import Any
 
-from .cpi import allocate_city_cpi
+from .cpi import allocate_city_cpi, investment_average_prices
 from .db import (
     all_rows,
     capture_round_snapshot,
@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 11
+ENGINE_API_VERSION = 12
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -668,7 +668,23 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "city_breakdown": {str(m["city"]): {} for m in markets},
         }
 
-    def calculate_cpi_and_sales(player_average_prices: dict[str, float]) -> None:
+    def cpi_entries_for_city(city: str) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for company_id, state in states.items():
+            city_decision = state["city_decisions"][city]
+            if int(city_decision["agents_after"]) <= 0:
+                continue
+            entries.append({
+                "company_id": company_id,
+                "ma_index": state["ma_index"],
+                "qi_index": state["qi_index"],
+                "mi_investment": float(city_decision["marketing_investment"]),
+                "price": float(city_decision["price"]),
+                "agents": int(city_decision["agents_after"]),
+            })
+        return entries
+
+    def calculate_cpi_and_sales(player_average_prices: dict[str, dict[str, float]]) -> None:
         """Calculate CPI and sales once for the supplied per-city player averages."""
         for state in states.values():
             state["city_sales"] = {str(m["city"]): 0.0 for m in markets}
@@ -683,19 +699,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             market = dict(market_row)
             city = str(market["city"])
             size = market_size(market, round_no, growth)
-            entries = []
-            for company_id, state in states.items():
-                city_decision = state["city_decisions"][city]
-                if int(city_decision["agents_after"]) <= 0:
-                    continue
-                entries.append({
-                    "company_id": company_id,
-                    "ma_index": state["ma_index"],
-                    "qi_index": state["qi_index"],
-                    "mi_investment": float(city_decision["marketing_investment"]),
-                    "price": float(city_decision["price"]),
-                    "agents": int(city_decision["agents_after"]),
-                })
+            entries = cpi_entries_for_city(city)
             allocations = allocate_city_cpi(
                 entries,
                 market_size=size,
@@ -774,29 +778,42 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
     # CPI affects sales and sales affect the weighted player average, iterate
     # until the per-city averages stabilize. Available stock is only the
     # deterministic initial weighting and is replaced by actual sold units.
-    player_average_prices: dict[str, float] = {}
+    player_average_prices: dict[str, dict[str, float]] = {}
     for market_row in markets:
         city = str(market_row["city"])
-        active = [
-            (float(state["city_decisions"][city]["price"]), float(state["available"]))
-            for state in states.values()
-            if int(state["city_decisions"][city]["agents_after"]) > 0
-        ]
-        active_prices = [price for price, _ in active]
-        fallback = sum(active_prices) / len(active_prices) if active_prices else market_base_averages[city]
-        player_average_prices[city] = weighted_player_average(active, fallback)
+        entries = cpi_entries_for_city(city)
+        quantities = [float(states[int(entry["company_id"])]["available"]) for entry in entries]
+        player_average_prices[city] = investment_average_prices(
+            entries,
+            quantities,
+            fallback=market_base_averages[city],
+            market_size=market_size(dict(market_row), round_no, growth),
+            max_price=float(market_row["max_price"]),
+            ma_large_threshold=ma_large_threshold,
+        )
 
     for _ in range(25):
         calculate_cpi_and_sales(player_average_prices)
-        next_averages: dict[str, float] = {}
+        next_averages: dict[str, dict[str, float]] = {}
         for market_row in markets:
             city = str(market_row["city"])
-            sold_pairs = [
-                (float(state["city_decisions"][city]["price"]), float(state["city_sales_units"][city]))
-                for state in states.values()
+            entries = cpi_entries_for_city(city)
+            quantities = [
+                float(states[int(entry["company_id"])]["city_sales_units"][city])
+                for entry in entries
             ]
-            next_averages[city] = weighted_player_average(sold_pairs, player_average_prices[city])
-        if all(math.isclose(next_averages[city], player_average_prices[city], abs_tol=0.005) for city in player_average_prices):
+            next_averages[city] = investment_average_prices(
+                entries,
+                quantities,
+                fallback=market_base_averages[city],
+                market_size=market_size(dict(market_row), round_no, growth),
+                max_price=float(market_row["max_price"]),
+                ma_large_threshold=ma_large_threshold,
+            )
+        if all(
+            math.isclose(next_averages[city][pool], player_average_prices[city][pool], abs_tol=0.005)
+            for city in player_average_prices for pool in ("ma", "qi", "mi")
+        ):
             player_average_prices = next_averages
             calculate_cpi_and_sales(player_average_prices)
             break
@@ -979,7 +996,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "effective_from_round": round_no + 1 if research_success else None,
             },
             "sales": city_report_rows,
-            "cpi_algorithm": {"version": get_setting(conn, "cpi_algorithm_version", "cpi-generator-admin-v1", str), "description": "赠品 + 第一层 + 第二层 + 福利1/2；价格差按设定幂次分配 40 CPI；各城市独立计算。", "price_power": price_power, "player_average_price_formula": "sum(player_price * player_sold) / sum(player_sold)"},
+            "cpi_algorithm": {"version": get_setting(conn, "cpi_algorithm_version", "cpi-generator-admin-v1", str), "description": "赠品 + 第一层 + 第二层 + 福利1/2；价格差按设定幂次分配 40 CPI；各城市独立计算。", "price_power": price_power, "player_average_price_formula": "each investment pool: sum(eligible player price * sold) / sum(eligible player sold); eligible investment >= 50% of that pool's large threshold"},
         }
         conn.execute(
             "INSERT INTO results(company_id,round_no,total_assets,debt,net_assets,cash,sales_revenue,total_cost,net_profit,produced,sold,inventory,ma_index,qi_index,research_success,report_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
