@@ -1341,7 +1341,14 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     st.markdown('<div class="report-title">财务 Finance</div>', unsafe_allow_html=True)
     finance = report["finance"]
     start_debt = float(finance.get("starting_debt", float(metrics["debt"]) - float(finance.get("loan_change", 0.0)) - float(finance.get("interest", 0.0))))
+    project_bonus = float(finance.get("project_bonus", 0.0))
+    # Older reports removed the already-usable bonus from Round begins and
+    # added it back after tax.  That could display negative intermediate cash
+    # even though the settlement balance never went below zero.  Normalize
+    # both old and new reports to the actual cash available at round start.
     cash_running = float(finance["round_begins"])
+    if not bool(finance.get("bonus_in_round_begins", False)):
+        cash_running += project_bonus
     debt_running = start_debt
     finance_items = [
         ("期初 / Round begins", 0.0, 0.0),
@@ -1365,7 +1372,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         ("市场报告 / Market report", -float(finance.get("market_reports", 0.0)), 0.0),
         ("贷款利息 / Debt interest", 0.0, float(finance.get("interest", 0.0))),
         ("税费 / Tax", -float(finance.get("tax", 0.0)), 0.0),
-        ("奖励 / Bonus", float(finance.get("project_bonus", 0.0)), 0.0),
+        (f"奖励 / Bonus（¥{project_bonus:,.0f}，已计入期初可用现金）", 0.0, 0.0),
     ]
     finance_rows = []
     for label, cash_flow, debt_change in finance_items:

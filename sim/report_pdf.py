@@ -188,7 +188,10 @@ def build_round_report_pdf(
         ("LINEABOVE", (0, 2), (-1, 2), 0.55, line),
     ]))
 
+    project_bonus = float(finance.get("project_bonus", 0))
     start_cash = float(finance.get("round_begins", 0))
+    if not bool(finance.get("bonus_in_round_begins", False)):
+        start_cash += project_bonus
     start_debt = float(finance.get(
         "starting_debt",
         float(metrics.get("debt", 0)) - float(finance.get("loan_change", 0)) - float(finance.get("interest", 0)),
@@ -218,7 +221,7 @@ def build_round_report_pdf(
         ("Market report cost", -float(finance.get("market_reports", 0)), 0.0),
         ("Debt interest", 0.0, float(finance.get("interest", 0))),
         ("Tax deduction", -float(finance.get("tax", 0)), 0.0),
-        ("Project bonus", float(finance.get("project_bonus", 0)), 0.0),
+        (f"Project bonus (Y{project_bonus:,.0f}, available at round start)", 0.0, 0.0),
     ]
     for item, cash_change, debt_change in finance_events:
         running_cash += cash_change

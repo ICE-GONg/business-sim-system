@@ -87,16 +87,25 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertGreater(len(pdf_bytes), 7_000)
                 finance = report["finance"]
                 self.assertEqual(finance["project_bonus"], project_bonus)
-                self.assertEqual(finance["round_begins"], companies[0]["cash"])
+                self.assertTrue(finance["bonus_in_round_begins"])
+                self.assertEqual(finance["round_begins"], companies[0]["cash"] + project_bonus)
                 expected_cash = (
                     finance["round_begins"] + finance["loan_change"]
                     - finance["wages"] - finance["layoff"] - finance["training"]
                     - finance["materials"] - finance["storage"] - finance["agents"]
                     - finance["marketing"] - finance["quality"] - finance["management"]
                     + finance["sales_revenue"] - finance["research"] - finance["market_reports"] - finance["transport"] - finance["tax"]
-                    + finance["project_bonus"]
                 )
                 self.assertAlmostEqual(finance["round_ends"], expected_cash)
+                running_cash = finance["round_begins"] + finance["loan_change"]
+                for cost in (
+                    finance["worker_wages"], finance["engineer_wages"], finance["layoff_cash"],
+                    finance["quit_penalty_cash"], finance["training"], finance["component_material"],
+                    finance["component_storage"], finance["product_material"], finance["product_storage"],
+                    finance["agents"], finance["marketing"], finance["quality"], finance["management"],
+                ):
+                    running_cash -= cost
+                    self.assertGreaterEqual(running_cash, -1e-6)
                 taxable_profit = report["key_metrics"]["sales_revenue"] - (report["key_metrics"]["cost"] - finance["tax"])
                 self.assertAlmostEqual(finance["tax"], max(0, taxable_profit * 0.20))
                 agents = db.all_rows(conn, "SELECT city,count FROM agents WHERE company_id=? AND city IN ('广州','深圳') ORDER BY city", (companies[0]["id"],))

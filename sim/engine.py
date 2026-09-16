@@ -835,11 +835,12 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             (company_id, round_no),
         )
         project_bonus = float(bonus_row["amount"]) if bonus_row else 0.0
-        # The round-start controller has already credited this amount so it is
-        # available for wages, production and investment immediately.  The
-        # report moves it out of "Round begins" and presents it after tax;
-        # settlement must not credit it for a second time.
-        report_round_begins = float(company["cash"]) - project_bonus
+        # The round-start controller has already credited the bonus, so it is
+        # usable by every pre-sales expense.  "Round begins" must therefore
+        # expose the full available balance.  Subtracting the bonus here made
+        # the report show a fictitious negative balance even though settlement
+        # correctly capped every payment at the available cash.
+        report_round_begins = float(company["cash"])
         revenue = 0.0
         requested_transport_total = 0.0
         sold = 0
@@ -935,7 +936,7 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "materials": state["component_material_cost"] + state["product_material_cost"], "storage": state["storage_cost"],
                 "agents": state["agent_cost"], "marketing": state["marketing_total"], "quality": state["quality"], "management": state["management"],
                 "sales_revenue": revenue, "research": research, "market_reports": total_report_cost, "transport": transport_cost, "interest": interest, "tax": tax,
-                "project_bonus": project_bonus, "round_ends": cash,
+                "project_bonus": project_bonus, "bonus_in_round_begins": True, "round_ends": cash,
             },
             "human_resources": {
                 "workers": state["workers"], "engineers": state["engineers"], "previous_workers": state["previous_workers"], "previous_engineers": state["previous_engineers"],
