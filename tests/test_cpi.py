@@ -64,7 +64,7 @@ class CPIGeneratorPortTests(unittest.TestCase):
 
     def test_ma_qi_post_cap_is_smooth_positive_and_diminishing(self) -> None:
         large = 500.0
-        boundary = large * 4.0
+        boundary = large * 10.0
         epsilon = 1e-4
         function = lambda value: cpi_module._post_large_effective(
             value, large, unlimited=False,

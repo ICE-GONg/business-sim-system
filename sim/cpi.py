@@ -161,8 +161,8 @@ def _post_large_effective(
     """Effective second-layer investment above the large threshold.
 
     MI has no upper efficiency cap and therefore remains linear. MA and QI
-    remain linear through four times the large threshold (the historical
-    upper boundary), then follow a C1-continuous logarithmic extension. Its
+    remain linear through ten times the large threshold, then follow a
+    C1-continuous logarithmic extension. Its
     marginal return is ``1 / (1 + excess / threshold)``: always positive and
     smoothly diminishing instead of the old permanent 10% conversion.
     """
@@ -170,7 +170,9 @@ def _post_large_effective(
     remaining = max(0.0, float(investment) - large)
     if unlimited or large <= 0.0:
         return remaining
-    linear_span = large * 3.0
+    # The second layer starts at 1L, so a 9L linear span places the boundary
+    # at 10L total investment.
+    linear_span = large * 9.0
     if remaining <= linear_span:
         return remaining
     excess = remaining - linear_span
