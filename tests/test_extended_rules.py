@@ -785,7 +785,11 @@ class ExtendedRulesTest(unittest.TestCase):
                 # Limited attack rounds may lose money, but the field must not
                 # turn into collective suicide. At least five of seven remain
                 # profitable while laggards may spend to damage richer rivals.
-                self.assertGreaterEqual(profitable, max(1, len(round_results) - 2))
+                self.assertGreaterEqual(
+                    profitable,
+                    max(1, len(round_results) - 2),
+                    f"round={round_no} profits={[float(row['net_profit']) for row in round_results]}",
+                )
                 assets = sorted(float(result["net_assets"]) for result in round_results)
                 if assets:
                     median_assets = assets[len(assets) // 2]

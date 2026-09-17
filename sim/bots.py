@@ -12,6 +12,7 @@ from .bot_joint_pricing import JointPriceTarget, solve_joint_prices
 from .bot_market_forecast import forecast_market_sales
 from .cpi import (
     PRICE_CPI_TOTAL,
+    allocate_city_cpi,
     allocate_city_cpi_for_company,
     investment_average_prices,
     prepare_city_cpi_for_company,
@@ -20,7 +21,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 29
+BOT_API_VERSION = 30
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -71,6 +72,8 @@ def _select_empirical_super_candidate(
     *,
     tactical_price_allowed: bool,
     profit_target: float = 0.0,
+    competitive_mode: bool = False,
+    sacrifice_allowed: bool = False,
 ) -> dict[str, Any] | None:
     """Choose the plan with the largest relative advantage in the live field.
 
@@ -86,6 +89,17 @@ def _select_empirical_super_candidate(
     ]
     if not valid:
         return None
+    if competitive_mode and not sacrifice_allowed:
+        # Saturation and penultimate-round attackers must first look for a
+        # profitable way to apply pressure. Deliberate capital sacrifice is
+        # reserved for one trailing attacker in the final round so several
+        # aggressive Bots cannot drag the whole field into collective losses.
+        profitable_attacks = [
+            candidate for candidate in valid
+            if float(candidate.get("predicted_profit", -math.inf)) >= 0.0
+        ]
+        if profitable_attacks:
+            valid = profitable_attacks
     # Relative advantage is measured against the whole modelled field in the
     # same currency: own net profit plus aggregate rival revenue removed by
     # capacity capture/undercutting. Downside receives a deliberately modest
@@ -99,13 +113,20 @@ def _select_empirical_super_candidate(
         starting_assets = max(1.0, float(candidate.get("starting_assets", 1.0)))
         ending_assets = float(candidate.get("ending_assets", starting_assets + own_profit))
         capital_ratio = ending_assets / starting_assets
+        own_loss_penalty = 0.35 if competitive_mode else 0.10
+        risk_loss_penalty = 0.10 if competitive_mode else 0.05
         stability_penalty = (
-            max(0.0, -own_profit) * 0.10
-            + max(0.0, -risk_profit) * 0.05
+            max(0.0, -own_profit) * own_loss_penalty
+            + max(0.0, -risk_profit) * risk_loss_penalty
             + starting_assets * max(0.0, 0.10 - capital_ratio) ** 2 * 50.0
             + max(0.0, -ending_assets) * 3.0
         )
-        return own_profit + rival_damage - stability_penalty
+        targeted_damage = float(candidate.get("targeted_damage", 0.0))
+        # Generic rival damage is already part of the shared strategic value.
+        # Targeted damage adds direction, not a second full valuation of the
+        # same denial, so keep it below one to avoid collective suicide.
+        attack_multiplier = 0.90 if competitive_mode else 0.0
+        return own_profit + rival_damage + targeted_damage * attack_multiplier - stability_penalty
 
     style = int(profile) % 7
     return max(
@@ -117,6 +138,8 @@ def _select_empirical_super_candidate(
                 and float(candidate.get("rival_damage", 0.0)) > 0
             ),
             float(candidate.get("rival_damage", 0.0)),
+            float(candidate.get("target_cpi_drop", 0.0)) if competitive_mode else 0.0,
+            float(candidate.get("target_surplus", 0.0)) if competitive_mode else 0.0,
             float(candidate.get("predicted_profit", -math.inf)),
             float(candidate.get("risk_profit", -math.inf)),
             int(float(candidate.get("predicted_profit", -math.inf)) > float(profit_target)),
@@ -129,6 +152,30 @@ def _select_empirical_super_candidate(
              * float(candidate.get("price_ratio", 0.0))),
         ),
     )
+
+
+def _competitive_super_attackers(
+    ranked_super_ids: list[int],
+    *,
+    official_round: int,
+    total_rounds: int,
+    markets_saturated: bool,
+) -> set[int]:
+    """Choose a small deterministic set of lower-ranked aggressive bots."""
+    count = len(ranked_super_ids)
+    if count <= 1:
+        return set()
+    protected = 3 if count >= 3 else 1
+    eligible = ranked_super_ids[protected:]
+    if not eligible:
+        return set()
+    if official_round >= max(1, total_rounds - 1):
+        attack_count = max(1, math.ceil(count / 3))
+    elif markets_saturated:
+        attack_count = 2 if count >= 6 else 1
+    else:
+        return set()
+    return set(eligible[-min(len(eligible), attack_count):])
 
 
 def _strict_profit_improvement(value: float, rate: float) -> float:
@@ -979,6 +1026,44 @@ def _submit_bots(
         conn,
         "SELECT 1 FROM companies WHERE is_super_bot=0 LIMIT 1",
     ))
+    benchmark_round_row = one(
+        conn,
+        "SELECT MAX(round_no) AS round_no FROM results WHERE round_no>=1 AND round_no<?",
+        (max(1, round_no),),
+    )
+    benchmark_round = int(benchmark_round_row["round_no"] or 0) if benchmark_round_row else 0
+    ranked_rows = [dict(row) for row in all_rows(
+        conn,
+        "SELECT c.id,c.is_bot,c.is_super_bot,r.net_assets,r.net_profit,r.sales_revenue "
+        "FROM companies c JOIN results r ON r.company_id=c.id "
+        "WHERE r.round_no=? ORDER BY r.net_assets DESC,c.id",
+        (benchmark_round,),
+    )] if benchmark_round else []
+    rank_by_company = {
+        int(row["id"]): index + 1 for index, row in enumerate(ranked_rows)
+    }
+    prior_margin_by_company = {
+        int(row["id"]): (
+            float(row["net_profit"] or 0.0)
+            / max(1.0, float(row["sales_revenue"] or 0.0))
+        )
+        for row in ranked_rows
+    }
+    ranked_super_ids = [
+        int(row["id"]) for row in ranked_rows if int(row["is_super_bot"] or 0)
+    ]
+    ranked_super_ids.extend(
+        int(bot["id"]) for bot in bots if int(bot["id"]) not in ranked_super_ids
+    )
+    competitive_super_ids = (
+        _competitive_super_attackers(
+            ranked_super_ids,
+            official_round=official_round,
+            total_rounds=total_rounds,
+            markets_saturated=all_markets_full,
+        )
+        if super_mode else set()
+    )
     previous_leader: dict[str, Any] | None = None
     if super_mode and human_present and official_round > 1:
         leader_row = one(
@@ -1083,6 +1168,7 @@ def _submit_bots(
         )
         if existing_decision and not replace_existing:
             continue
+        competitive_mode = bool(super_mode and company_id in competitive_super_ids)
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
         profit_target = 0.0
         if super_mode:
@@ -1249,6 +1335,50 @@ def _submit_bots(
         rival_metrics: dict[int, list[dict[str, float]]] = {index: [] for index in range(len(markets))}
         if super_mode:
             rival_asset_weights: dict[int, float] = {}
+            own_rank = rank_by_company.get(company_id, len(rank_by_company) + 1)
+
+            def attack_priority(
+                rival_id: int,
+                *,
+                rival_is_bot: bool,
+                rival_is_super: bool,
+                index: int,
+                mi_effective: float,
+                price: float,
+                predicted_margin: float,
+            ) -> float:
+                if not competitive_mode:
+                    return 0.0
+                rival_rank = rank_by_company.get(rival_id, len(rank_by_company) + 1)
+                higher_ranked = rival_rank < own_rank
+                if not rival_is_bot:
+                    # 1) higher-ranked human; 4) lower-ranked human.
+                    priority = 4.0 if higher_ranked else 1.0
+                elif rival_is_super and higher_ranked:
+                    # 2) a Super Bot that is currently ahead.
+                    priority = 3.0
+                elif not rival_is_super and predicted_margin >= 0.18:
+                    # 3) an ordinary Bot with a strong profit forecast.
+                    priority = 2.0
+                else:
+                    # 5) everything else remains a weak fallback target.
+                    priority = 0.15
+                if not human_present and rival_is_super and higher_ranked:
+                    priority = max(priority, 3.0)
+                market = markets[index]
+                size = (
+                    float(market["population"]) * float(market["penetration"])
+                    * growth ** max(0, official_round - 1)
+                )
+                mi_large = (float(market["max_price"]) / 50.0) * size * 0.20 / 1.5 / 2.0
+                mi_ratio = mi_effective / max(1.0, mi_large)
+                if mi_ratio >= 2.0:
+                    priority += min(1.25, (mi_ratio - 2.0) * 0.20 + 0.35)
+                reference = previous_prices.get(index, float(market["initial_avg_price"]))
+                if price > 0.0 and price <= reference * 0.80:
+                    priority += 1.0
+                priority += min(0.80, max(0.0, predicted_margin) * 1.5)
+                return priority
 
             def rival_asset_weight(rival_id: int) -> float:
                 cached = rival_asset_weights.get(rival_id)
@@ -1277,7 +1407,7 @@ def _submit_bots(
                 conn,
                 "SELECT d.company_id,d.worker_delta,d.engineer_delta,d.management_investment,d.production_volume,"
                 "d.quality_investment,cd.city,cd.agent_delta,cd.marketing_investment,cd.price,c.product_inventory,"
-                "c.is_super_bot AS rival_is_super "
+                "c.is_bot AS rival_is_bot,c.is_super_bot AS rival_is_super "
                 "FROM decisions d JOIN companies c ON c.id=d.company_id "
                 "JOIN city_decisions cd ON cd.company_id=d.company_id AND cd.round_no=d.round_no "
                 "WHERE d.round_no=? AND d.submitted_at IS NOT NULL AND d.company_id<>?",
@@ -1307,16 +1437,37 @@ def _submit_bots(
                 ma_index = float(rival["management_investment"] or 0) / max(1, workers + engineers)
                 qi_denominator = float(rival["product_inventory"] or 0) * 1.2 + float(rival["production_volume"] or 0)
                 qi_index = float(rival["quality_investment"] or 0) / max(1.0, qi_denominator)
+                available_per_city = (
+                    float(rival["product_inventory"] or 0) + float(rival["production_volume"] or 0)
+                ) / max(1, int(active_count["n"] or 0))
+                mi_effective = float(rival["marketing_investment"] or 0) * (1.0 + agents * 0.10)
+                revenue_proxy = max(0.0, float(rival["price"] or 0)) * available_per_city
+                fixed_proxy = (
+                    float(rival["management_investment"] or 0)
+                    + float(rival["quality_investment"] or 0)
+                ) / max(1, int(active_count["n"] or 0)) + float(rival["marketing_investment"] or 0)
+                predicted_margin = max(
+                    prior_margin_by_company.get(int(rival["company_id"]), 0.0),
+                    (revenue_proxy - fixed_proxy) / max(1.0, revenue_proxy),
+                )
                 rival_metrics[index].append({
+                    "company_id": float(rival["company_id"]),
                     "ma": ma_index,
                     "qi": qi_index,
-                    "mi_effective": float(rival["marketing_investment"] or 0) * (1.0 + agents * 0.10),
+                    "mi_effective": mi_effective,
                     "price": float(rival["price"] or 0),
                     "agents": float(agents),
+                    "attack_weight": attack_priority(
+                        int(rival["company_id"]),
+                        rival_is_bot=bool(rival["rival_is_bot"]),
+                        rival_is_super=bool(rival["rival_is_super"]),
+                        index=index,
+                        mi_effective=mi_effective,
+                        price=float(rival["price"] or 0),
+                        predicted_margin=predicted_margin,
+                    ),
                     "strategic_weight": rival_asset_weight(int(rival["company_id"])),
-                    "available": (
-                        float(rival["product_inventory"] or 0) + float(rival["production_volume"] or 0)
-                    ) / max(1, int(active_count["n"] or 0)),
+                    "available": available_per_city,
                 })
 
             # Super Bots are analysed and committed one at a time, but every
@@ -1429,11 +1580,21 @@ def _submit_bots(
                             * 1.03,
                         )
                     rival_metrics[index].append({
+                        "company_id": float(other_id),
                         "ma": default_ma,
                         "qi": default_qi,
                         "mi_effective": default_mi,
                         "price": expected_price,
                         "agents": float(other_agents),
+                        "attack_weight": attack_priority(
+                            other_id,
+                            rival_is_bot=True,
+                            rival_is_super=True,
+                            index=index,
+                            mi_effective=default_mi,
+                            price=expected_price,
+                            predicted_margin=prior_margin_by_company.get(other_id, 0.0),
+                        ),
                         "strategic_weight": rival_asset_weight(other_id),
                         "available": predicted_available,
                     })
@@ -1841,10 +2002,13 @@ def _submit_bots(
                 for rival_number, rival in enumerate(rival_metrics[index]):
                     rival_agents = max(1.0, rival.get("agents", 1.0))
                     entries.append({
-                        "company_id": -(rival_number + 1), "ma_index": rival["ma"],
+                        "company_id": int(rival.get("company_id", -(rival_number + 1))),
+                        "ma_index": rival["ma"],
                         "qi_index": rival["qi"],
                         "mi_investment": rival["mi_effective"] / (1.0 + rival_agents * 0.10),
                         "price": rival["price"], "agents": rival_agents,
+                        "attack_weight": float(rival.get("attack_weight", 0.0)),
+                        "available": float(rival.get("available", 0.0)),
                     })
                     weighted_prices.append((rival["price"], max(1.0, rival.get("available", 1.0))))
                 entries.append({
@@ -1891,6 +2055,25 @@ def _submit_bots(
             ma_ceiling = max(1.0, ma_threshold * (8000.0 / 1300.0))
             qi_ceiling = max(1.0, qi_line * 6.0)
             mi_ratio_ceiling = 6.0 if use_mi else 0.0
+            if competitive_mode:
+                ma_ceiling = max(ma_ceiling, ma_threshold * 10.0)
+                qi_ceiling = max(qi_ceiling, qi_line * 10.0)
+                if use_mi:
+                    rival_mi_ratios = []
+                    for index in selected:
+                        benefit = 1.0 + agent_plan[index][1] * 0.10
+                        base_threshold = mi_thresholds.get(index, 0.0) * benefit
+                        if base_threshold <= 0.0:
+                            continue
+                        rival_mi_ratios.extend(
+                            float(item.get("mi_effective", 0.0)) / base_threshold
+                            for item in rival_metrics[index]
+                            if float(item.get("attack_weight", 0.0)) > 0.0
+                        )
+                    mi_ratio_ceiling = max(
+                        mi_ratio_ceiling,
+                        min(24.0, max(rival_mi_ratios, default=0.0) * 1.30),
+                    )
             field_ma = min(ma_ceiling, max(1.0, ma_index_target))
             field_qi = min(qi_ceiling, max(1.0, qi_index_target))
             field_mi_ratio = max(
@@ -2021,10 +2204,13 @@ def _submit_bots(
                 for rival_number, rival in enumerate(rival_metrics[index]):
                     rival_agents = max(1.0, rival.get("agents", 1.0))
                     entries.append({
-                        "company_id": -(rival_number + 1), "ma_index": rival["ma"],
+                        "company_id": int(rival.get("company_id", -(rival_number + 1))),
+                        "ma_index": rival["ma"],
                         "qi_index": rival["qi"],
                         "mi_investment": rival["mi_effective"] / (1.0 + rival_agents * 0.10),
                         "price": rival["price"], "agents": rival_agents,
+                        "attack_weight": float(rival.get("attack_weight", 0.0)),
+                        "available": float(rival.get("available", 0.0)),
                     })
                     weight = max(1.0, rival.get("available", 1.0))
                     rival_weights.append(weight)
@@ -2405,6 +2591,148 @@ def _submit_bots(
                         else:
                             low_scale = scale
 
+            if competitive_mode and candidate_cache:
+                # Exact targeted pressure is more expensive than the own-CPI
+                # search, so run it only on a diverse shortlist after the
+                # binary searches finish. Baseline CPI is cached per city;
+                # each shortlisted plan is then compared against that same
+                # pre-entry field to measure target CPI loss and new surplus.
+                candidate_values = list(candidate_cache.values())
+                shortlisted: dict[int, dict[str, Any]] = {}
+
+                def include_shortlist(rows: list[dict[str, Any]], limit: int = 24) -> None:
+                    for row in rows[:limit]:
+                        shortlisted[id(row)] = row
+
+                include_shortlist(sorted(
+                    candidate_values,
+                    key=lambda row: float(row.get("predicted_profit", -math.inf))
+                    + float(row.get("rival_damage", 0.0)),
+                    reverse=True,
+                ), 32)
+                include_shortlist(sorted(
+                    candidate_values,
+                    key=lambda row: float(row.get("marketing_total", 0.0)),
+                    reverse=True,
+                ))
+                include_shortlist(sorted(
+                    candidate_values,
+                    key=lambda row: float(row.get("price_ratio", 1.0)),
+                ))
+                include_shortlist(sorted(
+                    candidate_values,
+                    key=lambda row: float(row.get("ma", 0.0)) + float(row.get("qi", 0.0)),
+                    reverse=True,
+                ))
+                baseline_by_city: dict[int, dict[int, dict[str, Any]]] = {}
+
+                for candidate in shortlisted.values():
+                    candidate_available = old_products + int(candidate["groups"]) * int(group["products"])
+                    targeted_damage = 0.0
+                    target_cpi_drop = 0.0
+                    target_surplus = 0.0
+                    for (
+                        index, cap, low_price_unlocked, direct_unit_cost,
+                        rival_weights, _rival_weighted_prices, base_entries_with_own,
+                        size, _cpi_evaluator, _shadow_price_competitors,
+                        _aggregate_rival_weight,
+                    ) in candidate_city_data:
+                        base_entries = [dict(entry) for entry in base_entries_with_own[:-1]]
+                        target_entries = [
+                            entry for entry in base_entries
+                            if float(entry.get("attack_weight", 0.0)) > 0.0
+                        ]
+                        if not target_entries:
+                            continue
+                        baseline = baseline_by_city.get(index)
+                        if baseline is None:
+                            baseline_averages = investment_average_prices(
+                                base_entries,
+                                rival_weights,
+                                fallback=previous_prices[index],
+                                market_size=size,
+                                max_price=float(markets[index]["max_price"]),
+                                ma_large_threshold=ma_threshold,
+                            )
+                            baseline_rows = allocate_city_cpi(
+                                base_entries,
+                                market_size=size,
+                                max_price=float(markets[index]["max_price"]),
+                                ma_large_threshold=ma_threshold,
+                                price_power=price_power,
+                                average_price=baseline_averages,
+                                market_average_price=previous_prices[index],
+                            )
+                            baseline = {
+                                int(row["company_id"]): row for row in baseline_rows
+                            }
+                            baseline_by_city[index] = baseline
+
+                        effective_ratio = (
+                            float(candidate["price_ratio"])
+                            if low_price_unlocked or float(candidate["price_ratio"]) >= 0.75
+                            else min(0.98, max(0.75, high_price_ratio))
+                        )
+                        candidate_price = min(
+                            cap,
+                            max(price_min, cap * effective_ratio, direct_unit_cost * 1.03),
+                        )
+                        own_entry = dict(base_entries_with_own[-1])
+                        own_entry.update({
+                            "ma_index": float(candidate["ma"]),
+                            "qi_index": float(candidate["qi"]),
+                            "mi_investment": float(candidate["marketing"].get(index, 0.0)),
+                            "price": candidate_price,
+                            "agents": agent_plan[index][1],
+                        })
+                        after_entries = [*base_entries, own_entry]
+                        own_weight = max(1.0, float(candidate_available) / active_market_count)
+                        after_averages = investment_average_prices(
+                            after_entries,
+                            [*rival_weights, own_weight],
+                            fallback=previous_prices[index],
+                            market_size=size,
+                            max_price=float(markets[index]["max_price"]),
+                            ma_large_threshold=ma_threshold,
+                        )
+                        after_rows = allocate_city_cpi(
+                            after_entries,
+                            market_size=size,
+                            max_price=float(markets[index]["max_price"]),
+                            ma_large_threshold=ma_threshold,
+                            price_power=price_power,
+                            average_price=after_averages,
+                            market_average_price=previous_prices[index],
+                        )
+                        after = {int(row["company_id"]): row for row in after_rows}
+                        for target in target_entries:
+                            target_id = int(target["company_id"])
+                            before_row = baseline.get(target_id)
+                            after_row = after.get(target_id)
+                            if not before_row or not after_row:
+                                continue
+                            weight = float(target.get("attack_weight", 0.0))
+                            before_cpi = float(before_row["total_cpi"])
+                            after_cpi = float(after_row["total_cpi"])
+                            cpi_drop = max(0.0, before_cpi - after_cpi)
+                            available = max(0.0, float(target.get("available", 0.0)))
+                            before_sales = min(available, size * before_cpi / 100.0)
+                            after_sales = min(available, size * after_cpi / 100.0)
+                            lost_sales = max(0.0, before_sales - after_sales)
+                            new_surplus = max(0.0, available - after_sales) - max(
+                                0.0, available - before_sales,
+                            )
+                            target_price = max(1.0, float(target.get("price", 0.0)))
+                            targeted_damage += (
+                                lost_sales * target_price
+                                + max(0.0, new_surplus) * target_price * 0.20
+                            ) * weight
+                            target_cpi_drop += cpi_drop * weight
+                            target_surplus += max(0.0, new_surplus) * weight
+                    candidate["targeted_damage"] = targeted_damage
+                    candidate["target_cpi_drop"] = target_cpi_drop
+                    candidate["target_surplus"] = target_surplus
+
             # Select by relative advantage across every evaluated plan. Profiles
             # still generate different candidate grids and rival responses, but
             # they cannot override the economic result after the search.
@@ -2419,6 +2747,18 @@ def _submit_bots(
                     or market_pressure >= 0.60
                 ),
                 profit_target=profit_target,
+                competitive_mode=competitive_mode,
+                sacrifice_allowed=bool(
+                    last_round
+                    and competitive_mode
+                    and next(
+                        (
+                            rival_id for rival_id in reversed(ranked_super_ids)
+                            if rival_id in competitive_super_ids
+                        ),
+                        None,
+                    ) == company_id
+                ),
             )
             if empirical_candidate is not None:
                 best_candidate = empirical_candidate

@@ -115,6 +115,66 @@ class BotKDSRegressionTest(unittest.TestCase):
         )
         self.assertEqual(strategic["name"], "destructive")
 
+        targeted_attack = candidate(
+            "targeted-attack", profit=-400, risk=-600,
+            damage=0, price=.52, sold=450,
+        )
+        targeted_attack.update({
+            "targeted_damage": 2_000,
+            "target_cpi_drop": 12,
+            "target_surplus": 300,
+        })
+        selected_attack = self.bots._select_empirical_super_candidate(
+            [*choices, targeted_attack],
+            0,
+            tactical_price_allowed=True,
+            competitive_mode=True,
+            sacrifice_allowed=True,
+        )
+        self.assertEqual(selected_attack["name"], "targeted-attack")
+        stable_attack = self.bots._select_empirical_super_candidate(
+            [*choices, targeted_attack],
+            0,
+            tactical_price_allowed=True,
+            competitive_mode=True,
+            sacrifice_allowed=False,
+        )
+        self.assertEqual(stable_attack["name"], "unsafe")
+
+    def test_competitive_super_bot_count_is_ranked_and_bounded(self):
+        ranked = list(range(1, 10))
+        # Penultimate/final rounds use one third, always taken from the lowest
+        # eligible ranks while the top three remain protected.
+        self.assertEqual(
+            self.bots._competitive_super_attackers(
+                ranked, official_round=6, total_rounds=7,
+                markets_saturated=False,
+            ),
+            {7, 8, 9},
+        )
+        self.assertEqual(
+            self.bots._competitive_super_attackers(
+                ranked, official_round=3, total_rounds=7,
+                markets_saturated=True,
+            ),
+            {8, 9},
+        )
+        # With fewer than three Super Bots only first place is protected.
+        self.assertEqual(
+            self.bots._competitive_super_attackers(
+                [11, 12], official_round=4, total_rounds=5,
+                markets_saturated=False,
+            ),
+            {12},
+        )
+        self.assertEqual(
+            self.bots._competitive_super_attackers(
+                [21, 22, 23], official_round=4, total_rounds=5,
+                markets_saturated=True,
+            ),
+            set(),
+        )
+
     def test_super_profit_target_uses_self_higher_rank_and_previous_bot(self):
         leader_id = self.company("HUMAN")
         previous_bot_id = self.company("SUPER-A", super_mode=True)
