@@ -61,6 +61,7 @@ if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 5:
     importlib.invalidate_caches()
     importlib.reload(_remote_worker_module)
 from sim.remote_worker import (
+    RemoteRevisionError,
     assert_remote_job_current,
     remote_health,
     remote_pending,
@@ -121,25 +122,43 @@ def _remote_super_bot_submit(
 ) -> bool:
     """Compute and durably save one remote Super Bot at a time."""
     endpoints = _remote_super_bot_endpoints()
-    saved_local_url = _saved_local_worker_url()
-    if saved_local_url and endpoints and endpoints[0] == saved_local_url:
-        # A quick public GET prevents an expired temporary tunnel from making
-        # every Bot wait for the much longer computation-request timeout.
-        local_status = remote_health([saved_local_url], timeout=2.5)
-        if not local_status or not local_status[0]["ok"]:
-            endpoints = endpoints[1:]
     if not endpoints:
         return False
-    with connect() as conn:
-        remote_submit(
-            conn,
-            endpoints,
-            _deployment_secret("SUPER_BOT_REMOTE_TOKEN"),
-            int(round_no),
-            replace_existing=replace_existing,
-            progress_callback=progress_callback,
-            timing_callback=lambda metrics: LOGGER.info("Super Bot remote timing: %s", metrics),
+    # Check every route, including cloud fallbacks: an expired Mac tunnel must
+    # not redirect expensive analysis to an older cloud worker. Health GETs
+    # are parallel, public, and contain no competition data or credentials.
+    statuses = remote_health(endpoints, timeout=2.5)
+    endpoints = [
+        endpoint for index, endpoint in enumerate(endpoints, 1)
+        if any(status.get("line") == index and status.get("ok") for status in statuses)
+    ]
+    if not endpoints:
+        st.warning(
+            "外部计算线路暂不可用或规则版本不一致，已自动改用当前应用的最新规则计算。"
+            "已保存的草稿会保留；计算可能比本地算力慢一些。"
         )
+        return False
+    try:
+        with connect() as conn:
+            remote_submit(
+                conn,
+                endpoints,
+                _deployment_secret("SUPER_BOT_REMOTE_TOKEN"),
+                int(round_no),
+                replace_existing=replace_existing,
+                progress_callback=progress_callback,
+                timing_callback=lambda metrics: LOGGER.info("Super Bot remote timing: %s", metrics),
+            )
+    except RemoteRevisionError:
+        # A node can restart onto a different release after health succeeds.
+        # Re-evaluate the complete batch with one current engine; retain each
+        # prior draft until its replacement has actually finished. Never mask
+        # authentication failures or changed-input errors as a version issue.
+        st.warning("计算节点在分析期间版本发生变化，已切换为当前应用规则重新分析；已保存的草稿不会提前清空。")
+        with connect() as conn:
+            submit_local_super_bots(
+                conn, int(round_no), progress_callback, replace_existing=True,
+            )
     return True
 
 
@@ -2218,6 +2237,8 @@ def render_admin_rounds() -> None:
             candidate_url = _normalise_local_worker_url(local_worker_input)
             status = remote_health([candidate_url], timeout=2.5)[0]
             if not status["ok"]:
+                if status.get("reachable"):
+                    raise ValueError("本地服务已连通，但计算规则版本不一致。请下载最新 Mac 启动器并重新启动，再连接新地址。")
                 raise ValueError("没有收到本地计算服务响应。请重新双击启动器，再粘贴新地址。")
             with connect() as conn:
                 set_setting(conn, LOCAL_WORKER_URL_SETTING, candidate_url)
@@ -2332,7 +2353,7 @@ def render_admin_rounds() -> None:
                         replace_existing=super_saved >= super_total and not remote_job_pending,
                         progress_callback=update_super_progress,
                     ):
-                        update_super_progress(super_total, super_total, "远程计算完成")
+                        update_super_progress(super_total, super_total, "计算完成")
                     else:
                         with connect() as conn:
                             submit_local_super_bots(

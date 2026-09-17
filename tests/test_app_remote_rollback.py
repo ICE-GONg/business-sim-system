@@ -27,6 +27,15 @@ class RemoteRollbackAppTests(unittest.TestCase):
         from sim import db
 
         self.db = db
+        self.health_patch = patch(
+            "sim.remote_worker.remote_health",
+            side_effect=lambda endpoints, timeout: [
+                {"line": index, "ok": True, "message": "已连通，计算规则版本一致", "seconds": 0.01}
+                for index, _ in enumerate(endpoints, 1)
+            ],
+        )
+        self.health_patch.start()
+        self.addCleanup(self.health_patch.stop)
         previous_path = db.DB_PATH
         self.addCleanup(setattr, db, "DB_PATH", previous_path)
         db.DB_PATH = Path(os.environ["SIM_DB_PATH"])
@@ -178,11 +187,63 @@ class RemoteRollbackAppTests(unittest.TestCase):
         local_url = "https://expired-local.trycloudflare.com"
         with self.db.connect() as conn:
             self.db.set_setting(conn, "super_bot_local_worker_url", local_url)
-        offline = [{"line": 1, "ok": False, "message": "连接失败或超时", "seconds": 2.5}]
+        offline = [
+            {"line": 1, "ok": False, "message": "连接失败或超时", "seconds": 2.5},
+            {"line": 2, "ok": True, "message": "已连通，计算规则版本一致", "seconds": 0.01},
+        ]
         with patch("sim.remote_worker.remote_health", return_value=offline) as health, patch(
             "sim.remote_worker._post", self.post,
         ):
             self.at.button(key="round_rollback_button").click().run()
         self.assertFalse(self.at.exception)
-        health.assert_called_once_with([local_url], timeout=2.5)
+        health.assert_called_once_with([local_url, "https://worker.test"], timeout=2.5)
         self.assertEqual(self.calls, ["bot", "rebalance"])
+
+    def test_stale_cloud_falls_back_to_current_app_and_finishes_drafts(self):
+        self.prepare()
+        stale = [{"line": 1, "ok": False, "reachable": True, "message": "版本不一致", "seconds": 0.01}]
+        with patch("sim.remote_worker.remote_health", return_value=stale), patch(
+            "sim.remote_worker._post", side_effect=AssertionError("must not compute on a stale node"),
+        ):
+            self.at.button(key="round_rollback_button").click().run()
+        self.assertFalse(self.at.exception)
+        self.assertFalse(self.at.error)
+        with self.db.connect() as conn:
+            self.assertEqual(self.db.one(conn, "SELECT is_draft FROM decisions WHERE company_id=?", (self.super_id,))["is_draft"], 1)
+            self.assertEqual(self.db.one(conn, "SELECT phase FROM super_bot_remote_jobs WHERE round_no=1")["phase"], "done")
+        self.assertTrue(any("已撤销第 1 轮" in row.value for row in self.at.success))
+
+    def test_node_version_race_after_saved_bot_finishes_with_current_app(self):
+        from sim.remote_worker import RemoteRevisionError, submit_local_super_bots
+
+        self.prepare()
+
+        def race(endpoint, token, payload):
+            if payload["phase"] == "rebalance":
+                with self.db.connect() as conn:
+                    self.assertEqual(self.db.one(conn, "SELECT is_draft FROM decisions WHERE company_id=?", (self.super_id,))["is_draft"], 1)
+                raise RemoteRevisionError("node changed version")
+            return self.post(endpoint, token, payload)
+
+        with patch("sim.remote_worker._post", race), patch(
+            "sim.remote_worker.submit_local_super_bots", wraps=submit_local_super_bots,
+        ) as local:
+            self.at.button(key="round_rollback_button").click().run()
+        self.assertFalse(self.at.exception)
+        self.assertFalse(self.at.error)
+        self.assertEqual(self.calls, ["bot"])
+        self.assertTrue(local.call_args.kwargs["replace_existing"])
+        with self.db.connect() as conn:
+            self.assertEqual(self.db.one(conn, "SELECT is_draft FROM decisions WHERE company_id=?", (self.super_id,))["is_draft"], 1)
+            self.assertEqual(self.db.one(conn, "SELECT phase FROM super_bot_remote_jobs WHERE round_no=1")["phase"], "done")
+
+    def test_pairing_stale_local_worker_reports_version_not_connection(self):
+        self.prepare(super_bot=False)
+        self.at.text_input(key="local_compute_url_input").set_value("https://stale-local.test").run()
+        stale = [{"line": 1, "ok": False, "reachable": True, "message": "版本不一致", "seconds": 0.01}]
+        with patch("sim.remote_worker.remote_health", return_value=stale):
+            self.at.button(key="connect_local_compute").click().run()
+        self.assertFalse(self.at.exception)
+        self.assertTrue(any("已连通，但计算规则版本不一致" in row.value for row in self.at.error))
+        with self.db.connect() as conn:
+            self.assertEqual(self.db.get_setting(conn, "super_bot_local_worker_url", "", str), "")
