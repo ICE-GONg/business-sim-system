@@ -66,6 +66,7 @@ def build_round_report_pdf(
     font = "Courier"
     bold = "Courier-Bold"
     italic = "Courier-Oblique"
+    bold_italic = "Courier-BoldOblique"
     chinese_font = "STSong-Light"
     if chinese_font not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(UnicodeCIDFont(chinese_font))
@@ -80,29 +81,31 @@ def build_round_report_pdf(
     content_width = page_width - 2 * margin
 
     body = ParagraphStyle(
-        "OfficialBody", fontName=font, fontSize=7.2, leading=9.1,
+        "OfficialBody", fontName=bold, fontSize=8.0, leading=10.1,
         textColor=ink, allowWidows=1, allowOrphans=1,
     )
-    table_body = ParagraphStyle("OfficialTable", parent=body, fontSize=6.25, leading=7.7)
+    table_body = ParagraphStyle(
+        "OfficialTable", parent=body, fontName=bold, fontSize=7.0, leading=8.3,
+    )
     table_head = ParagraphStyle(
-        "OfficialTableHead", parent=table_body, fontName=font,
-        textColor=muted, alignment=TA_CENTER,
+        "OfficialTableHead", parent=table_body, fontName=bold,
+        textColor=muted,
     )
     note = ParagraphStyle(
-        "OfficialNote", parent=body, fontName=italic, fontSize=6.0,
-        leading=9.2, leftIndent=8, firstLineIndent=-8, spaceAfter=7.5,
+        "OfficialNote", parent=body, fontName=bold_italic, fontSize=6.7,
+        leading=10.0, leftIndent=8, firstLineIndent=-8, spaceAfter=8.0,
     )
     header_center = ParagraphStyle(
-        "OfficialHeaderCenter", parent=body, fontSize=7.0, leading=9.0,
+        "OfficialHeaderCenter", parent=body, fontName=bold, fontSize=7.8, leading=9.8,
         alignment=TA_LEFT,
     )
     header_right = ParagraphStyle(
-        "OfficialHeaderRight", parent=body, fontSize=6.6, leading=8.4,
+        "OfficialHeaderRight", parent=body, fontName=bold, fontSize=7.4, leading=9.3,
         alignment=TA_RIGHT,
     )
     section_style = ParagraphStyle(
-        "OfficialSection", parent=body, fontName=bold, fontSize=9.0,
-        leading=10.5,
+        "OfficialSection", parent=body, fontName=bold, fontSize=10.0,
+        leading=11.8,
     )
 
     def p(value: Any, style: ParagraphStyle = body) -> Paragraph:
@@ -155,17 +158,34 @@ def build_round_report_pdf(
 
     def make_table(
         data: list[list[Any]], widths_mm: list[float], *, header_rows: int = 1,
-        alignments: dict[int, str] | None = None, font_size: float = 6.25,
-        row_padding: float = 5.3, extra_style: list[tuple[Any, ...]] | None = None,
+        alignments: dict[int, str] | None = None, font_size: float = 7.0,
+        row_padding: float = 5.7, extra_style: list[tuple[Any, ...]] | None = None,
     ) -> Table:
         cooked: list[list[Any]] = []
-        row_style = ParagraphStyle("DynamicRow", parent=table_body, fontSize=font_size, leading=font_size + 1.1)
-        head_style = ParagraphStyle("DynamicHead", parent=table_head, fontSize=font_size, leading=font_size + 1.1)
+        paragraph_alignments = {
+            "LEFT": TA_LEFT,
+            "CENTER": TA_CENTER,
+            "RIGHT": TA_RIGHT,
+        }
+        column_alignments = alignments or {}
         for row_index, row in enumerate(data):
-            cooked.append([
-                cell if isinstance(cell, Flowable) else p(cell, head_style if row_index < header_rows else row_style)
-                for cell in row
-            ])
+            cooked_row: list[Any] = []
+            for column_index, cell in enumerate(row):
+                if isinstance(cell, Flowable):
+                    cooked_row.append(cell)
+                    continue
+                alignment_name = column_alignments.get(column_index, "LEFT")
+                parent_style = table_head if row_index < header_rows else table_body
+                cell_style = ParagraphStyle(
+                    f"DynamicCell-{row_index}-{column_index}",
+                    parent=parent_style,
+                    fontName=bold,
+                    fontSize=font_size,
+                    leading=font_size + 1.3,
+                    alignment=paragraph_alignments[alignment_name],
+                )
+                cooked_row.append(p(cell, cell_style))
+            cooked.append(cooked_row)
         result = Table(
             cooked, colWidths=[width * mm for width in widths_mm], repeatRows=header_rows,
             hAlign="LEFT", splitByRow=1, splitInRow=1,
@@ -364,11 +384,11 @@ def build_round_report_pdf(
             "Net Assets = Total Assets - Debt. Your result till this round, used for ranking.",
         ]),
         Spacer(1, 3 * mm), section("Finance"),
-        make_table(finance_rows, [54, 34, 37, 32, 38], font_size=5.9,
-                   alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT"}, row_padding=4.3),
+        make_table(finance_rows, [54, 34, 37, 32, 38], font_size=6.6,
+                   alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT"}, row_padding=4.7),
         Spacer(1, 3.5 * mm), section("Human Resources"),
-        make_table(human_rows, [39, 19, 16, 18, 16, 19, 18, 24, 26], font_size=5.5,
-                   alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT", 8: "RIGHT"}, row_padding=4.0),
+        make_table(human_rows, [39, 19, 16, 18, 16, 19, 18, 24, 26], font_size=6.15,
+                   alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT", 8: "RIGHT"}, row_padding=4.4),
         Spacer(1, 1.8 * mm),
         *notes([
             "Low-salary Effect: If your salary is relatively low, you cannot add as many employees as you planned to, and some employees may quit.",
@@ -418,8 +438,8 @@ def build_round_report_pdf(
         story.extend([
             Spacer(1, 3.4 * mm), section(f"Market Report - {market.get('city', '')}"), summary_table,
             Spacer(1, 1.8 * mm),
-            make_table(market_rows, [16, 33, 18, 33, 34, 24, 21, 16], font_size=5.55,
-                       alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT"}, row_padding=4.6),
+            make_table(market_rows, [16, 33, 18, 33, 34, 24, 21, 16], font_size=6.15,
+                       alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT"}, row_padding=5.0),
         ])
 
     def measured_height(flowables: list[Flowable]) -> float:
