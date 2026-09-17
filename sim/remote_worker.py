@@ -20,12 +20,13 @@ from concurrent.futures import ThreadPoolExecutor
 from .defaults import DEFAULT_SETTINGS
 
 PROTOCOL = 2
-REMOTE_API_VERSION = 4
+REMOTE_API_VERSION = 5
 TABLES = ("settings", "companies", "employee_cohorts", "market_config", "rounds",
           "decisions", "city_decisions", "agents", "results", "city_results", "market_round_stats")
 _LOCK = threading.Lock()
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 _RETRYABLE_HTTP_STATUSES = {408, 429, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530}
+_REVISION_MISMATCH_MESSAGE = "计算节点规则版本与当前应用不一致，请更新并重启计算节点后重试；本次结果未写入。"
 
 
 class RemoteWorkerError(ValueError):
@@ -38,6 +39,37 @@ class RemoteTransportError(RemoteWorkerError):
 
 class RemoteAnalysisChangedError(RemoteWorkerError):
     """Authoritative calculation inputs changed while an analysis was running."""
+
+
+class RemoteRevisionError(RemoteWorkerError):
+    """This worker cannot execute the application's current calculation rules."""
+
+
+def calculation_revision() -> dict[str, int]:
+    """Identify the loaded rules, including after a Streamlit module refresh."""
+    from . import bots, cpi, engine
+
+    return {"bot": bots.BOT_API_VERSION, "cpi": cpi.CPI_API_VERSION,
+            "engine": engine.ENGINE_API_VERSION}
+
+
+def check_calculation_revision(payload: dict, *, allow_legacy: bool = False) -> None:
+    # Older clients may still use an updated worker during rollout. New clients
+    # always send a revision and require it in the result before saving anything.
+    if allow_legacy and "calculation_revision" not in payload:
+        return
+    if payload.get("calculation_revision") != calculation_revision():
+        raise RemoteRevisionError(_REVISION_MISMATCH_MESSAGE)
+
+
+def _check_result_revision(request: dict, result: dict) -> None:
+    if not result.get("ok"):
+        if result.get("error_code") == "calculation_revision_mismatch":
+            raise RemoteRevisionError(_REVISION_MISMATCH_MESSAGE)
+        raise RemoteWorkerError(str(result.get("error") or "远程计算失败"))
+    if request.get("calculation_revision") != calculation_revision():
+        raise RemoteAnalysisChangedError("分析期间计算规则已升级，请重新分析全部超级 Bot。")
+    check_calculation_revision(result)
 
 
 def resolve_remote_endpoints(primary: str = "", *, urls: Any = None, fallback: str = "") -> list[str]:
@@ -81,7 +113,14 @@ def remote_health(endpoints: str | list[str] | tuple[str, ...], timeout: float =
             if isinstance(result, dict) and "statusCode" in result and "body" in result:
                 result = json.loads(result["body"]) if isinstance(result["body"], str) else result["body"]
             if isinstance(result, dict) and result.get("ok") and result.get("protocol") == PROTOCOL:
-                status.update(ok=True, message="已连通")
+                status["reachable"] = True
+                status["calculation_revision"] = result.get("calculation_revision")
+                try:
+                    check_calculation_revision(result)
+                except RemoteRevisionError:
+                    status["message"] = "已连通，但计算规则版本不兼容，请更新并重启计算节点"
+                else:
+                    status.update(ok=True, message="已连通，计算规则版本一致")
             else:
                 status["message"] = "响应不是兼容的计算服务"
         except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError, http.client.HTTPException):
@@ -144,7 +183,7 @@ def _job_fingerprints(conn: sqlite3.Connection, round_no: int) -> tuple[str, str
         conn.execute("BEGIN")
     try:
         state = _state(conn)
-        fingerprint_state = dict(state)
+        fingerprint_state = dict(state, calculation_revision=calculation_revision())
         round_data = state.get("rounds")
         if round_data:
             ignored = {"status", "starts_at", "ends_at", "settled_at"}
@@ -208,7 +247,8 @@ def create_remote_request(conn: sqlite3.Connection, round_no: int, *, phase: str
     if phase not in ("bot", "rebalance") or (phase == "bot" and company_id is None):
         raise RemoteWorkerError("无效的远程计算阶段")
     raw, fingerprint = _snapshot(conn)
-    return {"protocol": PROTOCOL, "request_id": uuid.uuid4().hex, "snapshot_hash": fingerprint,
+    return {"protocol": PROTOCOL, "calculation_revision": calculation_revision(),
+            "request_id": uuid.uuid4().hex, "snapshot_hash": fingerprint,
             "snapshot_b64": base64.b64encode(gzip.compress(raw, compresslevel=6, mtime=0)).decode(),
             "round_no": int(round_no), "phase": phase, "company_id": company_id,
             "replace_existing": bool(replace_existing)}
@@ -251,6 +291,8 @@ def _rows(conn: sqlite3.Connection, table: str, round_no: int, ids: list[int]) -
 
 def run_remote_request(conn: sqlite3.Connection, payload: dict) -> dict:
     from .bots import rebalance_super_bot_decisions, submit_super_bot_decisions
+    check_calculation_revision(payload, allow_legacy=True)
+    revision = calculation_revision()
     started = time.perf_counter()
     round_no = int(payload["round_no"])
     _check_round(conn, round_no)
@@ -268,7 +310,8 @@ def run_remote_request(conn: sqlite3.Connection, payload: dict) -> dict:
     else:
         raise RemoteWorkerError("无效的远程计算阶段")
     conn.commit()
-    return {"ok": True, "protocol": PROTOCOL, "request_id": payload["request_id"],
+    return {"ok": True, "protocol": PROTOCOL, "calculation_revision": revision,
+            "request_id": payload["request_id"],
             "snapshot_hash": payload["snapshot_hash"], "round_no": round_no, "phase": phase,
             "company_ids": ids, "submitted": submitted,
             "decisions": _rows(conn, "decisions", round_no, ids),
@@ -278,8 +321,7 @@ def run_remote_request(conn: sqlite3.Connection, payload: dict) -> dict:
 
 def apply_remote_result(conn: sqlite3.Connection, request: dict, result: dict,
                         *, commit: bool = True) -> int:
-    if not result.get("ok"):
-        raise RemoteWorkerError(str(result.get("error") or "远程计算失败"))
+    _check_result_revision(request, result)
     for key in ("protocol", "request_id", "snapshot_hash", "round_no", "phase"):
         if result.get(key) != request.get(key):
             raise RemoteWorkerError("远程结果与本次任务不匹配，未写入")
@@ -567,6 +609,13 @@ def _post(endpoint: str, token: str, payload: dict) -> dict:
     except urllib.error.HTTPError as exc:
         if exc.code in _RETRYABLE_HTTP_STATUSES:
             raise RemoteTransportError("计算节点暂不可用或忙碌，请继续未完成的分析。") from exc
+        if exc.code == 409:
+            try:
+                details = json.loads(exc.read(8192))
+            except (ValueError, OSError):
+                details = None
+            if isinstance(details, dict) and details.get("error_code") == "calculation_revision_mismatch":
+                raise RemoteRevisionError(_REVISION_MISMATCH_MESSAGE) from exc
         # Authentication, input and computation errors are not a reason to
         # send the same business request to a second worker.
         raise RemoteWorkerError(f"远程计算返回 HTTP {exc.code}，请检查计算节点；已保存的决策不受影响。") from exc
@@ -577,6 +626,13 @@ def _post(endpoint: str, token: str, payload: dict) -> dict:
     if "statusCode" in result and "body" in result:
         if int(result["statusCode"]) in _RETRYABLE_HTTP_STATUSES:
             raise RemoteTransportError("计算节点暂不可用或忙碌，请继续未完成的分析。")
+        if int(result["statusCode"]) == 409:
+            try:
+                details = json.loads(result["body"]) if isinstance(result["body"], str) else result["body"]
+            except ValueError:
+                details = None
+            if isinstance(details, dict) and details.get("error_code") == "calculation_revision_mismatch":
+                raise RemoteRevisionError(_REVISION_MISMATCH_MESSAGE)
         if int(result["statusCode"]) >= 400:
             raise RemoteWorkerError(f"远程计算返回 HTTP {result['statusCode']}，未写入决策。")
         result = json.loads(result["body"]) if isinstance(result["body"], str) else result["body"]
@@ -723,11 +779,15 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
                 selected_endpoint = (active_endpoint + attempt) % len(endpoints)
                 try:
                     result = _post(endpoints[selected_endpoint], token, payload)
-                except RemoteTransportError:
+                    _check_result_revision(payload, result)
+                except (RemoteTransportError, RemoteRevisionError) as exc:
                     if attempt + 1 >= len(endpoints):
                         raise
                     if progress_callback:
-                        progress_callback(total - len(pending), max(1, total), "计算线路暂不可用，备用线路连接中")
+                        message = ("计算节点规则版本不兼容，请更新节点；备用线路连接中"
+                                   if isinstance(exc, RemoteRevisionError)
+                                   else "计算线路暂不可用，备用线路连接中")
+                        progress_callback(total - len(pending), max(1, total), message)
                 else:
                     active_endpoint = selected_endpoint
                     break

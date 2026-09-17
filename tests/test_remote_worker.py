@@ -83,6 +83,56 @@ class RemoteWorkerTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT cash FROM companies WHERE id=1").fetchone()[0], 123)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
 
+    def test_missing_or_old_worker_revision_never_writes_decisions(self):
+        self.calls = []
+        request = remote.create_remote_request(self.conn, 1, company_id=1)
+        result = self.dispatch("https://example.test", "token", request)
+        self.assertEqual(request["calculation_revision"], remote.calculation_revision())
+        self.assertEqual(result["calculation_revision"], request["calculation_revision"])
+        old_revision = dict(request["calculation_revision"], bot=-1)
+        for revision in (None, old_revision):
+            with self.subTest(revision=revision):
+                incompatible = dict(result)
+                if revision is None:
+                    incompatible.pop("calculation_revision")
+                else:
+                    incompatible["calculation_revision"] = revision
+                with self.assertRaisesRegex(remote.RemoteRevisionError, "更新并重启"):
+                    remote.apply_remote_result(self.conn, request, incompatible)
+                self.assertFalse(self.conn.in_transaction)
+                self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
+
+    def test_loaded_rule_upgrade_invalidates_fingerprints_and_completed_job(self):
+        from sim import bots, cpi, engine
+
+        remote.mark_remote_job_complete(self.conn, 1)
+        fingerprints = remote._job_fingerprints(self.conn, 1)
+        snapshot_hash = remote._snapshot(self.conn)[1]
+        self.assertFalse(remote.remote_pending(self.conn, 1))
+        for module, version in ((bots, "BOT_API_VERSION"), (cpi, "CPI_API_VERSION"),
+                                (engine, "ENGINE_API_VERSION")):
+            with self.subTest(module=module.__name__), patch.object(module, version, getattr(module, version) + 1):
+                revised = remote._job_fingerprints(self.conn, 1)
+                self.assertNotEqual(revised[0], fingerprints[0])
+                self.assertNotEqual(revised[1], fingerprints[1])
+                self.assertEqual(remote._snapshot(self.conn)[1], snapshot_hash)
+                self.assertTrue(remote.remote_pending(self.conn, 1))
+                self.conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaises(remote.RemoteAnalysisChangedError):
+                    remote.assert_remote_job_current(self.conn, 1)
+                self.conn.rollback()
+
+    def test_upgrade_during_request_rejects_result_without_retrying_worker(self):
+        from sim import bots
+
+        self.calls = []
+        request = remote.create_remote_request(self.conn, 1, company_id=1)
+        result = self.dispatch("https://example.test", "token", request)
+        with patch.object(bots, "BOT_API_VERSION", bots.BOT_API_VERSION + 1):
+            with self.assertRaisesRegex(remote.RemoteAnalysisChangedError, "计算规则已升级"):
+                remote.apply_remote_result(self.conn, request, result)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
+
     def test_wrong_scope_does_not_partially_write(self):
         self.calls = []
         request = remote.create_remote_request(self.conn, 1, company_id=1)
@@ -122,6 +172,24 @@ class RemoteWorkerTests(unittest.TestCase):
         self.assertEqual(self.calls, [("bot", 1), ("bot", 2), ("rebalance", None)])
         self.assertFalse(remote.remote_pending(self.conn, 1))
         self.assertEqual([r[0] for r in self.conn.execute("SELECT management_investment FROM decisions ORDER BY company_id")], [101, 201])
+
+    def test_rule_upgrade_between_segments_restarts_every_bot(self):
+        from sim import bots
+
+        self.calls = []
+
+        def interrupted(done, total, stage):
+            if stage == "C01":
+                raise RuntimeError("browser disconnected")
+
+        with patch.object(remote, "_post", self.dispatch):
+            with self.assertRaisesRegex(RuntimeError, "disconnected"):
+                remote.remote_submit(self.conn, "https://example.test", "token", 1,
+                                     progress_callback=interrupted)
+            with patch.object(bots, "BOT_API_VERSION", bots.BOT_API_VERSION + 1):
+                remote.remote_submit(self.conn, "https://example.test", "token", 1)
+                self.assertFalse(remote.remote_pending(self.conn, 1))
+        self.assertEqual(self.calls, [("bot", 1), ("bot", 1), ("bot", 2), ("rebalance", None)])
 
     def test_interrupted_reanalysis_keeps_old_pending_decision(self):
         self.calls = []
@@ -388,6 +456,7 @@ class RemoteWorkerTests(unittest.TestCase):
             self.assertEqual(main_handler({"body": "{}"}, None)["statusCode"], 503)
             health = main_handler({"httpMethod": "GET"}, None)
             self.assertEqual(json.loads(health["body"])["protocol"], 2)
+            self.assertEqual(json.loads(health["body"])["calculation_revision"], remote.calculation_revision())
         with patch.dict(os.environ, {"SUPER_BOT_REMOTE_TOKEN": "correct"}):
             self.assertEqual(main_handler({"body": '{"token":"wrong"}'}, None)["statusCode"], 403)
 
@@ -404,6 +473,34 @@ class RemoteWorkerTests(unittest.TestCase):
         self.assertIn("worker_seconds", result["timings"])
         remote.apply_remote_result(self.conn, payload, result)
         self.assertEqual(self.conn.execute("SELECT management_investment FROM decisions WHERE company_id=1").fetchone()[0], 100)
+
+    def test_worker_rejects_wrong_revision_before_loading_snapshot(self):
+        from scf_worker import main_handler
+
+        payload = remote.create_remote_request(self.conn, 1, company_id=1)
+        payload.update(token="correct", snapshot_b64="invalid")
+        payload["calculation_revision"]["bot"] -= 1
+        with patch.dict(os.environ, {"SUPER_BOT_REMOTE_TOKEN": "correct"}), patch.object(remote, "decode_snapshot") as decode:
+            response = main_handler({"body": json.dumps(payload)}, None)
+        self.assertEqual(response["statusCode"], 409)
+        self.assertEqual(json.loads(response["body"])["error_code"], "calculation_revision_mismatch")
+        self.assertEqual(json.loads(response["body"])["calculation_revision"], remote.calculation_revision())
+        decode.assert_not_called()
+        with patch("sim.bots.submit_super_bot_decisions") as submit:
+            with self.assertRaises(remote.RemoteRevisionError):
+                remote.run_remote_request(self.conn, payload)
+        submit.assert_not_called()
+
+    def test_updated_worker_still_serves_older_protocol_two_clients(self):
+        from scf_worker import main_handler
+
+        payload = remote.create_remote_request(self.conn, 1, company_id=1)
+        payload.pop("calculation_revision")
+        payload["token"] = "correct"
+        with patch.dict(os.environ, {"SUPER_BOT_REMOTE_TOKEN": "correct"}), patch("sim.bots.submit_super_bot_decisions", self.fake_submit):
+            response = main_handler({"body": json.dumps(payload)}, None)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(json.loads(response["body"])["calculation_revision"], remote.calculation_revision())
 
     def test_legacy_wal_snapshot_contains_committed_decisions_on_warm_calls(self):
         from scf_worker import main_handler

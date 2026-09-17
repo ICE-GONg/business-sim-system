@@ -54,7 +54,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def do_GET(self) -> None:
-        self._reply(200, {"ok": True, "protocol": 2, "service": "business-sim-super-bot"})
+        from sim.remote_worker import PROTOCOL, calculation_revision
+
+        self._reply(200, {"ok": True, "protocol": PROTOCOL,
+                          "calculation_revision": calculation_revision(),
+                          "service": "business-sim-super-bot"})
 
     def do_POST(self) -> None:
         expected = os.environ.get("SUPER_BOT_REMOTE_TOKEN", "")

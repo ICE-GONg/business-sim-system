@@ -27,8 +27,11 @@ class LocalWorkerTests(unittest.TestCase):
             connection.close()
 
     def test_health_and_unauthorized_post(self):
+        from sim.remote_worker import calculation_revision
+
         status, data = self.request("GET")
         self.assertEqual((status, data["protocol"]), (200, 2))
+        self.assertEqual(data["calculation_revision"], calculation_revision())
         self.assertEqual(self.request("POST", body="{}")[0], 403)
 
     def test_oversized_body_is_rejected_before_read(self):

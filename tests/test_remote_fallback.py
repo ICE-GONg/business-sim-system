@@ -66,6 +66,41 @@ class RemoteFallbackTests(unittest.TestCase):
         self.assertEqual(self.calls, [self.primary])
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
 
+    def test_old_worker_result_uses_compatible_fallback_without_saving_old_rules(self):
+        progress = []
+
+        def post(endpoint, token, payload):
+            self.calls.append((endpoint, payload["request_id"], payload["snapshot_hash"]))
+            if endpoint == self.primary:
+                # An old worker returns protocol 2, but knows no rule revision.
+                return {"ok": True, "protocol": 2, "decisions": [{"company_id": 999}]}
+            self.assertEqual(self.conn.execute(
+                "SELECT COUNT(*) FROM decisions WHERE company_id=999"
+            ).fetchone()[0], 0)
+            return self.dispatch(payload)
+
+        with patch.object(remote, "_post", post):
+            self.assertEqual(remote.remote_submit(
+                self.conn, [self.primary, self.fallback], "token", 1,
+                progress_callback=lambda done, total, message: progress.append(message),
+            ), 2)
+        self.assertEqual([row[0] for row in self.calls], [self.primary, self.fallback, self.fallback, self.fallback])
+        self.assertEqual(self.calls[0][1:], self.calls[1][1:])
+        self.assertTrue(any("规则版本不兼容" in message for message in progress))
+        self.assertFalse(remote.remote_pending(self.conn, 1))
+
+    def test_all_workers_with_old_rules_leave_batch_pending_and_decisions_untouched(self):
+        def post(endpoint, token, payload):
+            self.calls.append(endpoint)
+            return {"ok": True, "calculation_revision": dict(remote.calculation_revision(), bot=-1)}
+
+        with patch.object(remote, "_post", post):
+            with self.assertRaisesRegex(remote.RemoteRevisionError, "更新并重启"):
+                remote.remote_submit(self.conn, [self.primary, self.fallback], "token", 1)
+        self.assertEqual(self.calls, [self.primary, self.fallback])
+        self.assertTrue(remote.remote_pending(self.conn, 1))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
+
     def test_stale_result_never_uses_fallback(self):
         def post(endpoint, token, payload):
             self.calls.append(endpoint)
@@ -109,11 +144,23 @@ class RemoteFallbackTests(unittest.TestCase):
             with patch.object(remote.urllib.request, "urlopen", side_effect=error):
                 with self.assertRaises(remote.RemoteTransportError):
                     remote._post(self.primary, "token", {})
-        for code in (400, 403, 500):
+        for code in (400, 403, 409, 500):
             with patch.object(remote.urllib.request, "urlopen", side_effect=urllib.error.HTTPError(self.primary, code, "rejected", {}, io.BytesIO())):
                 with self.assertRaises(remote.RemoteWorkerError) as caught:
                     remote._post(self.primary, "token", {})
             self.assertNotIsInstance(caught.exception, remote.RemoteTransportError)
+            self.assertNotIsInstance(caught.exception, remote.RemoteRevisionError)
+
+    def test_version_conflict_http_and_gateway_envelope_are_retryable_separately(self):
+        body = json.dumps({"ok": False, "error_code": "calculation_revision_mismatch"})
+        conflict = urllib.error.HTTPError(self.primary, 409, "conflict", {}, io.BytesIO(body.encode()))
+        with patch.object(remote.urllib.request, "urlopen", side_effect=conflict):
+            with self.assertRaises(remote.RemoteRevisionError):
+                remote._post(self.primary, "token", {})
+        envelope = io.BytesIO(json.dumps({"statusCode": 409, "body": body}).encode())
+        with patch.object(remote.urllib.request, "urlopen", return_value=envelope):
+            with self.assertRaises(remote.RemoteRevisionError):
+                remote._post(self.primary, "token", {})
 
     def test_cloudflare_530_fails_over_and_http_500_does_not(self):
         def open_request(request, timeout):
@@ -156,10 +203,23 @@ class RemoteFallbackTests(unittest.TestCase):
             self.assertLessEqual(timeout, 5)
             if request.full_url == self.fallback:
                 raise urllib.error.URLError("offline")
-            return io.BytesIO(b'{"ok":true,"protocol":2,"service":"business-sim-super-bot"}')
+            return io.BytesIO(json.dumps({"ok": True, "protocol": 2,
+                                        "calculation_revision": remote.calculation_revision()}).encode())
 
         with patch.object(remote.urllib.request, "urlopen", get):
             statuses = remote.remote_health([self.primary, self.fallback])
         self.assertEqual(len(requests), 2)
         self.assertEqual([row["ok"] for row in statuses], [True, False])
         self.assertFalse(any(self.primary in str(row) or self.fallback in str(row) for row in statuses))
+
+    def test_health_distinguishes_reachable_old_worker_from_compatible_worker(self):
+        for revision in (None, dict(remote.calculation_revision(), bot=-1)):
+            with self.subTest(revision=revision):
+                payload = {"ok": True, "protocol": 2}
+                if revision is not None:
+                    payload["calculation_revision"] = revision
+                with patch.object(remote.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
+                    status = remote.remote_health([self.primary])[0]
+                self.assertTrue(status["reachable"])
+                self.assertFalse(status["ok"])
+                self.assertIn("更新并重启", status["message"])

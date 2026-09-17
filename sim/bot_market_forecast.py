@@ -3,24 +3,10 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping, Sequence
 
-from .cpi import allocate_city_cpi
+from .cpi import allocate_city_cpi, investment_average_prices
 
 
-FORECAST_API_VERSION = 1
-
-
-def _weighted_player_average(
-    price_quantity_pairs: Sequence[tuple[float, float]],
-    fallback: float,
-) -> float:
-    pairs = [
-        (max(0.0, float(price)), max(0.0, float(quantity)))
-        for price, quantity in price_quantity_pairs
-    ]
-    total_quantity = sum(quantity for _, quantity in pairs)
-    if total_quantity <= 0:
-        return max(0.0, float(fallback))
-    return sum(price * quantity for price, quantity in pairs) / total_quantity
+FORECAST_API_VERSION = 2
 
 
 def _integer_sales(city_sales: Mapping[str, float], available_units: int | float) -> dict[str, int]:
@@ -202,21 +188,48 @@ def forecast_market_sales(
         str(market["city"]): max(0.0, float(market["market_size"]))
         for market in resolved_markets
     }
-    player_averages: dict[str, float] = {}
-    for city in city_order:
-        active = [
-            (state["cities"][city]["price"], state["available"])
-            for state in states.values()
+    entries_by_city = {
+        city: [
+            {
+                "company_id": company_id,
+                "ma_index": state["ma_index"],
+                "qi_index": state["qi_index"],
+                "mi_investment": state["cities"][city]["marketing"],
+                "price": state["cities"][city]["price"],
+                "agents": state["cities"][city]["agents"],
+            }
+            for company_id, state in states.items()
             if state["cities"][city]["agents"] > 0
         ]
-        active_prices = [price for price, _ in active]
-        fallback = (
-            sum(active_prices) / len(active_prices)
-            if active_prices else base_averages[city]
-        )
-        player_averages[city] = _weighted_player_average(active, fallback)
+        for city in city_order
+    }
 
-    def calculate_once(averages: Mapping[str, float]) -> dict[int, dict[str, Any]]:
+    def resolve_averages(
+        sales: Mapping[int, Mapping[str, Any]] | None = None,
+    ) -> dict[str, dict[str, float]]:
+        averages = {}
+        for market in resolved_markets:
+            city = str(market["city"])
+            entries = entries_by_city[city]
+            quantities = [
+                states[int(entry["company_id"])]["available"]
+                if sales is None
+                else float(sales[int(entry["company_id"])]["sold_units"][city])
+                for entry in entries
+            ]
+            averages[city] = investment_average_prices(
+                entries,
+                quantities,
+                fallback=base_averages[city],
+                market_size=market_sizes[city],
+                max_price=float(market["max_price"]),
+                ma_large_threshold=float(ma_large_threshold),
+            )
+        return averages
+
+    player_averages = resolve_averages()
+
+    def calculate_once(averages: Mapping[str, dict[str, float]]) -> dict[int, dict[str, Any]]:
         result = {
             company_id: {
                 "visible": {city: 0.0 for city in city_order},
@@ -229,25 +242,14 @@ def forecast_market_sales(
         }
         for market in resolved_markets:
             city = str(market["city"])
-            entries = [
-                {
-                    "company_id": company_id,
-                    "ma_index": state["ma_index"],
-                    "qi_index": state["qi_index"],
-                    "mi_investment": state["cities"][city]["marketing"],
-                    "price": state["cities"][city]["price"],
-                    "agents": state["cities"][city]["agents"],
-                }
-                for company_id, state in states.items()
-                if state["cities"][city]["agents"] > 0
-            ]
+            entries = entries_by_city[city]
             allocations = allocate_city_cpi(
                 entries,
                 market_size=market_sizes[city],
                 max_price=float(market["max_price"]),
                 ma_large_threshold=float(ma_large_threshold),
                 price_power=resolved_power,
-                average_price=float(averages[city]),
+                average_price=averages[city],
                 market_average_price=base_averages[city],
             )
             for allocation in allocations:
@@ -310,25 +312,14 @@ def forecast_market_sales(
 
     calculated = calculate_once(player_averages)
     for _ in range(max(1, int(max_iterations))):
-        next_averages = {}
-        for city in city_order:
-            sold_pairs = [
-                (
-                    state["cities"][city]["price"],
-                    calculated[company_id]["sold_units"][city],
-                )
-                for company_id, state in states.items()
-            ]
-            next_averages[city] = _weighted_player_average(
-                sold_pairs, player_averages[city]
-            )
+        next_averages = resolve_averages(calculated)
         if all(
             math.isclose(
-                next_averages[city],
-                player_averages[city],
+                next_averages[city][pool],
+                player_averages[city][pool],
                 abs_tol=float(average_tolerance),
             )
-            for city in city_order
+            for city in city_order for pool in ("ma", "qi", "mi")
         ):
             player_averages = next_averages
             calculated = calculate_once(player_averages)

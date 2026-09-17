@@ -113,7 +113,9 @@ class BotKDSRegressionTest(unittest.TestCase):
             0,
             tactical_price_allowed=True,
         )
-        self.assertEqual(strategic["name"], "destructive")
+        # Protected/nonattacking bots never sacrifice profit for a cheap
+        # pressure proxy. Only designated attackers use verified target loss.
+        self.assertEqual(strategic["name"], "unsafe")
 
         targeted_attack = candidate(
             "targeted-attack", profit=-400, risk=-600,
@@ -121,6 +123,7 @@ class BotKDSRegressionTest(unittest.TestCase):
         )
         targeted_attack.update({
             "targeted_damage": 2_000,
+            "target_tier": 5,
             "target_cpi_drop": 12,
             "target_surplus": 300,
         })

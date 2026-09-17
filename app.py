@@ -46,17 +46,18 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 6
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 12
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 30
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 31
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
     importlib.reload(_cpi_module)
     importlib.reload(_engine_module)
+    importlib.reload(importlib.import_module("sim.bot_market_forecast"))
     importlib.reload(_bots_module)
 
 from sim.bots import finalize_super_bot_decisions, submit_bot_decisions
 from sim import remote_worker as _remote_worker_module
-if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 4:
+if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 5:
     importlib.invalidate_caches()
     importlib.reload(_remote_worker_module)
 from sim.remote_worker import (
@@ -96,6 +97,7 @@ from sim.db import (
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
 from sim.report_pdf import build_round_report_pdf
+from sim.kds_pdf import build_public_kds_pdf
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1572,6 +1574,11 @@ def render_player_kds(company: sqlite3.Row) -> None:
     with connect() as conn:
         settings = settings_dict(conn)
         markets = all_rows(conn, "SELECT * FROM market_config ORDER BY city")
+    st.download_button(
+        "下载公开 KDS PDF", build_public_kds_pdf(settings, markets),
+        file_name="Public_KDS.pdf", mime="application/pdf", use_container_width=True,
+        key="player_public_kds_pdf",
+    )
     st.markdown(f'<div class="report-note" style="text-align:right">Initial Cash · 初始现金：<b>{money(settings["initial_cash"])}</b></div>', unsafe_allow_html=True)
     st.markdown('<div class="report-title">Markets Details · 城市参数</div>', unsafe_allow_html=True)
     market_frame = pd.DataFrame(
@@ -2009,6 +2016,12 @@ def render_admin_kds() -> None:
         settings = settings_dict(conn)
         markets = all_rows(conn, "SELECT * FROM market_config ORDER BY city")
         started_row = one(conn, "SELECT COUNT(*) AS n FROM rounds WHERE status<>'waiting' OR starts_at IS NOT NULL")
+    st.download_button(
+        "下载公开 KDS PDF", build_public_kds_pdf(settings, markets),
+        file_name="Public_KDS.pdf", mime="application/pdf", use_container_width=True,
+        key="admin_public_kds_pdf",
+    )
+    st.caption("与玩家 KDS 页下载内容相同，采用当前已保存的公开参数。")
     competition_started = bool(started_row and int(started_row["n"]) > 0)
     unlocked = not competition_started or bool(st.session_state.get("admin_kds_unlocked"))
     if competition_started and not unlocked:

@@ -31,9 +31,14 @@ def _body(event):
 
 
 def main_handler(event, context):
+    from sim.remote_worker import (
+        PROTOCOL, RemoteRevisionError, calculation_revision, check_calculation_revision,
+        decode_snapshot, load_snapshot, run_remote_request,
+    )
+
     started = time.perf_counter()
     if isinstance(event, dict) and event.get("httpMethod", event.get("requestContext", {}).get("http", {}).get("method")) == "GET":
-        return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"ok": True, "protocol": 2, "service": "super-bot-worker"})}
+        return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"ok": True, "protocol": PROTOCOL, "calculation_revision": calculation_revision(), "service": "super-bot-worker"})}
     try:
         payload = _body(event)
         expected = os.environ.get("SUPER_BOT_REMOTE_TOKEN", "")
@@ -42,8 +47,8 @@ def main_handler(event, context):
             return {"statusCode": 503, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"ok": False, "error": "worker authentication is not configured"})}
         if not hmac.compare_digest(supplied, expected):
             return {"statusCode": 403, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"ok": False, "error": "forbidden"})}
-        if payload.get("protocol") == 2:
-            from sim.remote_worker import decode_snapshot, load_snapshot, run_remote_request
+        check_calculation_revision(payload, allow_legacy=True)
+        if payload.get("protocol") == PROTOCOL:
             with tempfile.TemporaryDirectory() as directory:
                 with sqlite3.connect(Path(directory) / "sim.db") as conn:
                     conn.row_factory = sqlite3.Row
@@ -71,9 +76,12 @@ def main_handler(event, context):
             conn.close()  # Checkpoint a legacy snapshot that uses WAL mode.
             result = {
                 "ok": True,
+                "calculation_revision": calculation_revision(),
                 "submitted": int(submitted),
                 "db_b64": base64.b64encode(db_path.read_bytes()).decode("ascii"),
             }
         return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(result)}
+    except RemoteRevisionError as exc:
+        return {"statusCode": 409, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"ok": False, "error_code": "calculation_revision_mismatch", "error": str(exc), "calculation_revision": calculation_revision()})}
     except Exception as exc:  # SCF serializes this into the app log only.
         return {"statusCode": 500, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"ok": False, "error": str(exc)})}
