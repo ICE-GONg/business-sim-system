@@ -92,6 +92,21 @@ class PublicKDSPDFTest(unittest.TestCase):
                 self.assertIn("零件材料单价", page)
                 self.assertIn("初始渗透率", page)
 
+    @unittest.skipIf(PdfReader is None, "pypdf is needed for PDF text verification")
+    def test_fractional_production_requirements_and_training_fees_keep_precision(self):
+        self.settings.update({
+            "component_hours": 1.5,
+            "product_hours": 7.125,
+            "worker_training_cost": 123.45,
+            "engineer_training_cost": 12.345678,
+        })
+        pdf = build_public_kds_pdf(self.settings, self.markets)
+        text = "\n".join(page.extract_text() for page in PdfReader(BytesIO(pdf)).pages)
+        for expected in ("1.5 小时", "7.125 小时", "RMB 123.45", "RMB 12.345678"):
+            self.assertIn(expected, text)
+        self.assertIn("RMB 15,000,000", text)
+        self.assertNotIn("15,000,000.000000", text)
+
 
 if __name__ == "__main__":
     unittest.main()

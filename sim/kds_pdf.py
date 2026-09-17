@@ -79,7 +79,7 @@ def build_public_kds_pdf(
         return Paragraph(text, style)
 
     def number(value: Any) -> str:
-        return f"{float(value):,.0f}"
+        return f"{float(value):,.6f}".rstrip("0").rstrip(".")
 
     def money(value: Any) -> str:
         return f"RMB {number(value)}"
