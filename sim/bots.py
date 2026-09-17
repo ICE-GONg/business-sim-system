@@ -21,7 +21,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 31
+BOT_API_VERSION = 32
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 
 BOT_PLANS = (
@@ -121,6 +121,92 @@ def _super_target_pressure(
     return max(targets, key=lambda row: (row["target_tier"], row["targeted_damage"]),
                default={"targeted_damage": 0.0, "target_tier": 0,
                         "target_cpi_drop": 0.0, "target_surplus": 0.0})
+
+
+def _apply_super_settlement_forecast(
+    candidate: dict[str, Any],
+    own_forecast: dict[str, Any],
+    own_cities: dict[str, dict[str, float | int]],
+    *,
+    candidate_available: int,
+    home_city: str,
+    transportation_cost: float,
+    committed_cost: float,
+    interest_cost: float,
+    tax_rate: float,
+    starting_assets: float,
+    secondary_confidence: float = 1.0,
+) -> dict[str, Any]:
+    """Score a Super Bot plan from settlement sales, including redistribution.
+
+    ``forecast_market_sales`` has already performed the same isolated price and
+    investment secondary passes as settlement. Pending Super Bot decisions can
+    discount only that secondary portion; the cheap visible-CPI estimate must
+    never silently erase it.
+    """
+    exact_sold_units = {
+        str(city): max(0, int(units))
+        for city, units in own_forecast.get("sold_units", {}).items()
+    }
+    confidence = min(1.0, max(0.0, float(secondary_confidence)))
+    primary_by_city = own_forecast.get("primary", {})
+    secondary_by_city = own_forecast.get("secondary", {})
+    if confidence < 1.0 and primary_by_city:
+        sold_units = {
+            str(city): (
+                max(0.0, float(primary_by_city.get(city, 0.0)))
+                + confidence * max(0.0, float(secondary_by_city.get(city, 0.0)))
+            )
+            for city in set(primary_by_city) | set(secondary_by_city)
+        }
+        forecast_total = sum(sold_units.values())
+        if forecast_total > max(0, int(candidate_available)) and forecast_total > 0:
+            scale = max(0, int(candidate_available)) / forecast_total
+            sold_units = {city: units * scale for city, units in sold_units.items()}
+    else:
+        sold_units = exact_sold_units
+    predicted_sold = float(sum(sold_units.values()))
+    predicted_revenue = sum(
+        float(units) * float(own_cities.get(city, {}).get("price", 0.0))
+        for city, units in sold_units.items()
+    )
+    predicted_transport = sum(
+        float(units) * max(0.0, float(transportation_cost))
+        for city, units in sold_units.items()
+        if city != str(home_city)
+    )
+    predicted_cost = (
+        max(0.0, float(committed_cost))
+        + max(0.0, float(interest_cost))
+        + predicted_transport
+    )
+    predicted_pre_tax = predicted_revenue - predicted_cost
+    resolved_tax_rate = max(0.0, float(tax_rate))
+    predicted_profit = predicted_pre_tax - max(0.0, predicted_pre_tax * resolved_tax_rate)
+    risk_pre_tax = predicted_revenue * 0.92 - predicted_cost
+    risk_profit = risk_pre_tax - max(0.0, risk_pre_tax * resolved_tax_rate)
+    visible_capacity = max(0.0, float(own_forecast.get("visible_total", 0.0)))
+    raw_secondary_capacity = max(0.0, float(own_forecast.get("secondary_total", 0.0)))
+    secondary_capacity = raw_secondary_capacity * confidence
+    effective_capacity = visible_capacity + secondary_capacity
+    available = max(0, int(candidate_available))
+    candidate.update({
+        "predicted_profit": predicted_profit,
+        "risk_profit": risk_profit,
+        "predicted_sold": predicted_sold,
+        "predicted_revenue": predicted_revenue,
+        "predicted_transport": predicted_transport,
+        "primary_capacity": visible_capacity,
+        "secondary_capacity": secondary_capacity,
+        "raw_secondary_capacity": raw_secondary_capacity,
+        "secondary_confidence": confidence,
+        "effective_capacity": effective_capacity,
+        "sell_ratio": predicted_sold / max(1, available),
+        "coverage": effective_capacity / max(1, available),
+        "ending_assets": float(starting_assets) + predicted_profit,
+        "rival_damage": 0.0,
+    })
+    return candidate
 
 
 def _select_empirical_super_candidate(
@@ -871,6 +957,7 @@ def _rebalance_super_bot_production(
     engineer_training = float(get_setting(conn, "engineer_training_cost", 0))
     add_agent_cost = float(get_setting(conn, "agent_add_cost", 300000))
     remove_agent_cost = float(get_setting(conn, "agent_remove_cost", 100000))
+    transportation_cost = max(0.0, float(get_setting(conn, "transport_cost", 0)))
     patent_factor = float(get_setting(conn, "patent_factor", 0.70))
     growth = float(get_setting(conn, "market_growth", 1.10))
     total_rounds = max(1, int(get_setting(conn, "total_rounds", 5)))
@@ -879,12 +966,13 @@ def _rebalance_super_bot_production(
     official_round = 1 if round_no < 0 else round_no
 
     market_by_city = {str(market["city"]): market for market in markets}
-    if not bool(one(conn, "SELECT 1 FROM companies WHERE is_super_bot=0 LIMIT 1")):
-        # In an all-Super-Bot pressure test, every unresolved rival was already
-        # preset during each search and later Bots responded to earlier saved
-        # decisions. A final trim/price-raising pass would erase deliberate
-        # full-output undercuts and high-investment denial strategies.
-        return
+    home_by_company = {
+        int(row["id"]): str(row["home_city"] or "")
+        for row in all_rows(conn, "SELECT id,home_city FROM companies WHERE is_super_bot=1")
+    }
+    all_super_field = not bool(one(
+        conn, "SELECT 1 FROM companies WHERE is_super_bot=0 LIMIT 1",
+    ))
     ranked = all_rows(conn,
         "SELECT c.id FROM companies c LEFT JOIN results r ON r.company_id=c.id "
         "AND r.round_no=(SELECT MAX(round_no) FROM results WHERE round_no>=1 AND round_no<?) "
@@ -895,25 +983,67 @@ def _rebalance_super_bot_production(
         total_rounds=total_rounds,
         markets_saturated=_all_markets_near_capacity(conn, round_no, markets),
     )
-    _coordinate_super_bot_prices(conn, round_no, markets, preserve_ids=preserve_ids)
+    if not all_super_field:
+        _coordinate_super_bot_prices(conn, round_no, markets, preserve_ids=preserve_ids)
 
     if (
-        official_round <= max(2, math.ceil(total_rounds * 0.50))
+        not all_super_field
+        and official_round <= max(2, math.ceil(total_rounds * 0.50))
         and not _all_markets_near_capacity(conn, round_no, markets, threshold=0.60)
     ):
-        # During the unsaturated expansion phase, keep the maximum affordable
-        # complete-group production selected by the search. Do not trim output
-        # merely to accommodate the current competitors' conservative volume.
+        # During a mixed-field unsaturated expansion phase, keep the maximum
+        # affordable complete-group production selected by the search. An
+        # all-Super field still needs the joint pass: every Bot's individually
+        # forecast secondary pool overlaps the others, so treating all of
+        # those provisional shares as simultaneously guaranteed overproduces.
         return
 
     # The candidate search has already compared affordable production levels.
     # This pass may trim newly revealed surplus after simultaneous price
     # coordination, but it must never expand back to the cash maximum.
     for _ in range(12):
+        field_forecast = _forecast_submitted_market(conn, round_no, markets)
+        # Production can shrink sharply once the whole field competes for the
+        # same secondary pools. Do not leave newly opened cities behind when
+        # their exact post-redistribution revenue cannot even repay the Agent
+        # opening fee. Closing those routes first also prevents their price or
+        # investment CPI from distorting the next secondary pass.
+        pruned_routes = False
+        for company_id, forecast in field_forecast["companies"].items():
+            sold_units = forecast.get("sold_units", {})
+            for route in all_rows(
+                conn,
+                "SELECT cd.city,cd.agent_delta,cd.price FROM city_decisions cd "
+                "JOIN companies c ON c.id=cd.company_id "
+                "WHERE cd.company_id=? AND cd.round_no=? AND c.is_super_bot=1 "
+                "AND cd.agent_delta>0",
+                (int(company_id), round_no),
+            ):
+                city = str(route["city"])
+                units = max(0.0, float(sold_units.get(city, 0.0)))
+                route_revenue = units * max(0.0, float(route["price"] or 0))
+                route_floor = float(route["agent_delta"] or 0) * add_agent_cost
+                if city != home_by_company.get(int(company_id), ""):
+                    route_floor += units * transportation_cost
+                if route_revenue <= route_floor + 1e-9:
+                    conn.execute(
+                        "UPDATE city_decisions SET agent_delta=0,marketing_investment=0 "
+                        "WHERE company_id=? AND round_no=? AND city=?",
+                        (int(company_id), round_no, city),
+                    )
+                    pruned_routes = True
+        if pruned_routes:
+            # Recompute CPI, average prices and both secondary pools from the
+            # changed city set before touching production or investment.
+            continue
+
         # Production follows the exact units this field can sell after the
         # category-isolated secondary pass. Visible CPI alone misses legitimate
         # price-to-price and investment-to-investment redistribution.
-        capacities = _forecast_submitted_sales_capacity(conn, round_no, markets)
+        capacities = {
+            int(company_id): float(result["sold_total"])
+            for company_id, result in field_forecast["companies"].items()
+        }
         changed = False
         for row in all_rows(
             conn,
@@ -2691,6 +2821,37 @@ def _submit_bots(
                 include_shortlist(sorted(candidate_values,
                     key=lambda row: float(row["ma"]) + float(row["qi"]), reverse=True))
 
+                # A first-pass CPI estimate can underrate a route that is
+                # eligible for a large price-to-price or investment-to-
+                # investment second pass. Keep a bounded spread of
+                # under-covered candidates from every CPI family so the exact
+                # settlement forecast decides whether they survive.
+                def secondary_family(row: dict[str, Any]) -> str:
+                    active = []
+                    if float(row.get("ma", 0.0)) > 1.00000001:
+                        active.append("ma")
+                    if float(row.get("qi", 0.0)) > 1.00000001:
+                        active.append("qi")
+                    if float(row.get("marketing_total", 0.0)) > 1e-9:
+                        active.append("mi")
+                    if not active:
+                        return "price"
+                    return active[0] if len(active) == 1 else "mixed"
+
+                for family in ("price", "ma", "qi", "mi", "mixed"):
+                    family_rows = [row for row in candidate_values
+                                   if secondary_family(row) == family]
+                    for target_coverage in (0.20, 0.45, 0.70, 0.95):
+                        if family_rows:
+                            row = min(
+                                family_rows,
+                                key=lambda item: (
+                                    abs(float(item.get("coverage", 0.0)) - target_coverage),
+                                    -float(item.get("predicted_profit", -math.inf)),
+                                ),
+                            )
+                            shortlisted[id(row)] = row
+
                 forecast_markets = [
                     {"city": str(market["city"]),
                      "market_size": float(market["population"]) * float(market["penetration"])
@@ -2767,33 +2928,32 @@ def _submit_bots(
                          "cities": own_cities},
                     ], **forecast_args)
                     own_forecast = after_forecast["companies"][company_id]
-                    revenue = sum(float(units) * own_cities[city]["price"]
-                                  for city, units in own_forecast["sold_units"].items()
-                                  if city in own_cities)
-                    # Unresolved opponents can still undercut. Preserve the
-                    # KDS-scaled shadow response from the complete search;
-                    # a static exact forecast must not replace that stress
-                    # scenario with an optimistic temporary price monopoly.
-                    predicted_sold = min(float(own_forecast["sold_total"]),
-                                         float(candidate["predicted_sold"]))
-                    revenue = min(revenue, float(candidate["search_revenue"]) *
-                                  predicted_sold / max(1.0, float(candidate["predicted_sold"])))
-                    transportation = sum(float(units) * transport_cost
-                                         for city, units in own_forecast["sold_units"].items()
-                                         if city != home)
-                    cost = float(actual_budget["total"]) + transportation + forecast_interest
-                    pre_tax = revenue - cost
-                    predicted_profit = pre_tax - max(0.0, pre_tax * tax_rate)
-                    risk_pre_tax = revenue * .92 - cost
-                    candidate.update({
-                        "predicted_profit": predicted_profit,
-                        "risk_profit": risk_pre_tax - max(0.0, risk_pre_tax * tax_rate),
-                        "predicted_sold": predicted_sold,
-                        "sell_ratio": predicted_sold / max(1, candidate_available),
-                        "coverage": float(own_forecast["visible_total"]) / max(1, candidate_available),
-                        "ending_assets": own_strategy_assets + predicted_profit,
-                        "rival_damage": 0.0,
-                    })
+                    unresolved_super_peers = sum(
+                        1 for peer in bots
+                        if int(peer["id"]) != company_id
+                        and int(peer["id"]) not in frozen_super_ids
+                    )
+                    # Secondary allocation is part of the plan, but an early
+                    # sequential Super Bot cannot assume every synthetic peer
+                    # will leave that pool untouched. Confidence rises to 100%
+                    # as later real decisions replace those presets. The final
+                    # joint pass then uses the exact complete field.
+                    secondary_confidence = 1.0 / (
+                        1.0 + 0.45 * unresolved_super_peers
+                    )
+                    _apply_super_settlement_forecast(
+                        candidate,
+                        own_forecast,
+                        own_cities,
+                        candidate_available=candidate_available,
+                        home_city=home,
+                        transportation_cost=transport_cost,
+                        committed_cost=float(actual_budget["total"]),
+                        interest_cost=forecast_interest,
+                        tax_rate=tax_rate,
+                        starting_assets=own_strategy_assets,
+                        secondary_confidence=secondary_confidence,
+                    )
                     if baseline_forecast is not None:
                         candidate.update(_super_target_pressure(
                             baseline_forecast, after_forecast, list(rival_players.values())))

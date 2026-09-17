@@ -47,6 +47,68 @@ class BotCompetitionTest(unittest.TestCase):
                 priorities.append(actual)
         self.assertEqual(priorities, [5, 4, 3, 2, 1, 1])
 
+    def test_super_candidate_profit_includes_secondary_sales(self):
+        candidate = {
+            "predicted_sold": 10,
+            "predicted_profit": -1,
+            "coverage": 0.10,
+            "rival_damage": 123,
+        }
+        forecast = {
+            "sold_units": {"Home": 40, "Away": 60},
+            "sold_total": 100,
+            "visible_total": 10,
+            "secondary_total": 90,
+        }
+        updated = self.bots._apply_super_settlement_forecast(
+            candidate,
+            forecast,
+            {"Home": {"price": 10}, "Away": {"price": 20}},
+            candidate_available=100,
+            home_city="Home",
+            transportation_cost=2,
+            committed_cost=100,
+            interest_cost=0,
+            tax_rate=0,
+            starting_assets=1_000,
+        )
+
+        self.assertEqual(updated["predicted_sold"], 100)
+        self.assertEqual(updated["primary_capacity"], 10)
+        self.assertEqual(updated["secondary_capacity"], 90)
+        self.assertEqual(updated["coverage"], 1)
+        self.assertEqual(updated["predicted_revenue"], 1_600)
+        self.assertEqual(updated["predicted_transport"], 120)
+        self.assertEqual(updated["predicted_profit"], 1_380)
+        self.assertEqual(updated["ending_assets"], 2_380)
+
+    def test_pending_super_peers_discount_only_secondary_sales(self):
+        updated = self.bots._apply_super_settlement_forecast(
+            {},
+            {
+                "sold_units": {"Home": 100},
+                "primary": {"Home": 40},
+                "secondary": {"Home": 60},
+                "visible_total": 40,
+                "secondary_total": 60,
+            },
+            {"Home": {"price": 10}},
+            candidate_available=100,
+            home_city="Home",
+            transportation_cost=0,
+            committed_cost=0,
+            interest_cost=0,
+            tax_rate=0,
+            starting_assets=0,
+            secondary_confidence=0.5,
+        )
+
+        self.assertEqual(updated["predicted_sold"], 70)
+        self.assertEqual(updated["primary_capacity"], 40)
+        self.assertEqual(updated["secondary_capacity"], 30)
+        self.assertEqual(updated["raw_secondary_capacity"], 60)
+        self.assertEqual(updated["predicted_profit"], 700)
+
     def test_attacker_counts_protect_leaders_and_change_by_phase(self):
         cases = (
             ([], 6, True, set()),
