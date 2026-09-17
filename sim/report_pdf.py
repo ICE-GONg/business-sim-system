@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Any
+from typing import Any, Callable
 from xml.sax.saxutils import escape
 
 
@@ -28,14 +28,14 @@ def _safe_text(value: Any) -> str:
 
 
 def _money(value: Any) -> str:
-    return f"RMB {float(value or 0):,.0f}"
+    return f"¥{float(value or 0):,.0f}"
 
 
 def _flow(value: Any) -> str:
     amount = float(value or 0)
     if abs(amount) < 0.005:
         return "--"
-    return f"{'+' if amount > 0 else '-'} RMB {abs(amount):,.0f}"
+    return f"{'+' if amount > 0 else '-'} {_money(abs(amount))}"
 
 
 def _num(value: Any, decimals: int = 0) -> str:
@@ -53,98 +53,143 @@ def build_round_report_pdf(
     rank: int | str,
     market_sections: list[dict[str, Any]],
 ) -> bytes:
-    """Build a clear, complete official-style competition round report."""
+    """Build a continuous official-style report from public result fields."""
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import CondPageBreak, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.platypus import Flowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-    font_name = "Helvetica"
-    font_bold = "Helvetica-Bold"
-    ink = colors.HexColor("#282c2f")
-    muted = colors.HexColor("#62686d")
-    line = colors.HexColor("#8f9598")
-    pale = colors.HexColor("#f3f5f4")
-    stream = BytesIO()
-    doc = SimpleDocTemplate(
-        stream,
-        pagesize=A4,
-        rightMargin=13 * mm,
-        leftMargin=13 * mm,
-        topMargin=16 * mm,
-        bottomMargin=14 * mm,
-        title=f"Round {round_no} Report - {company.get('code', '')}",
-        author="ASEEDER Business Simulation",
-        subject="Official Round Report",
-    )
-    base_styles = getSampleStyleSheet()
+    font = "Courier"
+    bold = "Courier-Bold"
+    italic = "Courier-Oblique"
+    chinese_font = "STSong-Light"
+    if chinese_font not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont(chinese_font))
+
+    ink = colors.HexColor("#292929")
+    muted = colors.HexColor("#666666")
+    line = colors.HexColor("#909090")
+    hairline = colors.HexColor("#c1c1c1")
+    watermark = colors.HexColor("#f1f1f1")
+    page_width = A4[0]
+    margin = 7.5 * mm
+    content_width = page_width - 2 * margin
+
     body = ParagraphStyle(
-        "ReportBody", parent=base_styles["BodyText"], fontName=font_name,
-        fontSize=7.2, leading=9.1, textColor=ink,
+        "OfficialBody", fontName=font, fontSize=7.2, leading=9.1,
+        textColor=ink, allowWidows=1, allowOrphans=1,
     )
-    small = ParagraphStyle(
-        "ReportSmall", parent=body, fontSize=6.25, leading=7.7, textColor=muted,
+    table_body = ParagraphStyle("OfficialTable", parent=body, fontSize=6.25, leading=7.7)
+    table_head = ParagraphStyle(
+        "OfficialTableHead", parent=table_body, fontName=font,
+        textColor=muted, alignment=TA_CENTER,
     )
-    tiny = ParagraphStyle("ReportTiny", parent=small, fontSize=5.55, leading=6.7)
-    label = ParagraphStyle("ReportLabel", parent=small, fontName=font_bold, textColor=ink)
+    note = ParagraphStyle(
+        "OfficialNote", parent=body, fontName=italic, fontSize=6.0,
+        leading=9.2, leftIndent=8, firstLineIndent=-8, spaceAfter=7.5,
+    )
+    header_center = ParagraphStyle(
+        "OfficialHeaderCenter", parent=body, fontSize=7.0, leading=9.0,
+        alignment=TA_LEFT,
+    )
+    header_right = ParagraphStyle(
+        "OfficialHeaderRight", parent=body, fontSize=6.6, leading=8.4,
+        alignment=TA_RIGHT,
+    )
     section_style = ParagraphStyle(
-        "ReportSection", parent=base_styles["Heading2"], fontName=font_bold,
-        fontSize=9.2, leading=11, alignment=TA_LEFT, spaceBefore=6,
-        spaceAfter=3, textColor=ink,
+        "OfficialSection", parent=body, fontName=bold, fontSize=9.0,
+        leading=10.5,
     )
 
-    def paragraph(value: Any, style: ParagraphStyle = body) -> Paragraph:
+    def p(value: Any, style: ParagraphStyle = body) -> Paragraph:
         return Paragraph(escape(_safe_text(value)), style)
 
     def rich(value: str, style: ParagraphStyle = body) -> Paragraph:
         return Paragraph(_safe_text(value), style)
 
-    def section(value: str) -> Table:
-        result = Table([[Paragraph(escape(_safe_text(value)), section_style)]], colWidths=[184 * mm], hAlign="LEFT")
+    class Brand(Flowable):
+        def __init__(self) -> None:
+            super().__init__()
+            self.width = 41 * mm
+            self.height = 11 * mm
+
+        def draw(self) -> None:
+            import math
+
+            center_x, center_y = 3.5 * mm, 5.8 * mm
+            rays = (
+                (colors.HexColor("#ef5350"), 0, 3.1),
+                (colors.HexColor("#f6a623"), 45, 2.7),
+                (colors.HexColor("#45b9a8"), 90, 3.1),
+                (colors.HexColor("#62a6d8"), 135, 2.7),
+            )
+            self.canv.setLineWidth(1.15)
+            for colour, angle, length in rays:
+                radians = math.radians(angle)
+                dx, dy = length * mm * math.cos(radians), length * mm * math.sin(radians)
+                self.canv.setStrokeColor(colour)
+                self.canv.line(center_x - dx, center_y - dy, center_x + dx, center_y + dy)
+            self.canv.setFillColor(muted)
+            self.canv.setFont(chinese_font, 6.4)
+            self.canv.drawString(8 * mm, 4.6 * mm, "阿思丹")
+            self.canv.setFillColor(ink)
+            self.canv.setFont("Helvetica-Bold", 8.4)
+            self.canv.drawString(18.5 * mm, 4.6 * mm, "ASEEDER")
+
+    def section(title: str) -> Table:
+        result = Table([[p(title, section_style)]], colWidths=[112 * mm], hAlign="LEFT")
+        result.keepWithNext = True
         result.setStyle(TableStyle([
-            ("LINEBELOW", (0, 0), (0, 0), 0.9, ink),
-            ("LEFTPADDING", (0, 0), (0, 0), 0),
-            ("RIGHTPADDING", (0, 0), (0, 0), 0),
-            ("TOPPADDING", (0, 0), (0, 0), 0),
-            ("BOTTOMPADDING", (0, 0), (0, 0), 1.5),
+            ("LINEABOVE", (0, 0), (-1, 0), 0.65, line),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.65, line),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1.8),
         ]))
         return result
 
-    def table(
-        data: list[list[Any]], widths: list[float], *, font_size: float = 6.35,
-        header_rows: int = 1, alignments: dict[int, str] | None = None,
+    def make_table(
+        data: list[list[Any]], widths_mm: list[float], *, header_rows: int = 1,
+        alignments: dict[int, str] | None = None, font_size: float = 6.25,
+        row_padding: float = 5.3, extra_style: list[tuple[Any, ...]] | None = None,
     ) -> Table:
         cooked: list[list[Any]] = []
+        row_style = ParagraphStyle("DynamicRow", parent=table_body, fontSize=font_size, leading=font_size + 1.1)
+        head_style = ParagraphStyle("DynamicHead", parent=table_head, fontSize=font_size, leading=font_size + 1.1)
         for row_index, row in enumerate(data):
             cooked.append([
-                cell if isinstance(cell, Paragraph) else paragraph(cell, label if row_index < header_rows else small)
+                cell if isinstance(cell, Flowable) else p(cell, head_style if row_index < header_rows else row_style)
                 for cell in row
             ])
-        result = Table(cooked, colWidths=widths, repeatRows=header_rows, hAlign="LEFT")
+        result = Table(
+            cooked, colWidths=[width * mm for width in widths_mm], repeatRows=header_rows,
+            hAlign="LEFT", splitByRow=1, splitInRow=1,
+        )
         commands: list[tuple[Any, ...]] = [
-            ("FONTNAME", (0, 0), (-1, -1), font_name),
-            ("FONTSIZE", (0, 0), (-1, -1), font_size),
-            ("BACKGROUND", (0, 0), (-1, header_rows - 1), pale),
-            ("TEXTCOLOR", (0, 0), (-1, -1), ink),
-            ("LINEABOVE", (0, 0), (-1, 0), 0.55, line),
-            ("LINEBELOW", (0, header_rows - 1), (-1, header_rows - 1), 0.55, line),
-            ("LINEBELOW", (0, header_rows), (-1, -1), 0.22, colors.HexColor("#cfd3d1")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 2.5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 2.5),
-            ("TOPPADDING", (0, 0), (-1, -1), 2.15),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.15),
+            ("TEXTCOLOR", (0, 0), (-1, -1), ink),
+            ("LINEBELOW", (0, header_rows - 1), (-1, header_rows - 1), 0.45, line),
+            ("LINEBELOW", (0, header_rows), (-1, -1), 0.22, hairline),
+            ("LEFTPADDING", (0, 0), (-1, -1), 1.5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
+            ("TOPPADDING", (0, 0), (-1, -1), row_padding),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), row_padding),
         ]
         if alignments:
             for column, alignment in alignments.items():
                 commands.append(("ALIGN", (column, 0), (column, -1), alignment))
+        if extra_style:
+            commands.extend(extra_style)
         result.setStyle(TableStyle(commands))
         return result
 
     def notes(lines: list[str]) -> list[Paragraph]:
-        return [rich(f"&#8226; {escape(_safe_text(item))}", tiny) for item in lines]
+        return [Paragraph(f"• {escape(_safe_text(item))}", note) for item in lines]
 
     metrics = report.get("key_metrics", {})
     finance = report.get("finance", {})
@@ -152,46 +197,42 @@ def build_round_report_pdf(
     production = report.get("production", {})
     research = report.get("research", {})
     sales = report.get("sales", [])
-
     code = _safe_text(company.get("code", "-"))
-    header_left = rich(
-        '<font color="#e94d48" size="16">*</font> <font color="#282c2f"><b>ASEEDER</b></font>',
-        ParagraphStyle("Brand", parent=body, fontSize=10, leading=13),
-    )
-    header_center = rich(
-        f"<b>{escape(_safe_text(company.get('name') or 'Business Simulation'))}</b><br/>Round {round_no} Report",
-        ParagraphStyle("HeaderCenter", parent=small, alignment=TA_LEFT, leading=8.2),
-    )
-    header_right = rich(
-        f"Team Number:<br/><font size=12><b>{escape(code)}</b></font>",
-        ParagraphStyle("HeaderRight", parent=small, alignment=TA_RIGHT, leading=9),
-    )
-    header = Table([[header_left, header_center, header_right]], colWidths=[42 * mm, 104 * mm, 38 * mm])
+
+    header = Table([
+        [Brand(), rich(
+            "<b>ASIA BUSINESS SIMULATION</b><br/>"
+            f"Round {escape(str(round_no))} Report", header_center,
+        ), rich(
+            f"Team Number:&nbsp;&nbsp; <font size=10><b>{escape(code)}</b></font>",
+            header_right,
+        )],
+    ], colWidths=[42 * mm, 109 * mm, 44 * mm], hAlign="LEFT")
     header.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LINEBELOW", (0, 0), (-1, 0), 0.8, line),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.65, line),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (-1, -1), 0),
         ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2),
     ]))
 
-    key_metrics = table([
-        ["Total Assets", "Debt", "Net Assets", "Rank"],
-        [_money(metrics.get("total_assets")), _money(metrics.get("debt")), _money(metrics.get("net_assets")), rank],
-        ["Sales Revenue", "Cost", "Net Profit", "Home Market"],
-        [_money(metrics.get("sales_revenue")), _money(metrics.get("cost")), _money(metrics.get("net_profit")), company.get("home_city") or "-"],
-    ], [46 * mm] * 4, alignments={0: "CENTER", 1: "CENTER", 2: "CENTER", 3: "CENTER"})
-    key_metrics.setStyle(TableStyle([
-        ("BACKGROUND", (0, 2), (-1, 2), pale),
-        ("FONTNAME", (0, 2), (-1, 2), font_bold),
-        ("LINEABOVE", (0, 2), (-1, 2), 0.55, line),
-    ]))
+    key_metrics = make_table([
+        ["Total Assets", "", "Debt", "", "Net Assets", "", "Rank"],
+        [_money(metrics.get("total_assets")), "-", _money(metrics.get("debt")), "=", _money(metrics.get("net_assets")), "", rank],
+        ["Sales Revenue", "", "Cost", "", "Net Profit", "", ""],
+        [_money(metrics.get("sales_revenue")), "-", _money(metrics.get("cost")), "=", _money(metrics.get("net_profit")), "", ""],
+    ], [46, 6, 43, 6, 46, 6, 42], alignments={0: "CENTER", 1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER", 5: "CENTER", 6: "CENTER"},
+       extra_style=[
+           ("LINEABOVE", (0, 2), (-1, 2), 0.32, hairline),
+           ("TEXTCOLOR", (0, 0), (-1, 0), muted),
+           ("TEXTCOLOR", (0, 2), (-1, 2), muted),
+       ])
 
     project_bonus = float(finance.get("project_bonus", 0))
-    start_cash = float(finance.get("round_begins", 0))
-    if not bool(finance.get("bonus_in_round_begins", False)):
-        start_cash += project_bonus
+    stored_start_cash = float(finance.get("round_begins", 0))
+    bonus_in_start = bool(finance.get("bonus_in_round_begins", False))
+    start_cash = stored_start_cash - project_bonus if bonus_in_start else stored_start_cash
     start_debt = float(finance.get(
         "starting_debt",
         float(metrics.get("debt", 0)) - float(finance.get("loan_change", 0)) - float(finance.get("interest", 0)),
@@ -211,22 +252,22 @@ def build_round_report_pdf(
         ("Components storage cost", -float(finance.get("component_storage", finance.get("storage", 0))), 0.0),
         ("Products material cost", -float(finance.get("product_material", 0)), 0.0),
         ("Products storage cost", -float(finance.get("product_storage", 0)), 0.0),
-        ("Change sales agents", -float(finance.get("agents", 0)), 0.0),
+        ("Change sales agents cost", -float(finance.get("agents", 0)), 0.0),
         ("Marketing investment", -float(finance.get("marketing", 0)), 0.0),
         ("Quality investment", -float(finance.get("quality", 0)), 0.0),
         ("Management investment", -float(finance.get("management", 0)), 0.0),
         ("Sales revenue", float(metrics.get("sales_revenue", finance.get("sales_revenue", 0))), 0.0),
+        ("Market report cost", -float(finance.get("market_reports", 0)), 0.0),
         ("Research investment", -float(finance.get("research", 0)), 0.0),
         ("Transportation cost", -float(finance.get("transport", 0)), 0.0),
-        ("Market report cost", -float(finance.get("market_reports", 0)), 0.0),
         ("Debt interest", 0.0, float(finance.get("interest", 0))),
         ("Tax deduction", -float(finance.get("tax", 0)), 0.0),
-        (f"Project bonus (Y{project_bonus:,.0f}, available at round start)", 0.0, 0.0),
+        ("Project bonus", project_bonus, 0.0),
     ]
-    for item, cash_change, debt_change in finance_events:
+    for label, cash_change, debt_change in finance_events:
         running_cash += cash_change
         running_debt += debt_change
-        finance_rows.append([item, _flow(cash_change), _money(running_cash), _flow(debt_change), _money(running_debt)])
+        finance_rows.append([label, _flow(cash_change), _money(running_cash), _flow(debt_change), _money(running_debt)])
     finance_rows.append([
         "Round ends", "--", _money(finance.get("round_ends", running_cash)), "--", _money(metrics.get("debt", running_debt)),
     ])
@@ -238,190 +279,187 @@ def build_round_report_pdf(
         {"employee": "Experienced Engineers", "previous": 0, "laid": 0, "quitted": 0, "added": 0, "promoted": 0, "working": 0, "salary": hr.get("engineer_salary", 0), "average": hr.get("average_engineer_salary", 0)},
     ]
     human_rows: list[list[Any]] = [["Employees", "Previous", "Laid", "Quitted", "Added", "Promoted", "Working", "Salary", "Avg."]]
-    for item in hr_rows:
+    for row in hr_rows:
         human_rows.append([
-            item.get("employee", ""), item.get("previous", 0), item.get("laid", 0), item.get("quitted", 0),
-            item.get("added", 0), item.get("promoted", 0), item.get("working", 0),
-            _money(item.get("salary", 0)), _money(item.get("average", 0)),
+            row.get("employee", ""), row.get("previous", 0), row.get("laid", 0), row.get("quitted", 0),
+            row.get("added", 0), row.get("promoted", 0), row.get("working", 0),
+            _money(row.get("salary", 0)), _money(row.get("average", 0)),
         ])
 
     planned = int(production.get("planned", 0))
     produced = int(production.get("produced", 0))
-    components = int(production.get("components", produced * 7))
+    components_per_product = int(production.get("components_per_product", 7))
+    components = int(production.get("components", produced * components_per_product))
     old_products = int(production.get("old_products", 0))
+    old_components = int(production.get("old_components", 0))
     sold = int(production.get("sold", 0))
     surplus = int(production.get("surplus", max(0, old_products + produced - sold)))
     component_material_price = production.get(
-        "component_material_unit_price",
-        float(finance.get("component_material", 0)) / max(components, 1),
+        "component_material_unit_price", float(finance.get("component_material", 0)) / max(components, 1),
     )
     product_material_price = production.get(
-        "product_material_unit_price",
-        float(finance.get("product_material", 0)) / max(produced, 1),
+        "product_material_unit_price", float(finance.get("product_material", 0)) / max(produced, 1),
     )
     component_storage_price = production.get(
-        "component_storage_unit_price",
-        float(finance.get("component_storage", 0)) / max(int(production.get("component_storage_increase", 0)), 1),
+        "component_storage_unit_price", float(finance.get("component_storage", 0)) / max(int(production.get("component_storage_increase", 0)), 1),
     )
     product_storage_price = production.get(
-        "product_storage_unit_price",
-        float(finance.get("product_storage", 0)) / max(int(production.get("product_storage_increase", 0)), 1),
+        "product_storage_unit_price", float(finance.get("product_storage", 0)) / max(int(production.get("product_storage_increase", 0)), 1),
     )
-    management_table = table([
+
+    management_table = make_table([
         ["Management", "Management Investment", "Management Index"],
         ["", _money(finance.get("management", 0)), _num(production.get("ma_index", 0), 2)],
-    ], [61 * mm, 61 * mm, 62 * mm], alignments={0: "CENTER", 1: "CENTER", 2: "CENTER"})
-    overview_table = table([
+    ], [55, 70, 70], alignments={0: "CENTER", 1: "CENTER", 2: "CENTER"})
+    overview_table = make_table([
         ["Overview", "Plan", "Previous", "Produced", "Total", "Used/Sold", "Surplus"],
-        ["Components", planned * int(production.get("components_per_product", 7)), production.get("old_components", 0), components,
-         int(production.get("old_components", 0)) + components, production.get("component_used", components), production.get("component_surplus", 0)],
+        ["Components", planned * components_per_product, old_components, components,
+         old_components + components, production.get("component_used", components), production.get("component_surplus", 0)],
         ["Products", planned, old_products, produced, old_products + produced, sold, surplus],
-    ], [34 * mm, 25 * mm, 25 * mm, 25 * mm, 25 * mm, 25 * mm, 25 * mm],
-       alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT"})
-    details_table = table([
+    ], [35, 26, 26, 27, 27, 27, 27], alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT"})
+    details_table = make_table([
         ["Details", "Productivity", "Employees", "Production", "Material Price", "Material Cost"],
         ["Components", _num(production.get("component_productivity", 0), 3), _num(hr.get("workers", 0)), components, _money(component_material_price), _money(finance.get("component_material", 0))],
         ["Products", _num(production.get("product_productivity", 0), 3), _num(hr.get("engineers", 0)), produced, _money(product_material_price), _money(finance.get("product_material", 0))],
-    ], [34 * mm, 30 * mm, 28 * mm, 28 * mm, 32 * mm, 32 * mm],
-       alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"})
-    storage_table = table([
+    ], [35, 31, 28, 31, 33, 37], alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"})
+    storage_table = make_table([
         ["Storage", "Capacity Before", "Capacity After", "Increment", "Unit Price", "Storage Cost"],
         ["Components", production.get("component_storage_before", 0), production.get("component_storage_after", 0), production.get("component_storage_increase", 0), _money(component_storage_price), _money(finance.get("component_storage", 0))],
         ["Products", production.get("product_storage_before", 0), production.get("product_storage_after", 0), production.get("product_storage_increase", 0), _money(product_storage_price), _money(finance.get("product_storage", 0))],
-    ], [34 * mm, 32 * mm, 32 * mm, 28 * mm, 28 * mm, 30 * mm],
-       alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"})
-    quality_table = table([
+    ], [35, 32, 34, 27, 30, 37], alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"})
+    quality_table = make_table([
         ["Quality", "Quality Investment", "Old Products", "New Products", "Product Quality Index"],
         ["", _money(production.get("quality_investment", finance.get("quality", 0))), old_products, produced, _num(production.get("qi_index", 0), 2)],
-    ], [34 * mm, 39 * mm, 34 * mm, 34 * mm, 43 * mm], alignments={1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
-    research_table = table([
+    ], [35, 43, 35, 36, 46], alignments={1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
+    research_table = make_table([
         ["Overview", "Previous", "Change", "After", "Accumulated Research Investment"],
         ["Patents", research.get("active_patents_this_round", 0), 1 if research.get("success") else 0, research.get("patents_after", 0), _money(research.get("accumulated_after", 0))],
-    ], [34 * mm, 28 * mm, 28 * mm, 28 * mm, 66 * mm], alignments={1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
+    ], [35, 30, 28, 30, 72], alignments={1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
 
     agent_rows: list[list[Any]] = [["Agents", "Previous", "Change", "After", "Change Cost", "Marketing Investment"]]
     sales_rows: list[list[Any]] = [["Market", "Competitive Power", "Sales Volume", "Market Share", "Price", "Sales"]]
     active_sales = [
-        item
-        for item in sales
-        if int(item.get("agents", 0)) > 0
-        or int(item.get("agents_previous", 0)) > 0
-        or int(item.get("agent_change", 0)) != 0
-        or float(item.get("marketing", 0)) > 0
-        or int(item.get("sold", 0)) > 0
+        row for row in sales
+        if int(row.get("agents", 0)) > 0
+        or int(row.get("agents_previous", 0)) > 0
+        or int(row.get("agent_change", 0)) != 0
+        or float(row.get("marketing", 0)) > 0
+        or int(row.get("sold", 0)) > 0
     ]
-    for item in active_sales:
+    for row in active_sales:
         agent_rows.append([
-            item.get("city", ""), item.get("agents_previous", max(0, int(item.get("agents", 0)) - int(item.get("agent_change", 0)))),
-            item.get("agent_change", 0), item.get("agents", 0), _money(item.get("agent_change_cost", 0)), _money(item.get("marketing", 0)),
+            row.get("city", ""), row.get("agents_previous", max(0, int(row.get("agents", 0)) - int(row.get("agent_change", 0)))),
+            row.get("agent_change", 0), row.get("agents", 0), _money(row.get("agent_change_cost", 0)), _money(row.get("marketing", 0)),
         ])
-        gross_sales = float(item.get("sold", 0)) * float(item.get("price", 0))
+        gross_sales = float(row.get("sold", 0)) * float(row.get("price", 0))
         sales_rows.append([
-            item.get("city", ""), _pct_points(item.get("cpi", 0)), _num(item.get("sold", 0)),
-            _pct_points(float(item.get("market_share", 0)) * 100), _money(item.get("price", 0)), _money(gross_sales),
+            row.get("city", ""), _pct_points(row.get("cpi", 0)), _num(row.get("sold", 0)),
+            _pct_points(float(row.get("market_share", 0)) * 100), _money(row.get("price", 0)), _money(gross_sales),
         ])
 
-    story: list[Any] = [
-        header, Spacer(1, 3), section("Key Metrics"), key_metrics, Spacer(1, 2),
+    story: list[Flowable] = [
+        header, Spacer(1, 3.2 * mm), section("Key Metrics"), key_metrics, Spacer(1, 2 * mm),
         *notes([
-            "Net Profit = Sales Revenue - All Costs. It measures the result achieved in this round.",
-            "Net Assets = Total Assets - Debt. The end-of-round value is used for ranking.",
+            "Net Profit = Sales Revenue - All Costs. The direct indicator of your achievement in this round.",
+            "Net Assets = Total Assets - Debt. Your result till this round, used for ranking.",
         ]),
-        section("Finance"),
-        table(finance_rows, [55 * mm, 33 * mm, 34 * mm, 29 * mm, 33 * mm], font_size=5.9,
-              alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT"}),
-        CondPageBreak(45 * mm), section("Human Resources"),
-        table(human_rows, [40 * mm, 18 * mm, 15 * mm, 17 * mm, 15 * mm, 18 * mm, 17 * mm, 22 * mm, 22 * mm],
-              font_size=5.5, alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT", 8: "RIGHT"}),
+        Spacer(1, 3 * mm), section("Finance"),
+        make_table(finance_rows, [54, 34, 37, 32, 38], font_size=5.9,
+                   alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT"}, row_padding=4.3),
+        Spacer(1, 3.5 * mm), section("Human Resources"),
+        make_table(human_rows, [39, 19, 16, 18, 16, 19, 18, 24, 26], font_size=5.5,
+                   alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT", 8: "RIGHT"}, row_padding=4.0),
+        Spacer(1, 1.8 * mm),
         *notes([
-            "Low-salary Effect: salaries below the home-market average reduce effective productivity and cause proportional quits.",
-            "Layoff Cost: voluntary layoffs cost one month of salary and are shown separately in Finance.",
-            "Salary-reduction / Quitting: each automatic quitter receives two months of the current salary.",
-            "Worker Promotion: workers become experienced after completing two rounds.",
-            "Engineer Promotion: engineers become experienced after completing two rounds.",
-            "Compensation and payroll use the salary actually accepted by the system for this round.",
+            "Low-salary Effect: If your salary is relatively low, you cannot add as many employees as you planned to, and some employees may quit.",
+            "Layoff Cost: When you lay off your employees, you must compensate them for one month's salary.",
+            "Salary-reduction Penalty: When employees quit while you have reduction in salary, you must compensate them for two months' salary.",
+            "Worker Promotion: eligible workers are ready to be promoted in the next round.",
+            "Engineer Promotion: eligible engineers are ready to be promoted in the next round.",
+            "Compensations are based on the salary of the current round.",
         ]),
-        Spacer(1, 3), management_table, PageBreak(), section("Production"), overview_table,
-        Spacer(1, 4), details_table,
+        Spacer(1, 2 * mm), management_table, Spacer(1, 3.5 * mm), section("Production"), overview_table,
+        Spacer(1, 1.8 * mm), details_table, Spacer(1, 1.4 * mm),
         *notes([
-            "Productivity shows output capacity per employee after experience and salary effects.",
-            "Actual production is limited by the plan, components, employee capacity and available cash.",
+            "Productivity: This shows how many items one employee can produce in a round, affected by salary.",
+            "Production: The actual total produced items. It is often limited by your plan, components, employees and available cash.",
         ]),
-        Spacer(1, 4), storage_table,
-        *notes(["Storage Cost is paid only for an increase in storage capacity."]),
-        Spacer(1, 4), quality_table,
+        Spacer(1, 1.8 * mm), storage_table, Spacer(1, 1.4 * mm),
+        *notes(["Storage Cost: You only need to spend money on increasing your storage capacity."]),
+        Spacer(1, 1.8 * mm), quality_table, Spacer(1, 1.4 * mm),
         *notes(["Product Quality Index = Quality Investment / (Old Products x 1.20 + New Products)."]),
-        section("Research Investment"), research_table,
+        Spacer(1, 3.2 * mm), section("Research Investment"), research_table, Spacer(1, 1.4 * mm),
         *notes([
-            "A successful patent becomes active in the following round and does not reduce this round's material cost.",
-            "Research is resolved independently each round; the amount shown is the paid investment for this round.",
+            "Accumulated Research Investment: If your research is not successful, your research investment is accumulated to the next round. If successful, you receive a patent and the accumulated investment is reset to 0.",
         ]),
-        section("Sales"),
-        table(agent_rows, [34 * mm, 28 * mm, 25 * mm, 25 * mm, 34 * mm, 38 * mm],
-              alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"}),
-        Spacer(1, 4),
-        table(sales_rows, [36 * mm, 34 * mm, 28 * mm, 30 * mm, 27 * mm, 29 * mm],
-              alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"}),
-        *notes(["Transportation cost applies only to products sold outside the company's home market."]),
+        Spacer(1, 3.2 * mm), section("Sales"),
+        make_table(agent_rows, [35, 29, 27, 27, 35, 42], alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"}),
+        Spacer(1, 1.8 * mm),
+        make_table(sales_rows, [35, 38, 29, 33, 28, 32], alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT"}),
     ]
 
     for market in market_sections:
-        summary_table = table([
+        summary_table = make_table([
             ["Population", "Penetration", "Market Size", "Total Sales Volume", "Avg. Price"],
             [_num(market.get("population", 0)), f"{float(market.get('penetration', 0)) * 100:.2f}%",
              _num(market.get("market_size", 0)), _num(market.get("total_volume", 0)), _money(market.get("average_price", 0))],
-        ], [36 * mm, 34 * mm, 37 * mm, 41 * mm, 36 * mm], alignments={0: "CENTER", 1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
+        ], [40, 35, 40, 43, 37], alignments={0: "CENTER", 1: "CENTER", 2: "CENTER", 3: "CENTER", 4: "CENTER"})
         market_rows: list[list[Any]] = [[
             "Team", "Management Index", "Agents", "Marketing Investment",
             "Product Quality Index", "Price", "Sales Volume", "Market Share",
         ]]
-        for item in market.get("rows", []):
+        for row in market.get("rows", []):
             market_rows.append([
-                item.get("code", ""), _num(item.get("ma_index", 0), 2), item.get("agents", 0),
-                _money(item.get("marketing", 0)), _num(item.get("qi_index", 0), 2),
-                _money(item.get("price", 0)), _num(item.get("sold", 0)),
-                _pct_points(float(item.get("market_share", 0)) * 100),
+                row.get("code", ""), _num(row.get("ma_index", 0), 2), row.get("agents", 0),
+                _money(row.get("marketing", 0)), _num(row.get("qi_index", 0), 2),
+                _money(row.get("price", 0)), _num(row.get("sold", 0)),
+                _pct_points(float(row.get("market_share", 0)) * 100),
             ])
         story.extend([
-            PageBreak(), section(f"Market Report - {market.get('city', '')}"), summary_table, Spacer(1, 5),
-            table(market_rows, [18 * mm, 29 * mm, 17 * mm, 31 * mm, 31 * mm, 22 * mm, 20 * mm, 16 * mm],
-                  font_size=5.55, alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT"}),
-            Spacer(1, 3),
-            paragraph(
-                "Avg. Price = [sum(player price x player sales volume) + reference average x "
-                "(market size - total player sales volume)] / market size.", tiny,
-            ),
+            Spacer(1, 3.4 * mm), section(f"Market Report - {market.get('city', '')}"), summary_table,
+            Spacer(1, 1.8 * mm),
+            make_table(market_rows, [16, 33, 18, 33, 34, 24, 21, 16], font_size=5.55,
+                       alignments={1: "RIGHT", 2: "RIGHT", 3: "RIGHT", 4: "RIGHT", 5: "RIGHT", 6: "RIGHT", 7: "RIGHT"}, row_padding=4.6),
         ])
 
-    def page_decorations(canvas: Any, document: Any) -> None:
-        canvas.saveState()
-        width, height = A4
-        # Use a very pale solid colour instead of transparency: this stays
-        # consistently faint across browser PDF viewers and print drivers.
-        canvas.setFillColor(colors.HexColor("#edf3f1"))
-        canvas.setFont(font_bold, 31)
-        canvas.translate(width / 2, height / 2)
-        canvas.rotate(38)
-        canvas.drawCentredString(0, 0, "ASEEDER BUSINESS SIMULATION")
-        canvas.restoreState()
+    def measured_height(flowables: list[Flowable]) -> float:
+        height = 0.0
+        for flowable in flowables:
+            before: Callable[[], float] | None = getattr(flowable, "getSpaceBefore", None)
+            after: Callable[[], float] | None = getattr(flowable, "getSpaceAfter", None)
+            if before:
+                height += float(before())
+            _, item_height = flowable.wrap(content_width, 50_000)
+            height += item_height
+            if after:
+                height += float(after())
+        return height
 
+    content_height = measured_height(story)
+    page_height = max(A4[1], min(13_900.0, content_height + 45 * mm))
+    stream = BytesIO()
+    doc = SimpleDocTemplate(
+        stream, pagesize=(page_width, page_height), leftMargin=margin, rightMargin=margin,
+        topMargin=7 * mm, bottomMargin=7 * mm,
+        title=f"Round {round_no} Report - {code}", author="ABS Business Simulation",
+        subject="Official-style round report", invariant=1,
+    )
+
+    def page_decorations(canvas: Any, document: Any) -> None:
+        width, height = canvas._pagesize
         canvas.saveState()
-        canvas.setStrokeColor(colors.HexColor("#c2c6c4"))
-        canvas.setLineWidth(0.35)
-        canvas.line(13 * mm, 10.5 * mm, width - 13 * mm, 10.5 * mm)
-        canvas.setFont(font_name, 6.3)
-        canvas.setFillColor(muted)
-        canvas.drawString(13 * mm, 7.2 * mm, f"{code} | Round {round_no} Official Report")
-        canvas.drawRightString(width - 13 * mm, 7.2 * mm, f"Page {document.page}")
-        if document.page > 1:
-            canvas.setFont(font_bold, 6.8)
-            canvas.setFillColor(ink)
-            canvas.drawString(13 * mm, height - 9.5 * mm, "ASEEDER BUSINESS SIMULATION")
-            canvas.setFont(font_name, 6.3)
-            canvas.setFillColor(muted)
-            canvas.drawRightString(width - 13 * mm, height - 9.5 * mm, f"Team {code} | Round {round_no}")
-            canvas.setStrokeColor(colors.HexColor("#c2c6c4"))
-            canvas.line(13 * mm, height - 11 * mm, width - 13 * mm, height - 11 * mm)
+        canvas.setFillColor(watermark)
+        y = 115 * mm
+        while y < height - 40 * mm:
+            canvas.saveState()
+            canvas.translate(width / 2, y)
+            canvas.rotate(37)
+            canvas.setFont(chinese_font, 18)
+            canvas.drawRightString(-5 * mm, 0, "阿思丹")
+            canvas.setFont("Helvetica-Bold", 31)
+            canvas.drawString(1 * mm, 0, "ASEEDER")
+            canvas.restoreState()
+            y += 220 * mm
         canvas.restoreState()
 
     doc.build(story, onFirstPage=page_decorations, onLaterPages=page_decorations)
