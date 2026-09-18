@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import html
 import importlib
-import io
 import json
 import logging
 import math
 import os
-import shlex
 import sqlite3
 import sys
 import typing
-import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -99,6 +96,7 @@ from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
 from sim.report_pdf import build_round_report_pdf
 from sim.kds_pdf import build_public_kds_pdf
+from sim.local_launcher import build_local_worker_launcher_zip
 
 
 LOGGER = logging.getLogger(__name__)
@@ -195,82 +193,6 @@ def _normalise_local_worker_url(value: str) -> str:
         raise ValueError("本地算力地址不能包含空格。")
     return url
 
-
-def _local_worker_launcher_zip(token: str) -> bytes:
-    """Build an admin-only Mac launcher; its token is never committed."""
-    quoted_token = shlex.quote(token)
-    script = f'''#!/bin/zsh
-set -eu
-
-WORKER_DIR="$HOME/.business-sim-local-worker"
-RUNTIME_DIR="$HOME/.business-sim-local-worker-runtime"
-REPOSITORY="https://github.com/ICE-GONg/business-sim-system.git"
-mkdir -p "$RUNTIME_DIR"
-
-if [[ -d "$WORKER_DIR/.git" ]]; then
-  git -C "$WORKER_DIR" pull --ff-only
-else
-  git clone --depth 1 "$REPOSITORY" "$WORKER_DIR"
-fi
-
-if ! command -v cloudflared >/dev/null 2>&1; then
-  if ! command -v brew >/dev/null 2>&1; then
-    osascript -e 'display dialog "未找到 Homebrew。请先安装 Homebrew，再重新双击启动器。" buttons {{"好"}} default button 1'
-    exit 1
-  fi
-  brew install cloudflared
-fi
-
-for NAME in worker tunnel; do
-  PID_FILE="$RUNTIME_DIR/$NAME.pid"
-  if [[ -f "$PID_FILE" ]]; then
-    OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [[ -n "$OLD_PID" ]]; then kill "$OLD_PID" 2>/dev/null || true; fi
-  fi
-done
-
-export SUPER_BOT_REMOTE_TOKEN={quoted_token}
-export SUPER_BOT_LOCAL_PORT=8765
-nohup python3 "$WORKER_DIR/local_worker_server.py" >"$RUNTIME_DIR/worker.log" 2>&1 &
-echo $! >"$RUNTIME_DIR/worker.pid"
-
-for ATTEMPT in {{1..20}}; do
-  if curl -fsS --max-time 1 http://127.0.0.1:8765 >/dev/null 2>&1; then break; fi
-  sleep 0.5
-done
-if ! curl -fsS --max-time 2 http://127.0.0.1:8765 >/dev/null 2>&1; then
-  open -a TextEdit "$RUNTIME_DIR/worker.log"
-  osascript -e 'display dialog "本地计算服务启动失败，已经打开日志。" buttons {{"好"}} default button 1'
-  exit 1
-fi
-
-: >"$RUNTIME_DIR/tunnel.log"
-nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >"$RUNTIME_DIR/tunnel.log" 2>&1 &
-echo $! >"$RUNTIME_DIR/tunnel.pid"
-
-PUBLIC_URL=""
-for ATTEMPT in {{1..40}}; do
-  PUBLIC_URL="$(grep -Eo 'https://[-a-z0-9]+\\.trycloudflare\\.com' "$RUNTIME_DIR/tunnel.log" | tail -1 || true)"
-  if [[ -n "$PUBLIC_URL" ]]; then break; fi
-  sleep 0.5
-done
-if [[ -z "$PUBLIC_URL" ]]; then
-  open -a TextEdit "$RUNTIME_DIR/tunnel.log"
-  osascript -e 'display dialog "公网线路启动失败，已经打开日志。" buttons {{"好"}} default button 1'
-  exit 1
-fi
-
-print -n "$PUBLIC_URL" | pbcopy
-osascript -e "display dialog \"本地算力已启动，HTTPS 地址已复制：\\n$PUBLIC_URL\\n\\n回到管理员回合控制页面，粘贴后点击‘连接本地算力’。\" buttons {{\"好\"}} default button 1"
-'''
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        info = zipfile.ZipInfo("启动本地算力.command")
-        info.create_system = 3
-        info.external_attr = 0o755 << 16
-        info.compress_type = zipfile.ZIP_DEFLATED
-        archive.writestr(info, script.encode("utf-8"))
-    return buffer.getvalue()
 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -2210,9 +2132,9 @@ def render_admin_rounds() -> None:
     remote_token = _deployment_secret("SUPER_BOT_REMOTE_TOKEN")
     if remote_token:
         st.download_button(
-            "下载 Mac 一键启动器",
-            data=_local_worker_launcher_zip(remote_token),
-            file_name="business-sim-local-worker.zip",
+            "下载 Mac 一键启动器（修复版）",
+            data=build_local_worker_launcher_zip(remote_token),
+            file_name="business-sim-local-worker-v2.zip",
             mime="application/zip",
             key="download_local_compute_launcher",
             use_container_width=True,
