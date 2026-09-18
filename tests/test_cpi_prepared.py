@@ -3,10 +3,62 @@ from __future__ import annotations
 import random
 import unittest
 
-from sim.cpi import allocate_city_cpi_for_company, prepare_city_cpi_for_company
+from sim.cpi import (
+    allocate_city_cpi_for_company,
+    investment_average_prices,
+    prepare_city_cpi_for_company,
+    prepare_investment_average_prices,
+)
 
 
 class PreparedCPITests(unittest.TestCase):
+    def test_prepared_player_averages_are_bit_exact(self) -> None:
+        rng = random.Random(20260918)
+        for player_count in (1, 3, 17):
+            entries = [
+                {
+                    "company_id": index,
+                    "ma_index": rng.uniform(0, 13_000),
+                    "qi_index": rng.uniform(0, 5_000),
+                    "mi_investment": rng.uniform(0, 30_000_000),
+                    "price": rng.uniform(3_500, 25_000),
+                    "agents": rng.randrange(8),
+                }
+                for index in range(player_count)
+            ]
+            quantities = [rng.uniform(0, 50_000) for _ in entries]
+            prepared = prepare_investment_average_prices(
+                entries,
+                quantities,
+                target_index=player_count - 1,
+                fallback=9_800,
+                market_size=88_000,
+                max_price=25_000,
+                ma_large_threshold=1_300,
+            )
+            for _ in range(30):
+                own = {
+                    "ma_index": rng.uniform(0, 13_000),
+                    "qi_index": rng.uniform(0, 5_000),
+                    "mi_investment": rng.uniform(0, 30_000_000),
+                    "price": rng.uniform(3_500, 25_000),
+                    "agents": rng.randrange(8),
+                }
+                quantity = rng.uniform(0, 50_000)
+                changed = [dict(entry) for entry in entries]
+                changed[-1].update(own)
+                changed_quantities = [*quantities[:-1], quantity]
+                expected = investment_average_prices(
+                    changed,
+                    changed_quantities,
+                    fallback=9_800,
+                    market_size=88_000,
+                    max_price=25_000,
+                    ma_large_threshold=1_300,
+                )
+                actual = prepared.resolve(quantity=quantity, **own)
+                self.assertEqual(actual, expected)
+
     def test_reused_evaluator_matches_target_allocator_exactly(self) -> None:
         rng = random.Random(20260912)
         for player_count in (1, 2, 7, 25, 510):

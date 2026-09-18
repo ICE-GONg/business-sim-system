@@ -27,6 +27,7 @@ class LocalLauncherTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SUPER_BOT_REMOTE_TOKEN='token with spaces'", script)
+        self.assertIn('SUPER_BOT_PARALLEL_WORKERS="${SUPER_BOT_PARALLEL_WORKERS:-8}"', script)
         self.assertIn('exec > >(tee -a "$LOG_FILE") 2>&1', script)
         self.assertIn('osascript - "$PUBLIC_URL"', script)
         self.assertIn("PUBLIC_READY", script)

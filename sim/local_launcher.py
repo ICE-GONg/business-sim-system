@@ -117,6 +117,7 @@ done
 
 export SUPER_BOT_REMOTE_TOKEN=__SUPER_BOT_REMOTE_TOKEN__
 export SUPER_BOT_LOCAL_PORT=8765
+export SUPER_BOT_PARALLEL_WORKERS="${SUPER_BOT_PARALLEL_WORKERS:-8}"
 nohup "$PYTHON_BIN" "$WORKER_DIR/local_worker_server.py" >"$RUNTIME_DIR/worker.log" 2>&1 &
 echo $! >"$RUNTIME_DIR/worker.pid"
 

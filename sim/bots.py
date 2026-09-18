@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import os
 import random
 import sqlite3
 import threading
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable
 
 from .bot_joint_pricing import JointPriceTarget, solve_joint_prices
@@ -16,6 +18,7 @@ from .cpi import (
     allocate_city_cpi_for_company,
     investment_average_prices,
     prepare_city_cpi_for_company,
+    prepare_investment_average_prices,
 )
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
@@ -23,6 +26,50 @@ from .engine import available_loan_limit, current_company_net_assets, loan_ceili
 
 BOT_API_VERSION = 32
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
+_FORECAST_POOL_LOCK = threading.Lock()
+_FORECAST_POOL: ProcessPoolExecutor | None = None
+
+
+def _forecast_candidate_task(payload: dict[str, Any]) -> dict[str, Any]:
+    """Pickle-safe exact forecast task for local multi-core workers."""
+    return forecast_market_sales(**payload)
+
+
+def _forecast_candidates(
+    payloads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Run independent finalist forecasts in order, optionally on local cores.
+
+    Streamlit Cloud and SCF remain sequential by default. The downloadable Mac
+    worker opts into a persistent process pool, and any pool failure falls back
+    to the identical in-process formula rather than losing a decision.
+    """
+    if not payloads:
+        return []
+    try:
+        workers = max(1, min(12, int(os.environ.get("SUPER_BOT_PARALLEL_WORKERS", "1"))))
+    except (TypeError, ValueError):
+        workers = 1
+    if workers <= 1 or len(payloads) <= 1:
+        return [_forecast_candidate_task(payload) for payload in payloads]
+    global _FORECAST_POOL
+    try:
+        with _FORECAST_POOL_LOCK:
+            if _FORECAST_POOL is None:
+                _FORECAST_POOL = ProcessPoolExecutor(max_workers=workers)
+            pool = _FORECAST_POOL
+        chunksize = max(1, len(payloads) // max(1, workers * 2))
+        return list(pool.map(
+            _forecast_candidate_task,
+            payloads,
+            chunksize=chunksize,
+        ))
+    except Exception:
+        with _FORECAST_POOL_LOCK:
+            if _FORECAST_POOL is not None:
+                _FORECAST_POOL.shutdown(wait=False, cancel_futures=True)
+                _FORECAST_POOL = None
+        return [_forecast_candidate_task(payload) for payload in payloads]
 
 BOT_PLANS = (
     {"production": 350, "ma": 1340, "markets": 1, "agents": 2, "research": 1_500_000},
@@ -2434,6 +2481,15 @@ def _submit_bots(
                     price_power=price_power,
                     market_average_price=previous_prices[index],
                 )
+                average_evaluator = prepare_investment_average_prices(
+                    entries,
+                    [*rival_weights, 0.0],
+                    target_index=len(entries) - 1,
+                    fallback=previous_prices[index],
+                    market_size=size,
+                    max_price=cap,
+                    ma_large_threshold=ma_threshold,
+                )
                 # Price CPI is exceptionally fragile when the KDS uses a high
                 # exponent: one later Bot can take almost the whole 40-point
                 # pool with a tiny undercut.  Candidate scoring therefore keeps
@@ -2447,7 +2503,8 @@ def _submit_bots(
                 )
                 candidate_city_data.append((
                     index, cap, low_price_unlocked, direct_unit_cost,
-                    rival_weights, rival_weighted_prices, entries, size, cpi_evaluator,
+                    rival_weights, rival_weighted_prices, entries, size,
+                    cpi_evaluator, average_evaluator,
                     shadow_price_competitors, aggregate_rival_weight,
                 ))
 
@@ -2524,7 +2581,8 @@ def _submit_bots(
                 rival_damage = 0.0
                 for (
                     index, cap, low_price_unlocked, direct_unit_cost,
-                    rival_weights, rival_weighted_prices, average_entries, size, cpi_evaluator,
+                    rival_weights, rival_weighted_prices, _average_entries, size,
+                    cpi_evaluator, average_evaluator,
                     shadow_price_competitors, aggregate_rival_weight,
                 ) in candidate_city_data:
                     effective_ratio = (
@@ -2535,21 +2593,13 @@ def _submit_bots(
                     candidate_price = cap * effective_ratio
                     candidate_price = min(cap, max(price_min, candidate_price, direct_unit_cost * 1.03))
                     own_weight = max(1.0, candidate_available / active_market_count)
-                    average_entries = [dict(entry) for entry in average_entries]
-                    average_entries[-1].update({
-                        "ma_index": candidate_ma,
-                        "qi_index": candidate_qi,
-                        "mi_investment": candidate_marketing[index],
-                        "price": candidate_price,
-                        "agents": agent_plan[index][1],
-                    })
-                    average_price = investment_average_prices(
-                        average_entries,
-                        [*rival_weights, own_weight],
-                        fallback=previous_prices[index],
-                        market_size=size,
-                        max_price=cap,
-                        ma_large_threshold=ma_threshold,
+                    average_price = average_evaluator.resolve(
+                        ma_index=candidate_ma,
+                        qi_index=candidate_qi,
+                        mi_investment=candidate_marketing[index],
+                        price=candidate_price,
+                        quantity=own_weight,
+                        agents=agent_plan[index][1],
                     )
                     own_cpi = cpi_evaluator.evaluate(
                         ma_index=candidate_ma, qi_index=candidate_qi,
@@ -2882,7 +2932,11 @@ def _submit_bots(
                     if competitive_mode else None
                 )
                 saved_targets = ma_index_target, qi_index_target, marketing_targets
-                verified_candidates = []
+                rival_player_list = list(rival_players.values())
+                prepared_finalists: list[tuple[
+                    dict[str, Any], dict[str, Any], int, dict[str, Any]
+                ]] = []
+                forecast_payloads: list[dict[str, Any]] = []
                 for candidate in shortlisted.values():
                     ma_index_target = float(candidate["ma"])
                     qi_index_target = float(candidate["qi"])
@@ -2911,7 +2965,8 @@ def _submit_bots(
                     own_cities = {}
                     for (
                         index, cap, low_price_unlocked, direct_unit_cost,
-                        _weights, _prices, _entries, _size, _evaluator, _shadow, _aggregate,
+                        _weights, _prices, _entries, _size, _evaluator,
+                        _average_evaluator, _shadow, _aggregate,
                     ) in candidate_city_data:
                         ratio = float(candidate["price_ratio"])
                         effective_ratio = (ratio if low_price_unlocked or ratio >= .75
@@ -2921,26 +2976,36 @@ def _submit_bots(
                             "marketing": float(candidate["marketing"].get(index, 0.0)),
                             "price": min(cap, max(price_min, cap * effective_ratio, direct_unit_cost * 1.03)),
                         }
-                    after_forecast = forecast_market_sales(players=[
-                        *rival_players.values(),
+                    players = [
+                        *rival_player_list,
                         {"company_id": company_id, "available": candidate_available,
                          "ma_index": float(candidate["ma"]), "qi_index": float(candidate["qi"]),
                          "cities": own_cities},
-                    ], **forecast_args)
+                    ]
+                    prepared_finalists.append((
+                        candidate, own_cities, candidate_available, actual_budget,
+                    ))
+                    forecast_payloads.append({"players": players, **forecast_args})
+                unresolved_super_peers = sum(
+                    1 for peer in bots
+                    if int(peer["id"]) != company_id
+                    and int(peer["id"]) not in frozen_super_ids
+                )
+                secondary_confidence = 1.0 / (
+                    1.0 + 0.45 * unresolved_super_peers
+                )
+                verified_candidates = []
+                for prepared, after_forecast in zip(
+                    prepared_finalists,
+                    _forecast_candidates(forecast_payloads),
+                ):
+                    candidate, own_cities, candidate_available, actual_budget = prepared
                     own_forecast = after_forecast["companies"][company_id]
-                    unresolved_super_peers = sum(
-                        1 for peer in bots
-                        if int(peer["id"]) != company_id
-                        and int(peer["id"]) not in frozen_super_ids
-                    )
                     # Secondary allocation is part of the plan, but an early
                     # sequential Super Bot cannot assume every synthetic peer
                     # will leave that pool untouched. Confidence rises to 100%
                     # as later real decisions replace those presets. The final
                     # joint pass then uses the exact complete field.
-                    secondary_confidence = 1.0 / (
-                        1.0 + 0.45 * unresolved_super_peers
-                    )
                     _apply_super_settlement_forecast(
                         candidate,
                         own_forecast,
@@ -2956,7 +3021,7 @@ def _submit_bots(
                     )
                     if baseline_forecast is not None:
                         candidate.update(_super_target_pressure(
-                            baseline_forecast, after_forecast, list(rival_players.values())))
+                            baseline_forecast, after_forecast, rival_player_list))
                     verified_candidates.append(candidate)
                 ma_index_target, qi_index_target, marketing_targets = saved_targets
                 finalist_candidates = verified_candidates

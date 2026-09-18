@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from functools import lru_cache
 import math
 from typing import Any
 
@@ -77,6 +78,7 @@ _PRICE_EFFICIENCY_SLOPES = _pchip_slopes(
 )
 
 
+@lru_cache(maxsize=65_536)
 def investment_price_curve(price: float, max_price: float) -> float:
     """Return the continuous KDS-price multiplier with diminishing returns.
 
@@ -224,6 +226,143 @@ def investment_average_prices(
             if total > 0.0 else max(0.0, float(fallback))
         )
     return resolved
+
+
+class PreparedInvestmentAveragePrices:
+    """Exact O(1) player-average updates for one appended search candidate.
+
+    Super Bot rivals, quantities and qualification states do not change while
+    one candidate is searched. The canonical helper used to rebuild all three
+    pools for every sampled MA/QI/MI/price point. This class hoists the fixed
+    prefix sums once and appends the candidate in the same arithmetic order as
+    :func:`investment_average_prices`.
+    """
+
+    def __init__(
+        self,
+        entries: list[dict[str, Any]],
+        quantities: list[float],
+        *,
+        target_index: int,
+        fallback: float,
+        market_size: float,
+        max_price: float,
+        ma_large_threshold: float,
+    ):
+        self.entries = entries
+        self.quantities = quantities
+        self.target = int(target_index)
+        self.fallback = max(0.0, float(fallback))
+        self.market_size = max(0.0, float(market_size))
+        self.max_price = max(0.0, float(max_price))
+        self.fast_path = self.target == len(entries) - 1
+        qi_large = self.max_price / 50.0
+        mi_large = qi_large * self.market_size * 0.20 / 1.5 / 2.0
+        self.thresholds = {
+            "ma": max(0.0, float(ma_large_threshold)),
+            "qi": qi_large,
+            "mi": mi_large,
+        }
+        self.pairs: dict[str, tuple[tuple[float, float], ...]] = {}
+        if not self.fast_path:
+            return
+        for pool in ("ma", "qi", "mi"):
+            pairs: list[tuple[float, float]] = []
+            qualifying = self.thresholds[pool] * 0.5
+            for index, entry in enumerate(entries[:-1]):
+                value = self._value(pool, entry)
+                quantity = max(
+                    0.0,
+                    float(quantities[index] if index < len(quantities) else 0.0),
+                )
+                if value <= 0.0 or value + 1e-12 < qualifying or quantity <= 0.0:
+                    continue
+                pairs.append((max(0.0, float(entry.get("price", 0.0))), quantity))
+            self.pairs[pool] = tuple(pairs)
+
+    @staticmethod
+    def _value(pool: str, entry: dict[str, Any]) -> float:
+        if pool == "mi":
+            return max(0.0, float(entry.get("mi_investment", 0.0))) * agent_mi_benefit(
+                entry.get("agents", 0)
+            )
+        return max(0.0, float(entry.get(f"{pool}_index", 0.0)))
+
+    def resolve(
+        self,
+        *,
+        ma_index: float,
+        qi_index: float,
+        mi_investment: float,
+        price: float,
+        quantity: float,
+        agents: int | float,
+    ) -> dict[str, float]:
+        target = dict(self.entries[self.target])
+        target.update({
+            "ma_index": ma_index,
+            "qi_index": qi_index,
+            "mi_investment": mi_investment,
+            "price": price,
+            "agents": agents,
+        })
+        if not self.fast_path:
+            entries = [dict(entry) for entry in self.entries]
+            entries[self.target] = target
+            quantities = list(self.quantities)
+            while len(quantities) < len(entries):
+                quantities.append(0.0)
+            quantities[self.target] = quantity
+            return investment_average_prices(
+                entries,
+                quantities,
+                fallback=self.fallback,
+                market_size=self.market_size,
+                max_price=self.max_price,
+                ma_large_threshold=self.thresholds["ma"],
+            )
+
+        resolved: dict[str, float] = {}
+        target_quantity = max(0.0, float(quantity))
+        target_price = max(0.0, float(price))
+        for pool in ("ma", "qi", "mi"):
+            pairs = self.pairs[pool]
+            value = self._value(pool, target)
+            include_target = (
+                value > 0.0
+                and value + 1e-12 >= self.thresholds[pool] * 0.5
+                and target_quantity > 0.0
+            )
+            quantities = [quantity for _, quantity in pairs]
+            weighted_values = [item_price * quantity for item_price, quantity in pairs]
+            if include_target:
+                quantities.append(target_quantity)
+                weighted_values.append(target_price * target_quantity)
+            total = sum(quantities)
+            weighted = sum(weighted_values)
+            resolved[pool] = weighted / total if total > 0.0 else self.fallback
+        return resolved
+
+
+def prepare_investment_average_prices(
+    entries: list[dict[str, Any]],
+    quantities: list[float],
+    *,
+    target_index: int,
+    fallback: float,
+    market_size: float,
+    max_price: float,
+    ma_large_threshold: float,
+) -> PreparedInvestmentAveragePrices:
+    return PreparedInvestmentAveragePrices(
+        entries,
+        quantities,
+        target_index=target_index,
+        fallback=fallback,
+        market_size=market_size,
+        max_price=max_price,
+        ma_large_threshold=ma_large_threshold,
+    )
 
 
 def _pool_average(
@@ -611,6 +750,13 @@ class _PreparedIndexCPI:
             (value for index, value in enumerate(self.layer1_original) if index != target),
             default=0.0,
         )
+        self.appended_target = target == len(self.originals) - 1
+        if self.appended_target:
+            self.rival_originals = self.originals[:-1]
+            self.rival_first_originals = self.layer1_original[:-1]
+            self.rival_second_originals = self.layer2_original[:-1]
+            self.rival_first_total = sum(self.rival_first_originals)
+            self.rival_second_total = sum(self.rival_second_originals)
 
     def _layer2(self, value: float) -> float:
         if value < self.minimum or value < self.large:
@@ -624,6 +770,8 @@ class _PreparedIndexCPI:
         # A zero investment receives none of this pool, regardless of rivals.
         if original == 0.0:
             return 0.0
+        if self.appended_target:
+            return self._evaluate_appended_target(original, factors)
         target = self.target
         large = self.large
         minimum = self.minimum
@@ -704,6 +852,114 @@ class _PreparedIndexCPI:
             result *= INDEX_CPI_TOTAL / allocated_total
         return result
 
+    def _evaluate_appended_target(self, original: float, factors: list[float]) -> float:
+        """Allocation-identical scalar path without per-candidate containers."""
+        large = self.large
+        minimum = self.minimum
+        target_factor = factors[-1] if original > 0.0 else 1.0
+        max_factor = max(1.0, target_factor)
+        # Rivals keep fixed investments but their price factors change with
+        # the candidate's sales-weighted average price.
+        for value, factor in zip(self.rival_originals, factors):
+            if value > 0.0 and factor > max_factor:
+                max_factor = factor
+        adjusted_min = minimum * max_factor
+        adjusted_large = large * max_factor
+
+        gifts: list[float] = []
+        layer1_values: list[float] = []
+        layer2_values: list[float] = []
+        layer1_max = 0.0
+        has_above_large = False
+        for value, factor in zip(self.rival_originals, factors):
+            factor = factor if value > 0.0 else 1.0
+            adjusted = value * factor
+            below_min = adjusted < adjusted_min
+            above_large = adjusted >= large
+            has_above_large = has_above_large or above_large
+            gifts.append(GIFT_CPI if value > 0.0 and below_min else 0.0)
+            first = adjusted if below_min else min(adjusted, adjusted_large)
+            layer1_values.append(first)
+            if first > layer1_max:
+                layer1_max = first
+            second = 0.0
+            if not below_min and above_large:
+                second = _post_large_effective(
+                    adjusted, large, unlimited=self.unlimited_above_cap,
+                )
+            layer2_values.append(second)
+
+        target_adjusted = original * target_factor
+        target_below_min = target_adjusted < adjusted_min
+        target_above_large = target_adjusted >= large
+        has_above_large = has_above_large or target_above_large
+        target_gift = GIFT_CPI if target_below_min else 0.0
+        gifts.append(target_gift)
+        target_first_adjusted = (
+            target_adjusted
+            if target_below_min
+            else min(target_adjusted, adjusted_large)
+        )
+        layer1_values.append(target_first_adjusted)
+        if target_first_adjusted > layer1_max:
+            layer1_max = target_first_adjusted
+        target_second_adjusted = 0.0
+        if not target_below_min and target_above_large:
+            target_second_adjusted = _post_large_effective(
+                target_adjusted, large, unlimited=self.unlimited_above_cap,
+            )
+        layer2_values.append(target_second_adjusted)
+        # Python 3.12+ uses compensated summation. Keep the canonical list
+        # order so the optimized path stays bit-for-bit identical.
+        gift_total = sum(gifts)
+        layer1_total = sum(layer1_values)
+        layer2_total = sum(layer2_values)
+
+        layer1_available = LAYER1_TOTAL_CPI
+        if not has_above_large and adjusted_large > 0.0 and layer1_max > 0.0:
+            layer1_available *= layer1_max / adjusted_large
+
+        target_first_original = (
+            min(original, large) if original >= minimum else 0.0
+        )
+        target_second_original = self._layer2(original)
+        first_total = sum([*self.rival_first_originals, target_first_original])
+        second_total = sum([*self.rival_second_originals, target_second_original])
+        max_original = max(self.max_rival_original, target_first_original)
+        welfare_total = WELFARE_PART1_BASE + WELFARE_PART2_BASE
+        welfare_ratio = (
+            max(0.0, welfare_total - gift_total) / welfare_total
+            if welfare_total else 0.0
+        )
+        welfare1_available = (
+            WELFARE_PART1_BASE * welfare_ratio * max_original / large
+            if large > 0.0 and max_original > 0.0 else 0.0
+        )
+        welfare2_available = WELFARE_PART2_BASE * welfare_ratio
+
+        result = target_gift
+        if layer1_total > 0.0 and target_first_adjusted > 0.0:
+            result += target_first_adjusted / layer1_total * layer1_available
+        if layer2_total > 0.0 and target_second_adjusted > 0.0:
+            result += target_second_adjusted / layer2_total * LAYER2_TOTAL_CPI
+        if original >= minimum and first_total > 0.0 and welfare1_available > 0.0:
+            result += target_first_original / first_total * welfare1_available
+        if original >= large and second_total > 0.0 and welfare2_available > 0.0:
+            result += target_second_original / second_total * welfare2_available
+
+        allocated_total = gift_total
+        if layer1_total > 0.0:
+            allocated_total += layer1_available
+        if layer2_total > 0.0:
+            allocated_total += LAYER2_TOTAL_CPI
+        if first_total > 0.0 and welfare1_available > 0.0:
+            allocated_total += welfare1_available
+        if second_total > 0.0 and welfare2_available > 0.0:
+            allocated_total += welfare2_available
+        if allocated_total > INDEX_CPI_TOTAL:
+            result *= INDEX_CPI_TOTAL / allocated_total
+        return result
+
 
 class PreparedCityCPI:
     """Reusable exact target evaluator while the other companies stay fixed.
@@ -737,6 +993,33 @@ class PreparedCityCPI:
             float(e["mi_investment"]) * agent_mi_benefit(e.get("agents", 0)) for e in entries
         ], mi_large, self.target, unlimited_above_cap=True)
         self.price_weights = self._price_weights(float(market_average_price)) if market_average_price is not None else []
+        # Rival prices are invariant throughout one Super Bot search. Hoist
+        # the fitted curve terms and memoize the small set of target prices.
+        self._curve_terms = [self._curve_term(price) for price in self.prices]
+        self._target_curve_terms: dict[float, tuple[float, float]] = {}
+
+    def _curve_term(self, price: float) -> tuple[float, float]:
+        if price <= 0.0:
+            return (1.0, 0.0)
+        curve = investment_price_curve(price, self.max_price)
+        return (curve, price)
+
+    def _factors(self, average: float, price: float) -> list[float]:
+        terms = self._curve_terms.copy()
+        target_term = self._target_curve_terms.get(price)
+        if target_term is None:
+            target_term = self._curve_term(price)
+            self._target_curve_terms[price] = target_term
+        terms[self.target] = target_term
+        if average <= 0.0:
+            return [curve for curve, _ in terms]
+        # Keep the canonical operation order: (average / price) * curve.
+        # Reassociating these multiplications changes the final bit on some
+        # values and can perturb an otherwise exact candidate tie-break.
+        return [
+            (average / original_price) * curve if original_price > 0.0 else 1.0
+            for curve, original_price in terms
+        ]
 
     def _price_weights(self, average: float) -> list[float]:
         return [(average - price) ** self.power if price > 0 and price <= average else 0.0 for price in self.prices]
@@ -758,9 +1041,9 @@ class PreparedCityCPI:
             for pool in ("ma", "qi", "mi")
         }
         market_average = sum(prices) / len(prices) if self.market_average is None else float(self.market_average)
-        qi_factors = _investment_price_factors(prices, averages["qi"], self.max_price)
-        ma_factors = _investment_price_factors(prices, averages["ma"], self.max_price)
-        mi_factors = _investment_price_factors(prices, averages["mi"], self.max_price)
+        qi_factors = self._factors(averages["qi"], price)
+        ma_factors = self._factors(averages["ma"], price)
+        mi_factors = self._factors(averages["mi"], price)
         qi_cpi = self.qi.evaluate(qi_index, qi_factors)
         ma_cpi = self.ma.evaluate(ma_index, ma_factors)
         benefit = self.agent_benefit if agents is None else agent_mi_benefit(agents)
