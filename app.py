@@ -886,6 +886,32 @@ def salary_bounds(settings: dict[str, Any], previous: float) -> tuple[float, flo
     return max(minimum, reference - limit), min(maximum, reference + limit)
 
 
+def player_decision_widget_prefix(company_id: int, round_no: int) -> str:
+    """Return the stable widget namespace for one player's round draft."""
+    return f"player_decision_draft:{int(company_id)}:{int(round_no)}:"
+
+
+def retain_player_decision_draft(company_id: int, round_no: int) -> None:
+    """Keep unsubmitted decision widgets alive while another page is shown.
+
+    Streamlit normally removes widget state when a widget is absent from the
+    current run. Reassigning the current value before navigation detaches it
+    from that cleanup cycle, so the same round's inputs are restored when the
+    player returns from Overview, Ranking, Reports or KDS.
+    """
+    prefix = player_decision_widget_prefix(company_id, round_no)
+    for key in tuple(st.session_state):
+        if isinstance(key, str) and key.startswith(prefix):
+            st.session_state[key] = st.session_state[key]
+
+
+def clear_player_decision_draft(company_id: int, round_no: int) -> None:
+    prefix = player_decision_widget_prefix(company_id, round_no)
+    for key in tuple(st.session_state):
+        if isinstance(key, str) and key.startswith(prefix):
+            del st.session_state[key]
+
+
 def render_submitted_decision(
     decision: dict[str, Any],
     city_values: dict[str, dict[str, Any]],
@@ -1006,7 +1032,8 @@ def render_player_decision(company: sqlite3.Row) -> None:
         st.error("本轮提交时间已结束，请等待管理员结算。")
         return
 
-    with st.form(f"decision_{round_no}"):
+    widget_prefix = player_decision_widget_prefix(int(company["id"]), round_no)
+    with st.container():
         loan_min = -float(company["debt"])
         loan_max = max(0.0, loan_limit)
         with st.expander("💰 银行贷款", expanded=True):
@@ -1021,6 +1048,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 max_value=loan_max,
                 value=min(max(float(decision["loan_change"]), loan_min), loan_max),
                 step=10_000.0,
+                key=f"{widget_prefix}loan_change",
             )
 
         with st.expander("👥 人力资源", expanded=True):
@@ -1030,6 +1058,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 min_value=-current_workers,
                 value=int(decision["worker_delta"]),
                 step=1,
+                key=f"{widget_prefix}worker_delta",
             )
             worker_salary = worker_right.number_input(
                 "工人月薪",
@@ -1037,6 +1066,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 max_value=worker_salary_high,
                 value=min(max(float(decision["worker_salary"]), worker_salary_low), worker_salary_high),
                 step=50.0,
+                key=f"{widget_prefix}worker_salary",
             )
             engineer_left, engineer_right = st.columns(2)
             engineer_delta = engineer_left.number_input(
@@ -1044,6 +1074,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 min_value=-current_engineers,
                 value=int(decision["engineer_delta"]),
                 step=1,
+                key=f"{widget_prefix}engineer_delta",
             )
             engineer_salary = engineer_right.number_input(
                 "工程师月薪",
@@ -1051,6 +1082,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 max_value=engineer_salary_high,
                 value=min(max(float(decision["engineer_salary"]), engineer_salary_low), engineer_salary_high),
                 step=50.0,
+                key=f"{widget_prefix}engineer_salary",
             )
             st.caption(
                 f"当前：工人 {current_workers:,}、工程师 {current_engineers:,}。新员工按全局 KDS 收取培训费；第三轮起老员工享受经验倍率。"
@@ -1063,12 +1095,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 min_value=0,
                 value=int(decision["production_volume"]),
                 step=1,
+                key=f"{widget_prefix}production_volume",
             )
             management = production_right.number_input(
                 "管理投入（MA）",
                 min_value=0.0,
                 value=float(decision["management_investment"]),
                 step=10_000.0,
+                key=f"{widget_prefix}management_investment",
             )
             quality_left, research_right = st.columns(2)
             quality = quality_left.number_input(
@@ -1076,12 +1110,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
                 min_value=0.0,
                 value=float(decision["quality_investment"]),
                 step=10_000.0,
+                key=f"{widget_prefix}quality_investment",
             )
             research = research_right.number_input(
                 "研发 / 专利投入（R&D）",
                 min_value=0.0,
                 value=float(decision["research_investment"]),
                 step=10_000.0,
+                key=f"{widget_prefix}research_investment",
             )
 
         st.markdown("### 🏙️ 城市销售")
@@ -1099,14 +1135,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
                     max_value=int(settings["max_agent_add_per_city_round"]),
                     value=int(values["agent_delta"]),
                     step=1,
-                    key=f"agent_{round_no}_{city}",
+                    key=f"{widget_prefix}city:{city}:agent_delta",
                 )
                 marketing = c2.number_input(
                     "营销投入（MI）",
                     min_value=0.0,
                     value=float(values["marketing_investment"]),
                     step=10_000.0,
-                    key=f"mi_{round_no}_{city}",
+                    key=f"{widget_prefix}city:{city}:marketing_investment",
                 )
                 city_max = min(float(settings["price_max"]), float(market["max_price"]))
                 saved_price = min(max(float(values["price"]), float(settings["price_min"])), city_max)
@@ -1116,9 +1152,13 @@ def render_player_decision(company: sqlite3.Row) -> None:
                     max_value=city_max,
                     value=saved_price,
                     step=50.0,
-                    key=f"price_{round_no}_{city}",
+                    key=f"{widget_prefix}city:{city}:price",
                 )
-                order_report = c4.checkbox("购买市场报告", value=bool(values["order_report"]), key=f"report_{round_no}_{city}")
+                order_report = c4.checkbox(
+                    "购买市场报告",
+                    value=bool(values["order_report"]),
+                    key=f"{widget_prefix}city:{city}:order_report",
+                )
                 city_inputs[city] = {
                     "agent_delta": int(agent_delta),
                     "marketing_investment": float(marketing),
@@ -1126,7 +1166,12 @@ def render_player_decision(company: sqlite3.Row) -> None:
                     "order_report": int(order_report),
                     "current_agents": int(values["current_agents"]),
                 }
-        submitted = st.form_submit_button("保存并提交本轮决策", type="primary", use_container_width=True)
+        submitted = st.button(
+            "保存并提交本轮决策",
+            type="primary",
+            use_container_width=True,
+            key=f"player_decision_submit:{int(company['id'])}:{round_no}",
+        )
 
     if submitted:
         errors: list[str] = []
@@ -1175,6 +1220,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
                     (company["id"], round_no, city, values["agent_delta"], values["marketing_investment"], values["price"], values["order_report"]),
                 )
         flash("success", "本轮决策已提交并锁定。")
+        clear_player_decision_draft(int(company["id"]), round_no)
         st.rerun()
 
 
@@ -2594,6 +2640,8 @@ def main() -> None:
         player_setup_header(company)
         render_setup(company)
         return
+    if round_row:
+        retain_player_decision_draft(company_id, int(round_row["round_no"]))
     if not _running_under_app_test():
         watch_player_round(_round_state_token(round_row, final_release_round))
     final_results_released = bool(
