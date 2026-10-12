@@ -18,7 +18,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 8
+DB_API_VERSION = 9
 
 
 def now_iso() -> str:
@@ -121,6 +121,7 @@ def init_db() -> None:
                 product_inventory INTEGER NOT NULL DEFAULT 0,
                 is_bot INTEGER NOT NULL DEFAULT 0,
                 is_super_bot INTEGER NOT NULL DEFAULT 0,
+                is_disruptor_bot INTEGER NOT NULL DEFAULT 0,
                 bot_profile INTEGER NOT NULL DEFAULT 0,
                 component_storage_capacity INTEGER NOT NULL DEFAULT 0,
                 product_storage_capacity INTEGER NOT NULL DEFAULT 0,
@@ -263,6 +264,7 @@ def init_db() -> None:
                 player_count INTEGER NOT NULL DEFAULT 4 CHECK(player_count >= 0),
                 bot_count INTEGER NOT NULL DEFAULT 0 CHECK(bot_count >= 0),
                 super_bot_count INTEGER NOT NULL DEFAULT 0 CHECK(super_bot_count >= 0),
+                disruptor_bot_count INTEGER NOT NULL DEFAULT 0 CHECK(disruptor_bot_count >= 0),
                 lease_owner TEXT,
                 lease_phase TEXT,
                 lease_expires_at TEXT,
@@ -285,8 +287,25 @@ def init_db() -> None:
             conn.execute("ALTER TABLE companies ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
         if "is_super_bot" not in company_columns:
             conn.execute("ALTER TABLE companies ADD COLUMN is_super_bot INTEGER NOT NULL DEFAULT 0")
+        if "is_disruptor_bot" not in company_columns:
+            conn.execute("ALTER TABLE companies ADD COLUMN is_disruptor_bot INTEGER NOT NULL DEFAULT 0")
+        # The disruptor role is a specialised Super Bot.  Normalise imported
+        # or partially migrated rows so every downstream `is_super_bot=1`
+        # safety gate (drafting, finalisation and settlement) includes it.
+        conn.execute(
+            "UPDATE companies SET is_bot=1,is_super_bot=1 "
+            "WHERE is_disruptor_bot=1"
+        )
         if "bot_profile" not in company_columns:
             conn.execute("ALTER TABLE companies ADD COLUMN bot_profile INTEGER NOT NULL DEFAULT 0")
+        runtime_columns = {
+            row["name"] for row in all_rows(conn, "PRAGMA table_info(ai_training_runtime)")
+        }
+        if "disruptor_bot_count" not in runtime_columns:
+            conn.execute(
+                "ALTER TABLE ai_training_runtime ADD COLUMN disruptor_bot_count "
+                "INTEGER NOT NULL DEFAULT 0 CHECK(disruptor_bot_count >= 0)"
+            )
         decision_columns = {row["name"] for row in all_rows(conn, "PRAGMA table_info(decisions)")}
         if "is_draft" not in decision_columns:
             conn.execute("ALTER TABLE decisions ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0")
@@ -314,11 +333,12 @@ def init_db() -> None:
             conn.execute("INSERT INTO rounds(round_no,status) VALUES(1,'waiting')")
         conn.execute(
             "INSERT OR IGNORE INTO ai_training_runtime("
-            "id,enabled,player_count,bot_count,super_bot_count,updated_at"
+            "id,enabled,player_count,bot_count,super_bot_count,disruptor_bot_count,updated_at"
             ") SELECT 1,0,"
             "COALESCE(SUM(CASE WHEN is_bot=0 THEN 1 ELSE 0 END),0),"
             "COALESCE(SUM(CASE WHEN is_bot=1 AND is_super_bot=0 THEN 1 ELSE 0 END),0),"
-            "COALESCE(SUM(CASE WHEN is_super_bot=1 THEN 1 ELSE 0 END),0),? FROM companies",
+            "COALESCE(SUM(CASE WHEN is_super_bot=1 AND is_disruptor_bot=0 THEN 1 ELSE 0 END),0),"
+            "COALESCE(SUM(CASE WHEN is_disruptor_bot=1 THEN 1 ELSE 0 END),0),? FROM companies",
             (now_iso(),),
         )
 
@@ -396,7 +416,7 @@ def current_round(conn: sqlite3.Connection) -> sqlite3.Row | None:
 def capture_round_snapshot(conn: sqlite3.Connection, round_no: int) -> None:
     """Store the exact mutable competition state before a round is settled."""
     company_columns = (
-        "id,code,name,home_city,cash,debt,patents,research_balance,component_inventory,product_inventory,is_bot,is_super_bot,bot_profile,"
+        "id,code,name,home_city,cash,debt,patents,research_balance,component_inventory,product_inventory,is_bot,is_super_bot,is_disruptor_bot,bot_profile,"
         "component_storage_capacity,product_storage_capacity,setup_submitted_at"
     )
     snapshot = {
@@ -448,6 +468,7 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
                 "product_inventory": int(previous_result["inventory"]) if previous_result is not None else 0,
                 "is_bot": int(company.get("is_bot", 0)),
                 "is_super_bot": int(company.get("is_super_bot", 0)),
+                "is_disruptor_bot": int(company.get("is_disruptor_bot", 0)),
                 "bot_profile": int(company.get("bot_profile", 0)),
                 "component_storage_capacity": int(production.get("component_storage_after", 0)),
                 "product_storage_capacity": int(production.get("product_storage_after", 0)),
@@ -502,7 +523,7 @@ def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) 
     existing_company_ids = {int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies")}
     existing_cities = {str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config")}
     company_fields = (
-        "name=?,home_city=?,cash=?,debt=?,patents=?,research_balance=?,component_inventory=?,product_inventory=?,is_bot=?,is_super_bot=?,bot_profile=?,"
+        "name=?,home_city=?,cash=?,debt=?,patents=?,research_balance=?,component_inventory=?,product_inventory=?,is_bot=?,is_super_bot=?,is_disruptor_bot=?,bot_profile=?,"
         "component_storage_capacity=?,product_storage_capacity=?,setup_submitted_at=?"
     )
     for company in snapshot.get("companies", []):
@@ -510,6 +531,9 @@ def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) 
         if company_id not in existing_company_ids:
             continue
         restored_home = company.get("home_city") if company.get("home_city") in existing_cities else None
+        restored_disruptor = int(bool(company.get("is_disruptor_bot", 0)))
+        restored_super = max(int(bool(company.get("is_super_bot", 0))), restored_disruptor)
+        restored_bot = max(int(bool(company.get("is_bot", 0))), restored_super)
         conn.execute(
             f"UPDATE companies SET {company_fields} WHERE id=?",
             (
@@ -517,7 +541,8 @@ def _restore_snapshot_state(conn: sqlite3.Connection, snapshot: dict[str, Any]) 
                 float(company.get("debt", 0)), int(company.get("patents", 0)),
                 float(company.get("research_balance", 0)),
                 int(company.get("component_inventory", 0)), int(company.get("product_inventory", 0)),
-                int(company.get("is_bot", 0)), int(company.get("is_super_bot", 0)), int(company.get("bot_profile", 0)), int(company.get("component_storage_capacity", 0)),
+                restored_bot, restored_super, restored_disruptor,
+                int(company.get("bot_profile", 0)), int(company.get("component_storage_capacity", 0)),
                 int(company.get("product_storage_capacity", 0)),
                 company.get("setup_submitted_at") if restored_home else None,
                 company_id,
@@ -710,9 +735,17 @@ def reset_competition(conn: sqlite3.Connection) -> None:
     for table in ("round_bonuses", "round_snapshots", "market_round_stats", "city_results", "results", "city_decisions", "decisions", "agents", "employee_cohorts", "rounds"):
         conn.execute(f"DELETE FROM {table}")
     initial_cash = get_setting(conn, "initial_cash", 15_000_000)
+    conn.execute(
+        "UPDATE companies SET is_bot=1,is_super_bot=1 "
+        "WHERE is_disruptor_bot=1"
+    )
     homes = [str(row["city"]) for row in all_rows(conn, "SELECT city FROM market_config WHERE home_enabled=1 ORDER BY city")]
     ranked_super_homes = ranked_bot_home_cities(conn)
-    for company in all_rows(conn, "SELECT id,code,is_bot,is_super_bot,bot_profile FROM companies ORDER BY id"):
+    for company in all_rows(
+        conn,
+        "SELECT id,code,name,is_bot,is_super_bot,is_disruptor_bot,bot_profile "
+        "FROM companies ORDER BY id",
+    ):
         if bool(company["is_bot"]) and homes:
             home_pool = ranked_super_homes if bool(company["is_super_bot"]) and ranked_super_homes else homes
             # Keep Super Bots diverse without assigning them to weak homes:
@@ -722,7 +755,7 @@ def reset_competition(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE companies SET name=?,home_city=?,setup_submitted_at=?,cash=?,debt=0,patents=0,research_balance=0,"
                 "component_inventory=0,product_inventory=0,component_storage_capacity=0,product_storage_capacity=0 WHERE id=?",
-                (f"Auto Company {company['id']}", home, now_iso(), initial_cash, company["id"]),
+                (str(company["name"]), home, now_iso(), initial_cash, company["id"]),
             )
             conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (company["id"], home))
         else:

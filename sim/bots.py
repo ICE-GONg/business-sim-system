@@ -24,10 +24,20 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 32
+BOT_API_VERSION = 33
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
+
+
+def super_bot_analysis_order(
+    conn: sqlite3.Connection,
+    round_no: int,
+) -> list[int]:
+    """Public worker-facing alias for the shared AI analysis order."""
+    from .ai_training import super_bot_analysis_order as resolve_order
+
+    return list(resolve_order(conn, round_no))
 
 
 def _forecast_candidate_task(payload: dict[str, Any]) -> dict[str, Any]:
@@ -139,6 +149,9 @@ def _super_target_pressure(
     Tier ordering is separate from monetary value and each unit is counted once.
     """
     targets = []
+    human_damage = 0.0
+    strategic_super_damage = 0.0
+    ordinary_bot_damage = 0.0
     for player in players:
         company_id = int(player["company_id"])
         first = before["companies"].get(company_id, {})
@@ -155,19 +168,242 @@ def _super_target_pressure(
             * float(city_data["price"])
             for city, city_data in player["cities"].items()
         )
-        if (lost_units < max(1.0, float(first.get("sold_total", 0)) * 0.005)
-                or lost_revenue <= 0 or cpi_drop < 0.05):
+        secondary_denied = sum(
+            max(
+                0.0,
+                float(
+                    first.get("secondary_by_category", {})
+                    .get(city, {})
+                    .get("investment", 0.0)
+                )
+                - float(
+                    last.get("secondary_by_category", {})
+                    .get(city, {})
+                    .get("investment", 0.0)
+                ),
+            )
+            for city in player["cities"]
+        )
+        is_human = bool(player.get("is_human", False))
+        is_super = bool(player.get("is_super", False))
+        is_disruptor = bool(player.get("is_disruptor", False))
+        effective_damage = max(0.0, lost_revenue)
+        if is_human:
+            human_damage += effective_damage
+        elif is_super and not is_disruptor:
+            strategic_super_damage += effective_damage
+        else:
+            ordinary_bot_damage += effective_damage
+        if (
+            lost_units < max(1.0, float(first.get("sold_total", 0)) * 0.005)
+            or lost_revenue <= 0
+            or (cpi_drop < 0.05 and secondary_denied < 1.0)
+        ):
             continue
         targets.append({
             "targeted_damage": lost_revenue,
             "target_tier": int(player.get("attack_weight", 0)),
             "target_cpi_drop": cpi_drop,
             "target_surplus": lost_units,
+            "target_secondary_denied": secondary_denied,
             "target_company_id": company_id,
+            "target_is_human": is_human,
+            "target_is_super": is_super,
         })
-    return max(targets, key=lambda row: (row["target_tier"], row["targeted_damage"]),
-               default={"targeted_damage": 0.0, "target_tier": 0,
-                        "target_cpi_drop": 0.0, "target_surplus": 0.0})
+    selected = max(
+        targets,
+        key=lambda row: (
+            bool(row["target_is_human"]),
+            row["target_tier"],
+            row["target_cpi_drop"],
+            row["target_secondary_denied"],
+            row["targeted_damage"],
+        ),
+        default={
+            "targeted_damage": 0.0,
+            "target_tier": 0,
+            "target_cpi_drop": 0.0,
+            "target_surplus": 0.0,
+            "target_secondary_denied": 0.0,
+            "target_is_human": False,
+            "target_is_super": False,
+        },
+    )
+    return {
+        **selected,
+        "human_damage": human_damage,
+        "strategic_super_damage": strategic_super_damage,
+        "ordinary_bot_damage": ordinary_bot_damage,
+    }
+
+
+def _select_disruptor_early_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    leader_assets: float,
+) -> dict[str, Any] | None:
+    """Shadow the leader near 70% while preserving the strategic Super field.
+
+    The hidden role is not allowed to throw a healthy company away before its
+    attack window.  Exact ending assets are preferred inside a 65--75% band;
+    otherwise the closest solvent plan wins.  Damage to already analysed
+    strategic Super Bots is an explicit tie-break so the disruptor takes a
+    different CPI/price route instead of accidentally countering its allies.
+    """
+    valid = [
+        row for row in candidates
+        if math.isfinite(float(row.get("ending_assets", -math.inf)))
+        and float(row.get("ending_assets", -math.inf)) > 0.0
+        and math.isfinite(float(row.get("risk_profit", -math.inf)))
+    ]
+    if not valid:
+        return None
+    resolved_leader = max(1.0, float(leader_assets))
+    target = resolved_leader * 0.70
+    in_band = [
+        row for row in valid
+        if 0.65 <= float(row.get("ending_assets", 0.0)) / resolved_leader <= 0.75
+    ]
+    if in_band:
+        return max(
+            in_band,
+            key=lambda row: (
+                -float(row.get("strategic_super_damage", 0.0)),
+                -abs(float(row.get("ending_assets", 0.0)) - target),
+                float(row.get("risk_profit", -math.inf)),
+                float(row.get("predicted_profit", -math.inf)),
+            ),
+        )
+    return max(
+        valid,
+        key=lambda row: (
+            -abs(float(row.get("ending_assets", 0.0)) - target),
+            -float(row.get("strategic_super_damage", 0.0)),
+            float(row.get("risk_profit", -math.inf)),
+            float(row.get("predicted_profit", -math.inf)),
+        ),
+    )
+
+
+def _select_disruptor_attack_candidate(
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Choose a late exact attack, prioritising players and redistribution.
+
+    CPI suppression and denied *investment* secondary allocation are scored
+    before the disruptor's own profit.  This deliberately permits a costly
+    final attack, but only when the settlement forecast shows real lost sales
+    or secondary capacity rather than a cosmetic investment increase.
+    """
+    valid = [
+        row for row in candidates
+        if math.isfinite(float(row.get("predicted_profit", -math.inf)))
+    ]
+    if not valid:
+        return None
+    attacks = [
+        row for row in valid
+        if int(row.get("target_tier", 0)) > 0
+        and (
+            float(row.get("target_cpi_drop", 0.0)) > 0.0
+            or float(row.get("target_secondary_denied", 0.0)) > 0.0
+            or float(row.get("target_surplus", 0.0)) > 0.0
+        )
+    ]
+    if not attacks:
+        return max(
+            valid,
+            key=lambda row: (
+                float(row.get("rival_damage", 0.0)),
+                float(row.get("effective_capacity", 0.0)),
+                float(row.get("marketing_total", 0.0)),
+                float(row.get("ma", 0.0)) + float(row.get("qi", 0.0)),
+                -float(row.get("price_ratio", 1.0)),
+            ),
+        )
+    # If a human can actually be hurt, an ordinary/Super Bot cannot distract
+    # the disruptor with a larger but strategically irrelevant profit pool.
+    human_attacks = [row for row in attacks if bool(row.get("target_is_human", False))]
+    pool = human_attacks or attacks
+    best_tier = max(int(row.get("target_tier", 0)) for row in pool)
+    pool = [row for row in pool if int(row.get("target_tier", 0)) == best_tier]
+    return max(
+        pool,
+        key=lambda row: (
+            float(row.get("target_cpi_drop", 0.0)),
+            float(row.get("target_secondary_denied", 0.0)),
+            float(row.get("target_surplus", 0.0)),
+            float(row.get("targeted_damage", 0.0)),
+            float(row.get("secondary_capacity", 0.0)),
+            float(row.get("marketing_total", 0.0)),
+            float(row.get("ma", 0.0)) + float(row.get("qi", 0.0)),
+            -float(row.get("price_ratio", 1.0)),
+        ),
+    )
+
+
+def _disruptor_floor_lock_prices(
+    *,
+    disruptor_ids: list[int],
+    designated_company_id: int,
+    market_max_prices: dict[str, float],
+    coverable_cities: list[str],
+    price_min: float,
+) -> dict[int, dict[str, float]]:
+    """Lock only stock-covered cities at ``minimum + 1``.
+
+    A dedicated late disruptor uses a pure-price route.  Its inventory is
+    assigned to the most valuable player-pressure cities first; each city
+    consumes its estimated 40-CPI price capacity.  Cities that cannot be fully
+    served stay at their KDS maximum so an empty low-price allocation never
+    falls back into the price-only secondary pool.  At least one city is locked
+    whenever stock exists, which makes this role a deterministic price anchor.
+    """
+    coverable = {str(city) for city in coverable_cities}
+    result: dict[int, dict[str, float]] = {}
+    for company_id in disruptor_ids:
+        result[int(company_id)] = {
+            str(city): (
+                min(float(max_price), max(0.0, float(price_min)) + 1.0)
+                if int(company_id) == int(designated_company_id)
+                and str(city) in coverable
+                else float(max_price)
+            )
+            for city, max_price in market_max_prices.items()
+        }
+    return result
+
+
+def _disruptor_coverable_cities(
+    city_options: list[dict[str, Any]],
+    *,
+    available_units: float,
+) -> list[str]:
+    """Choose whole low-price pools that the designated Bot can stock."""
+    if not city_options or available_units <= 0:
+        return []
+    ordered = sorted(
+        city_options,
+        key=lambda option: (
+            -float(option.get("attack_weight", 0.0)),
+            float(option.get("lock_units", 0.0)),
+            str(option["city"]),
+        ),
+    )
+    remaining = max(0.0, float(available_units))
+    coverable: list[str] = []
+    for option in ordered:
+        required = max(1.0, float(option.get("lock_units", 0.0)))
+        if remaining + 1e-9 < required:
+            continue
+        coverable.append(str(option["city"]))
+        remaining -= required
+    # The designated role must always establish one price floor. Full-output
+    # search normally makes this branch unnecessary; it is a safe fallback for
+    # an unusually expensive KDS where not even the smallest pool fits.
+    if not coverable:
+        coverable.append(str(ordered[0]["city"]))
+    return coverable
 
 
 def _apply_super_settlement_forecast(
@@ -1030,6 +1266,14 @@ def _rebalance_super_bot_production(
         total_rounds=total_rounds,
         markets_saturated=_all_markets_near_capacity(conn, round_no, markets),
     )
+    if round_no >= 1 and official_round >= max(1, total_rounds - 1):
+        preserve_ids.update(
+            int(row["id"])
+            for row in all_rows(
+                conn,
+                "SELECT id FROM companies WHERE is_bot=1 AND is_disruptor_bot=1",
+            )
+        )
     if not all_super_field:
         _coordinate_super_bot_prices(conn, round_no, markets, preserve_ids=preserve_ids)
 
@@ -1057,6 +1301,8 @@ def _rebalance_super_bot_production(
         # investment CPI from distorting the next secondary pass.
         pruned_routes = False
         for company_id, forecast in field_forecast["companies"].items():
+            if int(company_id) in preserve_ids:
+                continue
             sold_units = forecast.get("sold_units", {})
             for route in all_rows(
                 conn,
@@ -1249,6 +1495,24 @@ def _submit_bots(
         "SELECT * FROM companies WHERE is_bot=1 AND is_super_bot=? ORDER BY id",
         (int(super_mode),),
     )
+    if super_mode and bots:
+        # The order is a game rule: before the attack window strategic Super
+        # Bots move first and disruptors shadow them; in the last two official
+        # rounds disruptors commit first so the strategic models can react.
+        from .ai_training import super_bot_analysis_order
+
+        order = list(super_bot_analysis_order(conn, round_no))
+        order_index = {company_id: index for index, company_id in enumerate(order)}
+        bots = sorted(
+            bots,
+            key=lambda row: (order_index.get(int(row["id"]), len(order)), int(row["id"])),
+        )
+    disruptor_ids = [
+        int(row["id"])
+        for row in bots
+        if int(row["is_disruptor_bot"] or 0)
+    ] if super_mode else []
+    floor_lock_company_id = min(disruptor_ids, default=0)
     markets = [dict(row) for row in all_rows(conn, "SELECT * FROM market_config ORDER BY city")]
     if not bots or not markets:
         return 0
@@ -1296,7 +1560,8 @@ def _submit_bots(
     benchmark_round = int(benchmark_round_row["round_no"] or 0) if benchmark_round_row else 0
     ranked_rows = [dict(row) for row in all_rows(
         conn,
-        "SELECT c.id,c.is_bot,c.is_super_bot,r.net_assets,r.net_profit,r.sales_revenue "
+        "SELECT c.id,c.is_bot,c.is_super_bot,c.is_disruptor_bot,"
+        "r.net_assets,r.net_profit,r.sales_revenue "
         "FROM companies c JOIN results r ON r.company_id=c.id "
         "WHERE r.round_no=? ORDER BY r.net_assets DESC,c.id",
         (benchmark_round,),
@@ -1311,11 +1576,18 @@ def _submit_bots(
         )
         for row in ranked_rows
     }
+    prior_leader_assets = (
+        max(1.0, float(ranked_rows[0]["net_assets"] or 0.0))
+        if ranked_rows else None
+    )
     ranked_super_ids = [
-        int(row["id"]) for row in ranked_rows if int(row["is_super_bot"] or 0)
+        int(row["id"]) for row in ranked_rows
+        if int(row["is_super_bot"] or 0) and not int(row["is_disruptor_bot"] or 0)
     ]
     ranked_super_ids.extend(
-        int(bot["id"]) for bot in bots if int(bot["id"]) not in ranked_super_ids
+        int(bot["id"]) for bot in bots
+        if not int(bot["is_disruptor_bot"] or 0)
+        and int(bot["id"]) not in ranked_super_ids
     )
     competitive_super_ids = (
         _competitive_super_attackers(
@@ -1418,6 +1690,7 @@ def _submit_bots(
             and (target_ids is None or int(saved["id"]) in target_ids)
         )
     }
+    order_position = {int(row["id"]): index for index, row in enumerate(bots)}
     for bot_position, bot_row in enumerate(bots):
         bot = dict(bot_row)
         company_id = int(bot["id"])
@@ -1428,7 +1701,7 @@ def _submit_bots(
             # synthetic later peers. Never delete the old saved drafts here.
             frozen_super_ids = {
                 int(saved["id"]) for saved in bots
-                if int(saved["id"]) < company_id and one(
+                if order_position[int(saved["id"])] < bot_position and one(
                     conn, "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?",
                     (int(saved["id"]), round_no),
                 )
@@ -1440,11 +1713,30 @@ def _submit_bots(
         )
         if existing_decision and not replace_existing:
             continue
-        competitive_mode = bool(super_mode and company_id in competitive_super_ids)
+        is_disruptor = bool(super_mode and int(bot["is_disruptor_bot"] or 0))
+        late_disruptor = bool(
+            is_disruptor
+            and round_no >= 1
+            and official_round >= max(1, total_rounds - 1)
+        )
+        floor_lock_disruptor = bool(
+            late_disruptor and company_id == floor_lock_company_id
+        )
+        competitive_mode = bool(
+            super_mode
+            and (late_disruptor or company_id in competitive_super_ids)
+        )
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
         profit_target = 0.0
-        if super_mode:
-            previous_super_id = int(bots[bot_position - 1]["id"]) if bot_position > 0 else None
+        if super_mode and not is_disruptor:
+            previous_super_id = next(
+                (
+                    int(previous["id"])
+                    for previous in reversed(bots[:bot_position])
+                    if not int(previous["is_disruptor_bot"] or 0)
+                ),
+                None,
+            )
             profit_target = _super_profit_target(
                 conn, company_id, round_no, previous_super_id,
             )
@@ -1603,7 +1895,7 @@ def _submit_bots(
         research_needed = max(0.0, research_goal - research_balance)
         research = 0.0
 
-        rival_metrics: dict[int, list[dict[str, float]]] = {index: [] for index in range(len(markets))}
+        rival_metrics: dict[int, list[dict[str, Any]]] = {index: [] for index in range(len(markets))}
         if super_mode:
             rival_asset_weights: dict[int, float] = {}
             own_rank = rank_by_company.get(company_id, len(rank_by_company) + 1)
@@ -1654,7 +1946,8 @@ def _submit_bots(
                 conn,
                 "SELECT d.company_id,d.worker_delta,d.engineer_delta,d.management_investment,d.production_volume,"
                 "d.quality_investment,cd.city,cd.agent_delta,cd.marketing_investment,cd.price,c.product_inventory,"
-                "c.is_bot AS rival_is_bot,c.is_super_bot AS rival_is_super "
+                "c.is_bot AS rival_is_bot,c.is_super_bot AS rival_is_super,"
+                "c.is_disruptor_bot AS rival_is_disruptor "
                 "FROM decisions d JOIN companies c ON c.id=d.company_id "
                 "JOIN city_decisions cd ON cd.company_id=d.company_id AND cd.round_no=d.round_no "
                 "WHERE d.round_no=? AND d.submitted_at IS NOT NULL AND d.company_id<>?",
@@ -1703,6 +1996,9 @@ def _submit_bots(
                     "mi_effective": mi_effective,
                     "price": float(rival["price"] or 0),
                     "agents": float(agents),
+                    "is_human": not bool(rival["rival_is_bot"]),
+                    "is_super": bool(rival["rival_is_super"]),
+                    "is_disruptor": bool(rival["rival_is_disruptor"]),
                     "attack_weight": attack_priority(
                         int(rival["company_id"]),
                         rival_is_bot=bool(rival["rival_is_bot"]),
@@ -1724,6 +2020,16 @@ def _submit_bots(
                 other = dict(other_row)
                 other_id = int(other["id"])
                 if other_id == company_id or other_id in frozen_super_ids:
+                    continue
+                # During the final attack window a disruptor acts only on the
+                # live human/ordinary field and earlier saved disruptors.  It
+                # must not make room for a hypothetical strategic Super plan
+                # that has not been analysed yet.  Before that window the
+                # strategic Super group likewise moves without anticipating
+                # hidden disruptors; those disruptors then observe and avoid it.
+                if late_disruptor:
+                    continue
+                if not is_disruptor and int(other["is_disruptor_bot"] or 0):
                     continue
                 other_profile = int(other["bot_profile"] if other["bot_profile"] is not None else other_id) % 7
                 other_style = BOT_STYLES[other_profile]
@@ -1832,6 +2138,9 @@ def _submit_bots(
                         "mi_effective": default_mi,
                         "price": expected_price,
                         "agents": float(other_agents),
+                        "is_human": False,
+                        "is_super": True,
+                        "is_disruptor": bool(other["is_disruptor_bot"]),
                         "attack_weight": attack_priority(
                             other_id,
                             rival_is_bot=True,
@@ -2220,7 +2529,7 @@ def _submit_bots(
                         average_ceiling - (average_ceiling - cost_floor) * pressure_depth
                         if average_ceiling >= cost_floor else cost_floor
                     )
-                elif super_mode and price_ratio_override is not None:
+                elif super_mode and price_ratio_override is not None and not late_disruptor:
                     # An explicit optimiser candidate may run a pure low-price
                     # strategy. Candidate scoring already rejects a total-plan
                     # loss, so only protect the direct unit contribution here.
@@ -2591,7 +2900,14 @@ def _submit_bots(
                         else min(0.98, max(0.75, high_price_ratio))
                     )
                     candidate_price = cap * effective_ratio
-                    candidate_price = min(cap, max(price_min, candidate_price, direct_unit_cost * 1.03))
+                    candidate_price = min(
+                        cap,
+                        max(
+                            price_min,
+                            candidate_price,
+                            0.0 if late_disruptor else direct_unit_cost * 1.03,
+                        ),
+                    )
                     own_weight = max(1.0, candidate_available / active_market_count)
                     average_price = average_evaluator.resolve(
                         ma_index=candidate_ma,
@@ -2812,8 +3128,7 @@ def _submit_bots(
                 # Pure-price path is always retained.
                 test_candidate(1.0, 1.0, 0.0, candidate_price_ratio)
                 first_full_low_price = bool(
-                    all_super_field
-                    and bot_position == 0
+                    (floor_lock_disruptor or (all_super_field and bot_position == 0))
                     and candidate_price_ratio < 0.75
                 )
                 if first_full_low_price:
@@ -2864,6 +3179,15 @@ def _submit_bots(
                     include_shortlist(sorted(candidate_values,
                         key=lambda row: float(row["predicted_profit"]) + float(row["rival_damage"]),
                         reverse=True), 8)
+                if late_disruptor:
+                    # Exact verification, not own profit, decides a self-
+                    # destruct attack. Retain the strongest pressure extremes
+                    # even when their preliminary P&L is deeply negative.
+                    include_shortlist(sorted(
+                        candidate_values,
+                        key=lambda row: float(row.get("rival_damage", 0.0)),
+                        reverse=True,
+                    ), 20)
                 include_shortlist(sorted(candidate_values,
                     key=lambda row: float(row["marketing_total"]), reverse=True))
                 include_shortlist(sorted(candidate_values,
@@ -2917,7 +3241,11 @@ def _submit_bots(
                         state = rival_players.setdefault(rival_id, {
                             "company_id": rival_id, "available": 0.0,
                             "ma_index": float(rival["ma"]), "qi_index": float(rival["qi"]),
-                            "attack_weight": float(rival.get("attack_weight", 0)), "cities": {},
+                            "attack_weight": float(rival.get("attack_weight", 0)),
+                            "is_human": bool(rival.get("is_human", False)),
+                            "is_super": bool(rival.get("is_super", False)),
+                            "is_disruptor": bool(rival.get("is_disruptor", False)),
+                            "cities": {},
                         })
                         state["available"] += max(0.0, float(rival["available"]))
                         state["cities"][str(markets[index]["city"])] = {
@@ -2929,7 +3257,7 @@ def _submit_bots(
                                      ma_large_threshold=ma_threshold, price_power=price_power)
                 baseline_forecast = (
                     forecast_market_sales(players=list(rival_players.values()), **forecast_args)
-                    if competitive_mode else None
+                    if competitive_mode or is_disruptor else None
                 )
                 saved_targets = ma_index_target, qi_index_target, marketing_targets
                 rival_player_list = list(rival_players.values())
@@ -2962,6 +3290,42 @@ def _submit_bots(
                     candidate["groups"] = candidate_groups
                     candidate_available = old_products + int(math.floor(
                         candidate_groups * group["products"]))
+                    floor_lock_prices: dict[str, float] = {}
+                    if floor_lock_disruptor:
+                        lock_options = []
+                        market_max_prices: dict[str, float] = {}
+                        for (
+                            lock_index, lock_cap, _low_price_unlocked,
+                            _direct_unit_cost, _weights, _prices, _entries,
+                            lock_size, _evaluator, _average_evaluator,
+                            _shadow, _aggregate,
+                        ) in candidate_city_data:
+                            city = str(markets[lock_index]["city"])
+                            market_max_prices[city] = float(lock_cap)
+                            human_pressure = sum(
+                                (
+                                    100.0 + float(rival.get("attack_weight", 0.0))
+                                ) * max(1.0, float(rival.get("available", 0.0)))
+                                for rival in rival_metrics[lock_index]
+                                if bool(rival.get("is_human", False))
+                            )
+                            lock_options.append({
+                                "city": city,
+                                "max_price": float(lock_cap),
+                                "lock_units": float(lock_size) * PRICE_CPI_TOTAL / 100.0,
+                                "attack_weight": human_pressure,
+                            })
+                        coverable_cities = _disruptor_coverable_cities(
+                            lock_options,
+                            available_units=candidate_available,
+                        )
+                        floor_lock_prices = _disruptor_floor_lock_prices(
+                            disruptor_ids=disruptor_ids,
+                            designated_company_id=floor_lock_company_id,
+                            market_max_prices=market_max_prices,
+                            coverable_cities=coverable_cities,
+                            price_min=price_min,
+                        ).get(company_id, {})
                     own_cities = {}
                     for (
                         index, cap, low_price_unlocked, direct_unit_cost,
@@ -2971,10 +3335,33 @@ def _submit_bots(
                         ratio = float(candidate["price_ratio"])
                         effective_ratio = (ratio if low_price_unlocked or ratio >= .75
                                            else min(.98, max(.75, high_price_ratio)))
-                        own_cities[str(markets[index]["city"])] = {
+                        city = str(markets[index]["city"])
+                        own_cities[city] = {
                             "agents": agent_plan[index][1],
                             "marketing": float(candidate["marketing"].get(index, 0.0)),
-                            "price": min(cap, max(price_min, cap * effective_ratio, direct_unit_cost * 1.03)),
+                            "price": floor_lock_prices.get(
+                                city,
+                                min(
+                                    cap,
+                                    max(
+                                        price_min,
+                                        cap * effective_ratio,
+                                        0.0 if late_disruptor else direct_unit_cost * 1.03,
+                                    ),
+                                ),
+                            ),
+                        }
+                    # Only the designated late disruptor has a city-by-city
+                    # price map that cannot be reconstructed from the shared
+                    # candidate ratio (covered pools use KDS minimum + 1 while
+                    # uncovered pools stay at their individual maxima).  For
+                    # every other Super Bot, rebuild prices from the ultimately
+                    # selected ratio so an optimiser or admin override cannot
+                    # be overwritten by a stale forecast value.
+                    if floor_lock_disruptor:
+                        candidate["resolved_city_prices"] = {
+                            city: float(data["price"])
+                            for city, data in own_cities.items()
                         }
                     players = [
                         *rival_player_list,
@@ -2986,10 +3373,18 @@ def _submit_bots(
                         candidate, own_cities, candidate_available, actual_budget,
                     ))
                     forecast_payloads.append({"players": players, **forecast_args})
-                unresolved_super_peers = sum(
-                    1 for peer in bots
-                    if int(peer["id"]) != company_id
-                    and int(peer["id"]) not in frozen_super_ids
+                unresolved_super_peers = (
+                    0
+                    if late_disruptor
+                    else sum(
+                        1 for peer in bots
+                        if int(peer["id"]) != company_id
+                        and int(peer["id"]) not in frozen_super_ids
+                        and not (
+                            not is_disruptor
+                            and int(peer["is_disruptor_bot"] or 0)
+                        )
+                    )
                 )
                 secondary_confidence = 1.0 / (
                     1.0 + 0.45 * unresolved_super_peers
@@ -3031,30 +3426,50 @@ def _submit_bots(
             # Select by relative advantage across every evaluated plan. Profiles
             # still generate different candidate grids and rival responses, but
             # they cannot override the economic result after the search.
-            empirical_candidate = _select_empirical_super_candidate(
-                finalist_candidates,
-                profile,
-                tactical_price_allowed=bool(
-                    late_game_low_price
-                    or saturated_low_price_indices
-                    or prior_surplus_ratio >= 0.50
-                    or all_super_field
-                    or market_pressure >= 0.60
-                ),
-                profit_target=profit_target,
-                competitive_mode=competitive_mode,
-                sacrifice_allowed=bool(
-                    last_round
-                    and competitive_mode
-                    and next(
-                        (
-                            rival_id for rival_id in reversed(ranked_super_ids)
-                            if rival_id in competitive_super_ids
-                        ),
-                        None,
-                    ) == company_id
-                ),
-            )
+            if late_disruptor:
+                disruptor_candidates = finalist_candidates
+                if floor_lock_disruptor:
+                    pure_price_candidates = [
+                        candidate for candidate in finalist_candidates
+                        if float(candidate.get("ma", 0.0)) <= 1.00000001
+                        and float(candidate.get("qi", 0.0)) <= 1.00000001
+                        and float(candidate.get("marketing_total", 0.0)) <= 1e-9
+                    ]
+                    if pure_price_candidates:
+                        disruptor_candidates = pure_price_candidates
+                empirical_candidate = _select_disruptor_attack_candidate(
+                    disruptor_candidates,
+                )
+            elif is_disruptor and prior_leader_assets is not None:
+                empirical_candidate = _select_disruptor_early_candidate(
+                    finalist_candidates,
+                    leader_assets=prior_leader_assets,
+                )
+            else:
+                empirical_candidate = _select_empirical_super_candidate(
+                    finalist_candidates,
+                    profile,
+                    tactical_price_allowed=bool(
+                        late_game_low_price
+                        or saturated_low_price_indices
+                        or prior_surplus_ratio >= 0.50
+                        or all_super_field
+                        or market_pressure >= 0.60
+                    ),
+                    profit_target=profit_target,
+                    competitive_mode=competitive_mode,
+                    sacrifice_allowed=bool(
+                        last_round
+                        and competitive_mode
+                        and next(
+                            (
+                                rival_id for rival_id in reversed(ranked_super_ids)
+                                if rival_id in competitive_super_ids
+                            ),
+                            None,
+                        ) == company_id
+                    ),
+                )
             if empirical_candidate is not None:
                 best_candidate = empirical_candidate
 
@@ -3115,6 +3530,21 @@ def _submit_bots(
                     False,
                     float(best_candidate["price_ratio"]),
                 )
+                # Ordinary strategic Super candidates are saved from the
+                # selected price ratio so a selector may still adjust that
+                # ratio after the forecast pass.  Only late disruptors need
+                # the city-specific resolved prices: they may deliberately
+                # sell below direct cost, and the designated floor locker uses
+                # a different price in covered and uncovered cities.
+                resolved_city_prices = (
+                    best_candidate.get("resolved_city_prices", {})
+                    if late_disruptor else {}
+                )
+                if resolved_city_prices:
+                    for city_row in city_rows:
+                        city = str(city_row["city"])
+                        if city in resolved_city_prices:
+                            city_row["price"] = float(resolved_city_prices[city])
 
         active_rows = [row for row in city_rows if int(row["agents_after"]) > 0 and int(row["index"]) in selected]
         weight_total = sum(
@@ -3145,6 +3575,7 @@ def _submit_bots(
         operating_reserve = max(float(bot["cash"]) * 0.06, float(budget["staff_cost"]) * 0.50)
         research_ready = (
             not last_round and research_needed > 0
+            and not late_disruptor
             and not distress_liquidation
             and projected_cash - research_needed >= operating_reserve
             and (

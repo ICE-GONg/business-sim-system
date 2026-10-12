@@ -29,6 +29,16 @@ _RETRYABLE_HTTP_STATUSES = {408, 429, 502, 503, 504, 520, 521, 522, 523, 524, 52
 _REVISION_MISMATCH_MESSAGE = "计算节点规则版本与当前应用不一致，请更新并重启计算节点后重试；本次结果未写入。"
 
 
+def _ordered_super_bot_ids(
+    conn: sqlite3.Connection,
+    round_no: int,
+) -> list[int]:
+    """Return the canonical, resumable analysis order for this round."""
+    from .bots import super_bot_analysis_order
+
+    return [int(company_id) for company_id in super_bot_analysis_order(conn, round_no)]
+
+
 class RemoteWorkerError(ValueError):
     pass
 
@@ -304,7 +314,7 @@ def run_remote_request(conn: sqlite3.Connection, payload: dict) -> dict:
         submitted = submit_super_bot_decisions(conn, round_no,
             replace_existing=bool(payload.get("replace_existing")), target_ids=set(ids), defer_rebalance=True)
     elif phase == "rebalance":
-        ids = [int(r[0]) for r in conn.execute("SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1 ORDER BY id")]
+        ids = _ordered_super_bot_ids(conn, round_no)
         rebalance_super_bot_decisions(conn, round_no)
         submitted = 0
     else:
@@ -333,8 +343,11 @@ def apply_remote_result(conn: sqlite3.Connection, request: dict, result: dict,
         _check_round(conn, round_no)
         if _snapshot(conn)[1] != request["snapshot_hash"]:
             raise RemoteWorkerError("分析期间玩家、管理员或轮次数据已改变，保留现有决策，请重新分析未完成的 Bot。")
-        allowed_ids = ([int(request["company_id"])] if request["phase"] == "bot" else
-                       [int(r[0]) for r in conn.execute("SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1 ORDER BY id")])
+        allowed_ids = (
+            [int(request["company_id"])]
+            if request["phase"] == "bot"
+            else _ordered_super_bot_ids(conn, round_no)
+        )
         if sorted(result["company_ids"]) != sorted(allowed_ids):
             raise RemoteWorkerError("远程结果超出本次 Bot 范围")
         if {int(r["company_id"]) for r in result["decisions"]} != set(allowed_ids) or len(result["decisions"]) != len(allowed_ids):
@@ -464,9 +477,7 @@ def mark_remote_job_complete(
             raise RemoteAnalysisChangedError(
                 "本地分析期间 KDS 或比赛输入已改变，全部超级 Bot 需要重新分析。"
             )
-        total = int(conn.execute(
-            "SELECT COUNT(*) FROM companies WHERE is_bot=1 AND is_super_bot=1"
-        ).fetchone()[0])
+        total = len(_ordered_super_bot_ids(conn, round_no))
         conn.execute(
             "INSERT INTO super_bot_remote_jobs("
             "round_no,round_start,pending_json,total,replace_existing,phase,"
@@ -507,13 +518,7 @@ def submit_local_super_bots(
             try:
                 round_start = _check_round(conn, round_no)
                 input_hash, state_hash = _job_fingerprints(conn, round_no)
-                ids = [
-                    int(row[0])
-                    for row in conn.execute(
-                        "SELECT id FROM companies "
-                        "WHERE is_bot=1 AND is_super_bot=1 ORDER BY id"
-                    )
-                ]
+                ids = _ordered_super_bot_ids(conn, round_no)
                 conn.execute(
                     "INSERT INTO super_bot_remote_jobs("
                     "round_no,round_start,pending_json,total,replace_existing,phase,"
@@ -680,10 +685,17 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
                 or has_untracked_decisions
                 or (existing_job and existing_job[1] == "done")
             )
-            query = "SELECT c.id FROM companies c WHERE c.is_bot=1 AND c.is_super_bot=1"
+            ids = _ordered_super_bot_ids(conn, round_no)
             if not replace_existing:
-                query += " AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.company_id=c.id AND d.round_no=?)"
-            ids = [int(r[0]) for r in conn.execute(query + " ORDER BY c.id", () if replace_existing else (round_no,))]
+                already_saved = {
+                    int(row[0])
+                    for row in conn.execute(
+                        "SELECT c.id FROM companies c JOIN decisions d ON d.company_id=c.id "
+                        "WHERE c.is_bot=1 AND c.is_super_bot=1 AND d.round_no=?",
+                        (round_no,),
+                    )
+                }
+                ids = [company_id for company_id in ids if company_id not in already_saved]
             conn.execute(
                 "INSERT INTO super_bot_remote_jobs("
                 "round_no,round_start,pending_json,total,replace_existing,phase,"
@@ -703,7 +715,8 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
             (round_no,),
         ).fetchone()
         pending, total, replace = json.loads(job[0]), int(job[1]), bool(job[2])
-        eligible = {int(r[0]) for r in conn.execute("SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1")}
+        ordered_eligible = _ordered_super_bot_ids(conn, round_no)
+        eligible = set(ordered_eligible)
         input_hash, state_hash = _job_fingerprints(conn, round_no)
         expected_input_hash, expected_state_hash = str(job[4] or ""), str(job[5] or "")
         if (
@@ -716,7 +729,7 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
             # legacy job without fingerprints). Keep every saved decision as
             # a recoverable checkpoint, but make every current Super Bot
             # pending so settlement can never mix analysis generations.
-            pending = sorted(eligible)
+            pending = ordered_eligible
             total = len(pending)
             replace = True
             conn.execute(
@@ -738,13 +751,8 @@ def remote_submit(conn: sqlite3.Connection, endpoint: str | list[str] | tuple[st
         while True:
             input_hash, state_hash = _job_fingerprints(conn, round_no)
             if input_hash != expected_input_hash or state_hash != expected_state_hash:
-                eligible = {
-                    int(row[0])
-                    for row in conn.execute(
-                        "SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1"
-                    )
-                }
-                pending = sorted(eligible)
+                pending = _ordered_super_bot_ids(conn, round_no)
+                eligible = set(pending)
                 total = len(pending)
                 replace = True
                 submitted = 0

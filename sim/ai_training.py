@@ -27,6 +27,7 @@ from .db import (
 
 AI_MODE = "ai_training"
 MANUAL_MODE = "manual"
+AI_TRAINING_API_VERSION = 1
 
 ACTION_NONE = "none"
 ACTION_WAIT = "wait"
@@ -68,8 +69,8 @@ def _runtime(conn: sqlite3.Connection) -> sqlite3.Row:
         # public helpers safe against a connection opened during a hot deploy.
         conn.execute(
             "INSERT INTO ai_training_runtime("
-            "id,enabled,player_count,bot_count,super_bot_count,updated_at"
-            ") VALUES(1,0,0,0,0,?)",
+            "id,enabled,player_count,bot_count,super_bot_count,disruptor_bot_count,updated_at"
+            ") VALUES(1,0,0,0,0,0,?)",
             (now_iso(),),
         )
         row = one(conn, "SELECT * FROM ai_training_runtime WHERE id=1")
@@ -85,18 +86,21 @@ def get_ai_training_config(conn: sqlite3.Connection) -> dict[str, Any]:
         "SELECT COUNT(*) AS total,"
         "COALESCE(SUM(CASE WHEN is_bot=0 THEN 1 ELSE 0 END),0) AS players,"
         "COALESCE(SUM(CASE WHEN is_bot=1 AND is_super_bot=0 THEN 1 ELSE 0 END),0) AS bots,"
-        "COALESCE(SUM(CASE WHEN is_super_bot=1 THEN 1 ELSE 0 END),0) AS super_bots "
+        "COALESCE(SUM(CASE WHEN is_super_bot=1 AND is_disruptor_bot=0 THEN 1 ELSE 0 END),0) AS super_bots,"
+        "COALESCE(SUM(CASE WHEN is_disruptor_bot=1 THEN 1 ELSE 0 END),0) AS disruptor_bots "
         "FROM companies",
     )
     configured = {
         "player_count": int(runtime["player_count"]),
         "bot_count": int(runtime["bot_count"]),
         "super_bot_count": int(runtime["super_bot_count"]),
+        "disruptor_bot_count": int(runtime["disruptor_bot_count"]),
     }
     actual_counts = {
         "player_count": int(actual["players"] if actual else 0),
         "bot_count": int(actual["bots"] if actual else 0),
         "super_bot_count": int(actual["super_bots"] if actual else 0),
+        "disruptor_bot_count": int(actual["disruptor_bots"] if actual else 0),
     }
     return {
         "enabled": bool(runtime["enabled"]),
@@ -110,6 +114,7 @@ def get_ai_training_config(conn: sqlite3.Connection) -> dict[str, Any]:
         "actual_player_count": actual_counts["player_count"],
         "actual_bot_count": actual_counts["bot_count"],
         "actual_super_bot_count": actual_counts["super_bot_count"],
+        "actual_disruptor_bot_count": actual_counts["disruptor_bot_count"],
         "actual_total": int(actual["total"] if actual else 0),
         "roster_matches": configured == actual_counts,
         "lease_owner": runtime["lease_owner"],
@@ -240,6 +245,8 @@ def configure_ai_training_roster(
     bot_count: int,
     super_bot_count: int,
     player_password: str = "1234",
+    *,
+    disruptor_bot_count: int = 0,
 ) -> dict[str, Any]:
     """Explicitly replace the waiting-room roster with exact requested counts.
 
@@ -250,9 +257,10 @@ def configure_ai_training_roster(
     players = int(player_count)
     bots = int(bot_count)
     super_bots = int(super_bot_count)
-    if min(players, bots, super_bots) < 0:
+    disruptor_bots = int(disruptor_bot_count)
+    if min(players, bots, super_bots, disruptor_bots) < 0:
         raise ValueError("玩家与 Bot 数量不能为负数。")
-    if players + bots + super_bots < 1:
+    if players + bots + super_bots + disruptor_bots < 1:
         raise ValueError("AI 训练至少需要一支队伍。")
     if players and not str(player_password):
         raise ValueError("玩家初始密码不能为空。")
@@ -277,7 +285,7 @@ def configure_ai_training_roster(
             "SELECT city FROM market_config WHERE home_enabled=1 ORDER BY city",
         )
     ]
-    if (bots or super_bots) and not homes:
+    if (bots or super_bots or disruptor_bots) and not homes:
         raise ValueError("请先设置至少一个可选主场，再创建 Bot。")
 
     # An explicit roster rebuild is a clean waiting-room operation. It leaves
@@ -301,7 +309,7 @@ def configure_ai_training_roster(
 
     initial_cash = float(get_setting(conn, "initial_cash", 15_000_000.0))
     player_hash = hash_password(str(player_password)) if players else ""
-    bot_hash = hash_password(secrets.token_hex(24)) if bots or super_bots else ""
+    bot_hash = hash_password(secrets.token_hex(24)) if bots or super_bots or disruptor_bots else ""
     created = now_iso()
     for index in range(1, players + 1):
         code = f"C{index:02d}"
@@ -316,7 +324,7 @@ def configure_ai_training_roster(
             "INSERT INTO companies("
             "code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,is_super_bot,bot_profile,created_at"
             ") VALUES(?,?,?,?,?,?,1,0,?,?)",
-            (f"BOT{index:02d}", f"Auto Company {index}", bot_hash, home, initial_cash, created, index, created),
+            (f"BOT{index:02d}", f"Bot {index}", bot_hash, home, initial_cash, created, index, created),
         )
         conn.execute(
             "INSERT INTO agents(company_id,city,count) VALUES(?,?,1)",
@@ -347,6 +355,30 @@ def configure_ai_training_roster(
             (int(cursor.lastrowid), home),
         )
 
+    for index in range(1, disruptor_bots + 1):
+        public_index = bots + index
+        home = ranked_homes[(super_bots + index - 1) % strong_pool_size]
+        cursor = conn.execute(
+            "INSERT INTO companies("
+            "code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,is_super_bot,"
+            "is_disruptor_bot,bot_profile,created_at"
+            ") VALUES(?,?,?,?,?,?,1,1,1,?,?)",
+            (
+                f"BOT{public_index:02d}",
+                f"Bot {public_index}",
+                bot_hash,
+                home,
+                initial_cash,
+                created,
+                super_bots + index,
+                created,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO agents(company_id,city,count) VALUES(?,?,1)",
+            (int(cursor.lastrowid), home),
+        )
+
     conn.execute("INSERT INTO rounds(round_no,status) VALUES(1,'waiting')")
     set_setting(conn, "test_round_enabled", 0)
     set_setting(conn, "final_results_release_round", 0)
@@ -359,11 +391,39 @@ def configure_ai_training_roster(
     _runtime(conn)
     conn.execute(
         "UPDATE ai_training_runtime SET enabled=1,player_count=?,bot_count=?,super_bot_count=?,"
+        "disruptor_bot_count=?,"
         "lease_owner=NULL,lease_phase=NULL,lease_expires_at=NULL,last_error=NULL,"
         "retry_not_before=NULL,last_action='configure_roster',updated_at=? WHERE id=1",
-        (players, bots, super_bots, now_iso()),
+        (players, bots, super_bots, disruptor_bots, now_iso()),
     )
     return get_ai_training_config(conn)
+
+
+def super_bot_analysis_order(
+    conn: sqlite3.Connection,
+    round_no: int,
+) -> list[int]:
+    """Return one stable order for strategic and disruptor Super Bots.
+
+    During expansion rounds the strategic models establish their plans first,
+    allowing disruptors to select a non-overlapping route from saved drafts.
+    In the final two official rounds disruptors move first, so strategic models
+    can react to their player-pressure decisions.  The optional test round is
+    always treated as an early round.
+    """
+    total_rounds = max(1, int(get_setting(conn, "total_rounds", 5, int)))
+    target_round = int(round_no)
+    disruptors_first = (
+        target_round > 0
+        and target_round >= max(1, total_rounds - 1)
+    )
+    rows = all_rows(
+        conn,
+        "SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1 "
+        "ORDER BY CASE WHEN is_disruptor_bot=? THEN 0 ELSE 1 END,id",
+        (int(disruptors_first),),
+    )
+    return [int(row["id"]) for row in rows]
 
 
 def ai_training_action(
@@ -439,7 +499,11 @@ def ai_training_action(
             "SUM(CASE WHEN c.is_bot=1 AND c.is_super_bot=0 AND d.submitted_at IS NOT NULL AND d.is_draft=0 THEN 1 ELSE 0 END) AS bot_submitted,"
             "SUM(CASE WHEN c.is_super_bot=1 THEN 1 ELSE 0 END) AS super_total,"
             "SUM(CASE WHEN c.is_super_bot=1 AND d.company_id IS NOT NULL THEN 1 ELSE 0 END) AS super_saved,"
-            "SUM(CASE WHEN c.is_super_bot=1 AND d.submitted_at IS NOT NULL AND d.is_draft=0 THEN 1 ELSE 0 END) AS super_submitted "
+            "SUM(CASE WHEN c.is_super_bot=1 AND d.submitted_at IS NOT NULL AND d.is_draft=0 THEN 1 ELSE 0 END) AS super_submitted,"
+            "SUM(CASE WHEN c.is_super_bot=1 AND c.is_disruptor_bot=0 THEN 1 ELSE 0 END) AS strategic_super_total,"
+            "SUM(CASE WHEN c.is_disruptor_bot=1 THEN 1 ELSE 0 END) AS disruptor_total,"
+            "SUM(CASE WHEN c.is_disruptor_bot=1 AND d.company_id IS NOT NULL THEN 1 ELSE 0 END) AS disruptor_saved,"
+            "SUM(CASE WHEN c.is_disruptor_bot=1 AND d.submitted_at IS NOT NULL AND d.is_draft=0 THEN 1 ELSE 0 END) AS disruptor_submitted "
             "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=?",
             (round_no,),
         )
@@ -453,6 +517,10 @@ def ai_training_action(
                 "super_total",
                 "super_saved",
                 "super_submitted",
+                "strategic_super_total",
+                "disruptor_total",
+                "disruptor_saved",
+                "disruptor_submitted",
             )
         }
         if stats["bot_submitted"] < stats["bot_total"]:

@@ -30,6 +30,7 @@ from sim import cpi as _cpi_module
 from sim import db as _db_module
 from sim import engine as _engine_module
 from sim import bots as _bots_module
+from sim import ai_training as _ai_training_module
 
 # Streamlit Community Cloud can rerun a freshly downloaded app.py inside a
 # process that still has the previous internal modules cached. Refresh only
@@ -37,16 +38,18 @@ from sim import bots as _bots_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 8
+    or getattr(_db_module, "DB_API_VERSION", 0) < 9
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 6
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 12
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 32
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 33
+    or getattr(_ai_training_module, "AI_TRAINING_API_VERSION", 0) < 1
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
+    importlib.reload(_ai_training_module)
     importlib.reload(_cpi_module)
     importlib.reload(_engine_module)
     importlib.reload(importlib.import_module("sim.bot_market_forecast"))
@@ -1972,7 +1975,8 @@ def render_ai_training_overview() -> None:
             conn,
             "SELECT SUM(CASE WHEN is_bot=0 THEN 1 ELSE 0 END) AS players,"
             "SUM(CASE WHEN is_bot=1 AND is_super_bot=0 THEN 1 ELSE 0 END) AS bots,"
-            "SUM(CASE WHEN is_super_bot=1 THEN 1 ELSE 0 END) AS super_bots FROM companies",
+            "SUM(CASE WHEN is_super_bot=1 AND is_disruptor_bot=0 THEN 1 ELSE 0 END) AS super_bots,"
+            "SUM(CASE WHEN is_disruptor_bot=1 THEN 1 ELSE 0 END) AS disruptor_bots FROM companies",
         )
         submission = (
             submission_status(conn, int(round_row["round_no"]))
@@ -1982,12 +1986,13 @@ def render_ai_training_overview() -> None:
         runtime = one(conn, "SELECT * FROM ai_training_runtime WHERE id=1")
         ranking = rank_rows(conn)
     round_banner(round_row)
-    metrics = st.columns(5)
+    metrics = st.columns(6)
     metrics[0].metric("真人玩家", int(counts["players"] or 0) if counts else 0)
     metrics[1].metric("普通 Bot", int(counts["bots"] or 0) if counts else 0)
     metrics[2].metric("Super Bot", int(counts["super_bots"] or 0) if counts else 0)
-    metrics[3].metric("赛前就绪", f"{setup['ready']}/{setup['total']}")
-    metrics[4].metric(
+    metrics[3].metric("自曝 Bot", int(counts["disruptor_bots"] or 0) if counts else 0)
+    metrics[4].metric("赛前就绪", f"{setup['ready']}/{setup['total']}")
+    metrics[5].metric(
         "本轮提交",
         f"{submission['submitted']}/{submission['total']}" if submission else "—",
     )
@@ -2019,7 +2024,7 @@ def render_ai_training_overview() -> None:
 
 
 def render_ai_training_setup() -> None:
-    hero("AI 训练设置", "一次设置真人玩家、普通 Bot 与 Super Bot 数量；应用后只需等待玩家提交，系统会自动完成后续回合。")
+    hero("AI 训练设置", "一次设置真人玩家、普通 Bot、Super Bot 与自曝 Bot；系统会按回合自动编排分析顺序。")
     with connect() as conn:
         config = get_ai_training_config(conn)
         round_row = current_round(conn)
@@ -2029,11 +2034,12 @@ def render_ai_training_setup() -> None:
         auto_enabled = bool(get_setting(conn, "ai_training_auto_enabled", 1, int))
         transition_seconds = max(3, get_setting(conn, "ai_training_transition_seconds", 5, int))
     waiting = bool(round_row and int(round_row["round_no"]) == 1 and str(round_row["status"]) == "waiting")
-    current_cols = st.columns(4)
+    current_cols = st.columns(5)
     current_cols[0].metric("当前真人玩家", config["actual_player_count"])
     current_cols[1].metric("当前普通 Bot", config["actual_bot_count"])
     current_cols[2].metric("当前 Super Bot", config["actual_super_bot_count"])
-    current_cols[3].metric("运行模式", "AI 训练" if config["enabled"] else "常规比赛")
+    current_cols[3].metric("当前自曝 Bot", config["actual_disruptor_bot_count"])
+    current_cols[4].metric("运行模式", "AI 训练" if config["enabled"] else "常规比赛")
     if not waiting:
         st.info("比赛已经开始，阵容数量已锁定。需要改人数时，请先在“备份与重置”中重置比赛。")
     st.markdown(
@@ -2041,7 +2047,7 @@ def render_ai_training_setup() -> None:
         unsafe_allow_html=True,
     )
     with st.form("ai_training_setup_form"):
-        count_cols = st.columns(3)
+        count_cols = st.columns(4)
         player_count = count_cols[0].number_input(
             "真人玩家数量",
             min_value=0,
@@ -2065,6 +2071,15 @@ def render_ai_training_setup() -> None:
             value=int(config["super_bot_count"]),
             step=1,
             disabled=not waiting,
+        )
+        disruptor_bot_count = count_cols[3].number_input(
+            "自曝 Bot 数量",
+            min_value=0,
+            max_value=20,
+            value=int(config["disruptor_bot_count"]),
+            step=1,
+            disabled=not waiting,
+            help="前期跟随榜首约 70% 并避开 Super Bot；最后两轮优先压制玩家 CPI 与二次分配。玩家端只显示为普通 Bot。",
         )
         rule_cols = st.columns(3)
         selected_rounds = rule_cols[0].number_input(
@@ -2099,8 +2114,8 @@ def render_ai_training_setup() -> None:
     if apply_training:
         if not confirm_replace:
             st.error("请先勾选阵容替换确认。")
-        elif int(player_count) + int(bot_count) + int(super_bot_count) < 1:
-            st.error("至少需要一支真人玩家、普通 Bot 或 Super Bot 队伍。")
+        elif int(player_count) + int(bot_count) + int(super_bot_count) + int(disruptor_bot_count) < 1:
+            st.error("至少需要一支真人玩家、普通 Bot、Super Bot 或自曝 Bot 队伍。")
         else:
             try:
                 with connect() as conn:
@@ -2110,6 +2125,7 @@ def render_ai_training_setup() -> None:
                         int(bot_count),
                         int(super_bot_count),
                         player_password or "1234",
+                        disruptor_bot_count=int(disruptor_bot_count),
                     )
                     set_setting(conn, "total_rounds", int(selected_rounds))
                     set_setting(conn, "round_duration_minutes", int(selected_duration))
@@ -2175,22 +2191,28 @@ def render_admin_companies() -> None:
     setup_editable = bool(round_row and round_row["status"] == "waiting")
     home_options = ["未选择"] + [str(row["city"]) for row in markets]
     with st.form("add_bots"):
-        bot_cols = st.columns([2, 1, 2, 1])
+        bot_cols = st.columns([2, 1, 2, 1, 2, 1])
         bot_count = bot_cols[0].number_input("新增 Bot 数量", min_value=1, max_value=30, value=1, step=1, disabled=not setup_editable)
         add_bots = bot_cols[1].form_submit_button("添加普通 Bot", type="primary", disabled=not setup_editable, use_container_width=True)
         super_bot_count = bot_cols[2].number_input("新增超级 Bot 数量", min_value=1, max_value=10, value=1, step=1, disabled=not setup_editable)
         add_super_bots = bot_cols[3].form_submit_button("添加超级 Bot", disabled=not setup_editable, use_container_width=True)
-        st.caption("普通 Bot 开轮立即提交；超级 Bot 等其他队伍全部提交后读取本轮决策，再分析并提交。")
-    if add_bots or add_super_bots:
+        disruptor_bot_count = bot_cols[4].number_input("新增自曝 Bot 数量", min_value=1, max_value=10, value=1, step=1, disabled=not setup_editable)
+        add_disruptor_bots = bot_cols[5].form_submit_button("添加自曝 Bot", disabled=not setup_editable, use_container_width=True)
+        st.caption("普通 Bot 开轮立即提交；Super Bot 与自曝 Bot 读取全场数据。自曝 Bot 的特殊身份仅管理员可见。")
+    if add_bots or add_super_bots or add_disruptor_bots:
         if not markets:
             st.error("请先创建至少一个可选主场。")
         else:
             with connect() as conn:
-                is_super = bool(add_super_bots)
-                existing = int(one(conn, "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1 AND is_super_bot=?", (int(is_super),))["n"])
+                is_disruptor = bool(add_disruptor_bots)
+                is_super = bool(add_super_bots or is_disruptor)
+                if is_disruptor:
+                    existing = int(one(conn, "SELECT COUNT(*) AS n FROM companies WHERE code LIKE 'BOT%'")["n"])
+                else:
+                    existing = int(one(conn, "SELECT COUNT(*) AS n FROM companies WHERE is_bot=1 AND is_super_bot=? AND is_disruptor_bot=0", (int(is_super),))["n"])
                 initial_cash = get_setting(conn, "initial_cash", 15_000_000.0)
-                requested_count = int(super_bot_count if is_super else bot_count)
-                prefix = "SBOT" if is_super else "BOT"
+                requested_count = int(disruptor_bot_count if is_disruptor else (super_bot_count if is_super else bot_count))
+                prefix = "BOT" if is_disruptor or not is_super else "SBOT"
                 ranked_homes = ranked_bot_home_cities(conn) if is_super else [str(row["city"]) for row in markets]
                 ranked_pool_size = max(1, math.ceil(len(ranked_homes) / 3)) if is_super else len(ranked_homes)
                 for offset in range(requested_count):
@@ -2201,11 +2223,17 @@ def render_admin_companies() -> None:
                         code_value = f"{prefix}{number_index:02d}"
                     home = ranked_homes[(number_index - 1) % ranked_pool_size]
                     cursor = conn.execute(
-                        "INSERT INTO companies(code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,is_super_bot,bot_profile,created_at) VALUES(?,?,?,?,?,?,1,?,?,?)",
-                        (code_value, f"{'Super ' if is_super else ''}Auto Company {number_index}", hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(), int(is_super), number_index, now_iso()),
+                        "INSERT INTO companies(code,name,password_hash,home_city,cash,setup_submitted_at,is_bot,is_super_bot,is_disruptor_bot,bot_profile,created_at) VALUES(?,?,?,?,?,?,1,?,?,?,?)",
+                        (
+                            code_value,
+                            f"Bot {number_index}" if is_disruptor else f"{'Super ' if is_super else ''}Auto Company {number_index}",
+                            hash_password(os.urandom(16).hex()), home, initial_cash, now_iso(),
+                            int(is_super), int(is_disruptor), number_index, now_iso(),
+                        ),
                     )
                     conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cursor.lastrowid, home))
-            flash("success", f"已添加 {requested_count} 支{'超级' if is_super else '普通'} Bot 队伍。")
+            bot_kind = "自曝" if is_disruptor else ("超级" if is_super else "普通")
+            flash("success", f"已添加 {requested_count} 支{bot_kind} Bot 队伍。")
             st.rerun()
     if not setup_editable:
         st.info("比赛已开始：为避免影响结算，赛前资料已锁定。密码仍可重置。")
@@ -2214,7 +2242,7 @@ def render_admin_companies() -> None:
     company_labels = {
         int(company["id"]): (
             f"{company['code']} · {company['name']} · "
-            f"{'超级 Bot' if company['is_super_bot'] else ('普通 Bot' if company['is_bot'] else '玩家')}"
+            f"{'自曝 Bot' if company['is_disruptor_bot'] else ('超级 Bot' if company['is_super_bot'] else ('普通 Bot' if company['is_bot'] else '玩家'))}"
         )
         for company in companies
     }
@@ -2223,7 +2251,7 @@ def render_admin_companies() -> None:
             "选择要删除的队伍",
             options=list(company_labels),
             format_func=lambda company_id: company_labels[company_id],
-            placeholder="可一次选择多个玩家、普通 Bot 或超级 Bot",
+            placeholder="可一次选择多个玩家、普通 Bot、超级 Bot 或自曝 Bot",
         )
         confirm_bulk_delete = st.checkbox("我确认永久删除所选队伍及其全部比赛数据")
         bulk_delete = st.form_submit_button(
@@ -2245,7 +2273,10 @@ def render_admin_companies() -> None:
                 st.error(str(exc))
 
     for company in companies:
-        bot_tag = (" · 超级 BOT" if bool(company["is_super_bot"]) else " · BOT") if bool(company["is_bot"]) else ""
+        bot_tag = (
+            " · 自曝 BOT" if bool(company["is_disruptor_bot"])
+            else (" · 超级 BOT" if bool(company["is_super_bot"]) else " · BOT")
+        ) if bool(company["is_bot"]) else ""
         with st.expander(f"{company['code']} · {company['name']} · {company['home_city'] or '未选主场'}{bot_tag}"):
             st.markdown("##### 代管赛前资料")
             with st.form(f"admin_company_setup_{company['id']}"):
@@ -2313,18 +2344,45 @@ def render_admin_companies() -> None:
 
             if bool(company["is_bot"]):
                 with st.form(f"bot_type_{company['id']}"):
-                    current_type = "超级 Bot" if bool(company["is_super_bot"]) else "普通 Bot"
+                    current_type = (
+                        "自曝 Bot" if bool(company["is_disruptor_bot"])
+                        else ("超级 Bot" if bool(company["is_super_bot"]) else "普通 Bot")
+                    )
+                    bot_types = ["普通 Bot", "超级 Bot", "自曝 Bot"]
                     bot_type = st.radio(
-                        "Bot 类型", ["普通 Bot", "超级 Bot"],
-                        index=1 if bool(company["is_super_bot"]) else 0,
+                        "Bot 类型", bot_types,
+                        index=bot_types.index(current_type),
                         horizontal=True, disabled=not setup_editable,
                     )
                     save_bot_type = st.form_submit_button("保存 Bot 类型", disabled=not setup_editable)
                 if save_bot_type:
                     with connect() as conn:
+                        public_code = str(company["code"])
+                        public_name = str(company["name"])
+                        if bot_type == "自曝 Bot":
+                            if not public_code.startswith("BOT") or public_code.startswith("SBOT"):
+                                public_index = 1
+                                public_code = f"BOT{public_index:02d}"
+                                while one(
+                                    conn,
+                                    "SELECT 1 FROM companies WHERE code=? AND id<>?",
+                                    (public_code, company["id"]),
+                                ):
+                                    public_index += 1
+                                    public_code = f"BOT{public_index:02d}"
+                            else:
+                                digits = "".join(character for character in public_code if character.isdigit())
+                                public_index = int(digits or company["id"])
+                            public_name = f"Bot {public_index}"
                         conn.execute(
-                            "UPDATE companies SET is_super_bot=? WHERE id=?",
-                            (int(bot_type == "超级 Bot"), company["id"]),
+                            "UPDATE companies SET code=?,name=?,is_super_bot=?,is_disruptor_bot=? WHERE id=?",
+                            (
+                                public_code,
+                                public_name,
+                                int(bot_type in ("超级 Bot", "自曝 Bot")),
+                                int(bot_type == "自曝 Bot"),
+                                company["id"],
+                            ),
                         )
                     flash("success", f"{company['code']} 已切换为{bot_type}。")
                     st.rerun()
@@ -2684,12 +2742,12 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
         total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
         default_minutes = max(1, get_setting(conn, "round_duration_minutes", 30, int))
         default_test_round = bool(get_setting(conn, "test_round_enabled", 0, int))
-        companies_for_bonus = all_rows(conn, "SELECT id,code,name,is_bot,is_super_bot FROM companies ORDER BY id")
+        companies_for_bonus = all_rows(conn, "SELECT id,code,name,is_bot,is_super_bot,is_disruptor_bot FROM companies ORDER BY id")
         setup = setup_status(conn)
         submission = submission_status(conn, int(round_row["round_no"])) if round_row and round_row["status"] in ("open", "paused") else None
         decisions = all_rows(
             conn,
-            "SELECT c.code,c.name,c.home_city,c.setup_submitted_at,c.is_bot,c.is_super_bot,d.submitted_at,d.is_draft,d.production_volume,d.management_investment,d.quality_investment,d.research_investment "
+            "SELECT c.code,c.name,c.home_city,c.setup_submitted_at,c.is_bot,c.is_super_bot,c.is_disruptor_bot,d.submitted_at,d.is_draft,d.production_volume,d.management_investment,d.quality_investment,d.research_investment "
             "FROM companies c LEFT JOIN decisions d ON d.company_id=c.id AND d.round_no=? ORDER BY c.id",
             (int(round_row["round_no"]),),
         ) if round_row else []
@@ -3011,7 +3069,10 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
             [{
                 "队伍": row["code"],
                 "公司": row["name"],
-                "类型": "超级 Bot" if row["is_super_bot"] else ("普通 Bot" if row["is_bot"] else "玩家"),
+                "类型": (
+                    "自曝 Bot" if row["is_disruptor_bot"]
+                    else ("超级 Bot" if row["is_super_bot"] else ("普通 Bot" if row["is_bot"] else "玩家"))
+                ),
                 "主场": row["home_city"] or "—",
                 "赛前就绪": bool(row["setup_submitted_at"]),
                 "决策状态": "草稿" if row["is_draft"] else ("已提交" if row["submitted_at"] else "未提交"),
