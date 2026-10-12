@@ -18,7 +18,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 6
+DB_API_VERSION = 8
 
 
 def now_iso() -> str:
@@ -257,6 +257,20 @@ def init_db() -> None:
                 PRIMARY KEY(company_id,round_no),
                 FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS ai_training_runtime(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+                player_count INTEGER NOT NULL DEFAULT 4 CHECK(player_count >= 0),
+                bot_count INTEGER NOT NULL DEFAULT 0 CHECK(bot_count >= 0),
+                super_bot_count INTEGER NOT NULL DEFAULT 0 CHECK(super_bot_count >= 0),
+                lease_owner TEXT,
+                lease_phase TEXT,
+                lease_expires_at TEXT,
+                last_error TEXT,
+                retry_not_before TEXT,
+                last_action TEXT,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         market_columns = {row["name"] for row in all_rows(conn, "PRAGMA table_info(market_config)")}
@@ -298,6 +312,15 @@ def init_db() -> None:
         count = one(conn, "SELECT COUNT(*) AS n FROM rounds")
         if count and int(count["n"]) == 0:
             conn.execute("INSERT INTO rounds(round_no,status) VALUES(1,'waiting')")
+        conn.execute(
+            "INSERT OR IGNORE INTO ai_training_runtime("
+            "id,enabled,player_count,bot_count,super_bot_count,updated_at"
+            ") SELECT 1,0,"
+            "COALESCE(SUM(CASE WHEN is_bot=0 THEN 1 ELSE 0 END),0),"
+            "COALESCE(SUM(CASE WHEN is_bot=1 AND is_super_bot=0 THEN 1 ELSE 0 END),0),"
+            "COALESCE(SUM(CASE WHEN is_super_bot=1 THEN 1 ELSE 0 END),0),? FROM companies",
+            (now_iso(),),
+        )
 
 
 def employee_count(conn: sqlite3.Connection, company_id: int, role: str) -> int:
@@ -529,6 +552,9 @@ def start_competition(conn: sqlite3.Connection, duration_minutes: int, use_test_
     end = start + timedelta(minutes=max(1, int(duration_minutes)))
     set_setting(conn, "test_round_enabled", int(bool(use_test_round)))
     set_setting(conn, "final_results_release_round", 0)
+    set_setting(conn, "ai_training_processing_round", 0)
+    set_setting(conn, "ai_training_processing_started_at", "")
+    set_setting(conn, "ai_training_last_collection_at", "")
     if use_test_round:
         conn.execute("DELETE FROM rounds WHERE round_no=1")
         conn.execute(
@@ -559,7 +585,70 @@ def prepare_first_round_after_test(conn: sqlite3.Connection, duration_minutes: i
         "INSERT INTO rounds(round_no,status,starts_at,ends_at,settled_at) VALUES(1,'open',?,?,NULL)",
         (start.isoformat(), end.isoformat()),
     )
+    set_setting(conn, "ai_training_processing_round", 0)
+    set_setting(conn, "ai_training_processing_started_at", "")
+    set_setting(conn, "ai_training_last_collection_at", "")
     return 1
+
+
+def open_next_round(
+    conn: sqlite3.Connection,
+    current_round_no: int,
+    duration_minutes: int,
+    bonuses: dict[int, float] | None = None,
+) -> int:
+    """Open the round after a settled official round and apply bonuses once.
+
+    The helper is deliberately idempotent: if the next round already exists,
+    it returns that round without paying bonuses a second time. Bot submission
+    remains a caller responsibility so manual and AI controllers share the
+    same authoritative round-opening primitive.
+    """
+    current_no = int(current_round_no)
+    if current_no < 1:
+        raise ValueError("测试轮结束后请使用测试轮恢复流程开启第一轮。")
+    current = one(conn, "SELECT status FROM rounds WHERE round_no=?", (current_no,))
+    if current is None:
+        raise ValueError("当前回合不存在。")
+    if str(current["status"]) != "settled":
+        raise ValueError("当前回合尚未结算，不能开启下一轮。")
+    next_round = current_no + 1
+    existing = one(conn, "SELECT status FROM rounds WHERE round_no=?", (next_round,))
+    if existing is not None:
+        if str(existing["status"]) not in ("open", "paused"):
+            raise ValueError("下一轮已存在，但状态异常，未重复发放 Bonus。")
+        return next_round
+
+    clean_bonuses: dict[int, float] = {}
+    for company_id, amount in (bonuses or {}).items():
+        clean_amount = max(0.0, float(amount))
+        if clean_amount <= 0:
+            continue
+        company = one(conn, "SELECT id FROM companies WHERE id=?", (int(company_id),))
+        if company is None:
+            raise ValueError(f"Bonus 对应的玩家 {company_id} 不存在。")
+        clean_bonuses[int(company_id)] = clean_amount
+
+    start = datetime.now(timezone.utc)
+    end = start + timedelta(minutes=max(1, int(duration_minutes)))
+    conn.execute(
+        "INSERT INTO rounds(round_no,status,starts_at,ends_at,settled_at) "
+        "VALUES(?,'open',?,?,NULL)",
+        (next_round, start.isoformat(), end.isoformat()),
+    )
+    for company_id, amount in clean_bonuses.items():
+        conn.execute("UPDATE companies SET cash=cash+? WHERE id=?", (amount, company_id))
+        conn.execute(
+            "INSERT INTO round_bonuses(company_id,round_no,amount,created_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(company_id,round_no) DO UPDATE SET "
+            "amount=excluded.amount,created_at=excluded.created_at",
+            (company_id, next_round, amount, now_iso()),
+        )
+    set_setting(conn, "final_results_release_round", 0)
+    set_setting(conn, "ai_training_processing_round", 0)
+    set_setting(conn, "ai_training_processing_started_at", "")
+    set_setting(conn, "ai_training_last_collection_at", "")
+    return next_round
 
 
 def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: int = 30) -> int:
@@ -569,6 +658,9 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
         raise ValueError("还没有已结算回合，无法回退。")
     target_round = int(latest["round_no"])
     set_setting(conn, "final_results_release_round", 0)
+    set_setting(conn, "ai_training_processing_round", 0)
+    set_setting(conn, "ai_training_processing_started_at", "")
+    set_setting(conn, "ai_training_last_collection_at", "")
     snapshot_row = one(conn, "SELECT snapshot_json FROM round_snapshots WHERE round_no=?", (target_round,))
     snapshot = json.loads(snapshot_row["snapshot_json"]) if snapshot_row else _reconstruct_pre_round_snapshot(conn, target_round)
 
@@ -607,6 +699,14 @@ def rollback_latest_settled_round(conn: sqlite3.Connection, duration_minutes: in
 
 def reset_competition(conn: sqlite3.Connection) -> None:
     set_setting(conn, "final_results_release_round", 0)
+    set_setting(conn, "ai_training_processing_round", 0)
+    set_setting(conn, "ai_training_processing_started_at", "")
+    set_setting(conn, "ai_training_last_collection_at", "")
+    conn.execute(
+        "UPDATE ai_training_runtime SET lease_owner=NULL,lease_phase=NULL,lease_expires_at=NULL,"
+        "last_error=NULL,retry_not_before=NULL,last_action='reset_competition',updated_at=? WHERE id=1",
+        (now_iso(),),
+    )
     for table in ("round_bonuses", "round_snapshots", "market_round_stats", "city_results", "results", "city_decisions", "decisions", "agents", "employee_cohorts", "rounds"):
         conn.execute(f"DELETE FROM {table}")
     initial_cash = get_setting(conn, "initial_cash", 15_000_000)

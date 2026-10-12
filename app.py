@@ -37,7 +37,7 @@ from sim import bots as _bots_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 6
+    or getattr(_db_module, "DB_API_VERSION", 0) < 8
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
@@ -79,6 +79,7 @@ from sim.db import (
     get_setting,
     hash_password,
     now_iso,
+    open_next_round,
     one,
     prepare_first_round_after_test,
     ranked_bot_home_cities,
@@ -91,6 +92,30 @@ from sim.db import (
     start_competition,
     submission_status,
     verify_password,
+)
+from sim.ai_training import (
+    ACTION_ANALYZE_SUPER_BOTS,
+    ACTION_BEGIN_PROCESSING,
+    ACTION_COMPLETE,
+    ACTION_FINALIZE_SUPER_BOTS,
+    ACTION_NONE,
+    ACTION_OPEN_NEXT_ROUND,
+    ACTION_PREPARE_FIRST_ROUND,
+    ACTION_RELEASE_FINAL,
+    ACTION_SETTLE,
+    ACTION_START,
+    ACTION_SUBMIT_REGULAR_BOTS,
+    ACTION_WAIT,
+    acquire_ai_training_lease,
+    ai_training_action,
+    begin_ai_training_processing,
+    claim_ai_training_collection,
+    clear_ai_training_processing,
+    configure_ai_training_roster,
+    get_ai_training_config,
+    release_ai_training_lease,
+    renew_ai_training_lease,
+    set_ai_training_enabled,
 )
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
@@ -435,10 +460,40 @@ def show_round_end_lock(round_row: sqlite3.Row | None, final_results_released: b
     return True
 
 
-def _round_state_token(round_row: sqlite3.Row | None, final_release_round: int = 0) -> str:
+def show_ai_processing_lock(
+    round_row: sqlite3.Row | None,
+    processing_round: int = 0,
+) -> bool:
+    """Show The End while submitted data is calculated but not yet published."""
+    if (
+        not round_row
+        or str(round_row["status"]) != "open"
+        or int(round_row["round_no"]) != int(processing_round)
+    ):
+        return False
+    round_no = int(round_row["round_no"])
+    round_label = "Test Round" if round_no < 0 else f"Round {round_no}"
+    st.markdown(
+        '<div class="round-end-overlay" role="dialog" aria-modal="true" '
+        'aria-label="Round calculation in progress">'
+        '<div class="round-end-content"><div class="round-end-title">The End</div>'
+        f'<div class="round-end-label">{round_label}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    return True
+
+
+def _round_state_token(
+    round_row: sqlite3.Row | None,
+    final_release_round: int = 0,
+    processing_round: int = 0,
+) -> str:
     if not round_row:
-        return f"none:{final_release_round}"
-    return f"{round_row['round_no']}:{round_row['status']}:{round_row['starts_at'] or ''}:{final_release_round}"
+        return f"none:{final_release_round}:{processing_round}"
+    return (
+        f"{round_row['round_no']}:{round_row['status']}:"
+        f"{round_row['starts_at'] or ''}:{final_release_round}:{processing_round}"
+    )
 
 
 @st.fragment(run_every=1.0)
@@ -448,7 +503,10 @@ def watch_player_round(observed_token: str) -> None:
     with connect() as conn:
         latest = current_round(conn)
         final_release_round = get_setting(conn, "final_results_release_round", 0, int)
-    if _round_state_token(latest, final_release_round) != observed_token:
+        processing_round = get_setting(
+            conn, "ai_training_processing_round", 0, int
+        )
+    if _round_state_token(latest, final_release_round, processing_round) != observed_token:
         st.rerun()
 
 
@@ -475,6 +533,231 @@ def wait_for_countdown_completion(countdown_id: str) -> None:
         if latest_id == countdown_id:
             st.session_state["player_round_reveal_animation"] = True
         st.rerun()
+
+
+def run_ai_training_once(progress_callback=None) -> dict[str, Any]:
+    """Advance at most one durable AI-training phase.
+
+    Every browser session may call this function. A database lease guarantees
+    that only one session performs the expensive or state-changing action.
+    """
+    with connect() as conn:
+        planned = ai_training_action(conn)
+    action = str(planned.get("action", ACTION_NONE))
+    planned_round_no = int(planned.get("round_no") or 0)
+    # A complete set of draft rows is not necessarily a complete analysis:
+    # an interrupted worker may have saved the final Bot before its joint
+    # rebalance/fingerprint stage. Resume that job instead of finalizing it.
+    if action in (ACTION_FINALIZE_SUPER_BOTS, ACTION_SETTLE):
+        with connect() as conn:
+            if remote_pending(conn, planned_round_no):
+                action = ACTION_ANALYZE_SUPER_BOTS
+                planned = {
+                    **planned,
+                    "action": action,
+                    "reason": "super_bot_analysis_pending",
+                }
+    if action in (ACTION_NONE, ACTION_WAIT, ACTION_COMPLETE):
+        return {**planned, "changed": False}
+
+    with connect() as conn:
+        owner = acquire_ai_training_lease(conn, action, ttl_seconds=1800)
+    if not owner:
+        return {**planned, "action": ACTION_WAIT, "reason": "lease_busy", "changed": False}
+
+    # Another online page may have completed the planned phase between this
+    # page reading the state and obtaining the lease. Revalidate while owning
+    # the lease so a stale heartbeat never repeats Super Bot analysis or turns
+    # an already settled round into an artificial retry error.
+    with connect() as conn:
+        confirmed = ai_training_action(conn, lease_owner=owner)
+        confirmed_action = str(confirmed.get("action", ACTION_NONE))
+        confirmed_round_no = int(confirmed.get("round_no") or 0)
+        if (
+            confirmed_action in (ACTION_FINALIZE_SUPER_BOTS, ACTION_SETTLE)
+            and remote_pending(conn, confirmed_round_no)
+        ):
+            confirmed = {
+                **confirmed,
+                "action": ACTION_ANALYZE_SUPER_BOTS,
+                "reason": "super_bot_analysis_pending",
+            }
+    if (
+        str(confirmed.get("action", ACTION_NONE)) != action
+        or int(confirmed.get("round_no") or 0) != int(planned.get("round_no") or 0)
+    ):
+        with connect() as conn:
+            release_ai_training_lease(conn, owner)
+        return {
+            **confirmed,
+            "action": ACTION_WAIT,
+            "reason": "stale_plan",
+            "changed": False,
+        }
+
+    round_no = int(planned.get("round_no") or 0)
+
+    def analysis_progress(done: int, total: int, code: str) -> None:
+        # One Super Bot can be expensive. Renew after every durable segment so
+        # another online page cannot take over a still-running batch.
+        with connect() as conn:
+            renew_ai_training_lease(conn, owner, ttl_seconds=1800)
+        if progress_callback:
+            progress_callback(done, total, code)
+
+    changed = False
+    try:
+        if action == ACTION_START:
+            with connect() as conn:
+                duration = max(1, get_setting(conn, "round_duration_minutes", 30, int))
+                use_test_round = bool(get_setting(conn, "test_round_enabled", 0, int))
+                started_round = start_competition(conn, duration, use_test_round)
+                submit_bot_decisions(conn, started_round)
+            changed = True
+        elif action == ACTION_SUBMIT_REGULAR_BOTS:
+            with connect() as conn:
+                submit_bot_decisions(conn, round_no)
+            changed = True
+        elif action == ACTION_BEGIN_PROCESSING:
+            with connect() as conn:
+                begin_ai_training_processing(conn, round_no)
+            changed = True
+        elif action == ACTION_ANALYZE_SUPER_BOTS:
+            with connect() as conn:
+                replace_existing = remote_pending(conn, round_no)
+            if not _remote_super_bot_submit(
+                round_no,
+                replace_existing=replace_existing,
+                progress_callback=analysis_progress,
+            ):
+                with connect() as conn:
+                    submit_local_super_bots(
+                        conn,
+                        round_no,
+                        analysis_progress,
+                        replace_existing=replace_existing,
+                    )
+            changed = True
+        elif action == ACTION_FINALIZE_SUPER_BOTS:
+            with connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                latest = current_round(conn)
+                if not latest or int(latest["round_no"]) != round_no or str(latest["status"]) != "open":
+                    raise ValueError("回合状态已经变化，未提交旧的 Super Bot 草稿。")
+                assert_remote_job_current(conn, round_no)
+                finalize_super_bot_decisions(conn, round_no)
+            changed = True
+        elif action == ACTION_SETTLE:
+            with connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                latest = current_round(conn)
+                if not latest or int(latest["round_no"]) != round_no or str(latest["status"]) != "open":
+                    raise ValueError("回合状态已经变化，未重复结算。")
+                has_super = bool(one(
+                    conn,
+                    "SELECT 1 FROM companies WHERE is_bot=1 AND is_super_bot=1 LIMIT 1",
+                ))
+                if has_super:
+                    assert_remote_job_current(conn, round_no)
+                settle_round(conn, round_no)
+            changed = True
+        elif action == ACTION_PREPARE_FIRST_ROUND:
+            with connect() as conn:
+                duration = max(1, get_setting(conn, "round_duration_minutes", 30, int))
+                prepare_first_round_after_test(conn, duration)
+                submit_bot_decisions(conn, 1)
+            changed = True
+        elif action == ACTION_OPEN_NEXT_ROUND:
+            with connect() as conn:
+                duration = max(1, get_setting(conn, "round_duration_minutes", 30, int))
+                next_round = open_next_round(conn, round_no, duration)
+                submit_bot_decisions(conn, next_round)
+            changed = True
+        elif action == ACTION_RELEASE_FINAL:
+            with connect() as conn:
+                latest = current_round(conn)
+                if not latest or int(latest["round_no"]) != round_no or str(latest["status"]) != "settled":
+                    raise ValueError("最终回合状态已经变化，未重复释放结果。")
+                set_setting(conn, "final_results_release_round", round_no)
+                clear_ai_training_processing(conn, round_no)
+            changed = True
+        else:
+            raise ValueError(f"未知的 AI 训练动作：{action}")
+    except Exception as exc:
+        LOGGER.exception("AI training automation failed during %s", action)
+        with connect() as conn:
+            release_ai_training_lease(
+                conn,
+                owner,
+                error=str(exc),
+                retry_delay_seconds=10,
+            )
+        return {**planned, "changed": False, "error": str(exc)}
+    with connect() as conn:
+        release_ai_training_lease(conn, owner)
+    return {**planned, "changed": changed}
+
+
+def _render_ai_training_tick() -> dict[str, Any]:
+    """Run one visible controller tick and render optional analysis progress."""
+    st.markdown('<span class="round-poll-anchor" aria-hidden="true">.</span>', unsafe_allow_html=True)
+    progress = None
+
+    def update_progress(done: int, total: int, code: str) -> None:
+        nonlocal progress
+        if progress is None:
+            progress = st.progress(0.0, text="Super Bot 自动分析中…")
+        progress.progress(
+            min(1.0, done / max(1, total)),
+            text=f"Super Bot 自动分析 · {code} · {done}/{total}",
+        )
+
+    result = run_ai_training_once(update_progress)
+    if progress is not None:
+        progress.empty()
+    if result.get("error"):
+        st.caption(f"AI 自动轮转将在稍后重试：{result['error']}")
+    if result.get("changed"):
+        st.rerun()
+    return result
+
+
+@st.fragment(run_every=60.0)
+def watch_ai_training_collection() -> None:
+    """Collect full submission state at most once per minute across sessions."""
+    with connect() as conn:
+        claimed = claim_ai_training_collection(conn, interval_seconds=60)
+    if not claimed:
+        return
+    _render_ai_training_tick()
+
+
+@st.fragment(run_every=1.0)
+def watch_ai_training_processing() -> None:
+    """After The End appears, advance calculation, verification and publish."""
+    with connect() as conn:
+        processing_round = int(
+            get_setting(conn, "ai_training_processing_round", 0, int)
+        )
+        processing_started_at = parse_time(
+            get_setting(conn, "ai_training_processing_started_at", "", str)
+        )
+    if processing_round == 0:
+        return
+    # Give every connected player heartbeat time to redraw The End before one
+    # session starts the potentially long Super Bot calculation.
+    if (
+        processing_started_at is not None
+        and (datetime.now(timezone.utc) - processing_started_at).total_seconds() < 2.0
+    ):
+        return
+    _render_ai_training_tick()
+
+
+def watch_ai_training_automation() -> None:
+    """Mount the slow collector and the active-round processing heartbeat."""
+    watch_ai_training_collection()
+    watch_ai_training_processing()
 
 
 def player_visible_round(conn: sqlite3.Connection) -> int:
@@ -589,11 +872,18 @@ def render_login() -> None:
             st.markdown('<div class="login-card-title">LOG IN</div>', unsafe_allow_html=True)
             st.markdown('<div class="login-card-copy">输入比赛账号与密码进入系统</div>', unsafe_allow_html=True)
             with st.form("login_form"):
+                mode_label = st.segmented_control(
+                    "系统模式",
+                    ["常规比赛", "AI 训练模式"],
+                    default="常规比赛",
+                    help="AI 训练模式会在所有参赛者提交后自动分析 Bot、结算并推进下一轮。",
+                )
                 role_label = st.segmented_control("登录身份", ["玩家", "管理员"], default="玩家")
                 account = st.text_input("账号 / ACCOUNT", placeholder="例如 C01", autocomplete="username")
                 password = st.text_input("密码 / PASSWORD", type="password", autocomplete="current-password")
                 submitted = st.form_submit_button("登 录  ·  LOG IN", type="primary", use_container_width=True)
             if submitted:
+                requested_mode = "ai_training" if mode_label == "AI 训练模式" else "manual"
                 if role_label == "管理员":
                     expected_user = secret_value("SIM_ADMIN_USER")
                     expected_password = secret_value("SIM_ADMIN_PASSWORD")
@@ -601,26 +891,39 @@ def render_login() -> None:
                         st.error("管理员登录尚未安全配置，请在部署后台设置管理员账号和密码。")
                         return
                     if account == expected_user and password == expected_password:
-                        st.session_state["auth"] = {"role": "admin"}
+                        st.session_state["auth"] = {"role": "admin", "mode": requested_mode}
                         st.rerun()
                     st.error("管理员账号或密码错误。")
                 else:
                     with connect() as conn:
+                        active_mode = str(get_setting(conn, "operation_mode", "manual", str))
                         company = one(conn, "SELECT * FROM companies WHERE code=?", (account.strip(),))
+                        if active_mode != requested_mode:
+                            target_label = "AI 训练模式" if active_mode == "ai_training" else "常规比赛"
+                            st.error(f"当前运行的是{target_label}，请切换登录页上的系统模式。")
+                            return
                         if company and verify_password(password, company["password_hash"]):
-                            st.session_state["auth"] = {"role": "player", "company_id": int(company["id"])}
+                            st.session_state["auth"] = {
+                                "role": "player",
+                                "company_id": int(company["id"]),
+                                "mode": requested_mode,
+                            }
                             st.rerun()
                     st.error("玩家账号或密码错误。")
-            st.caption("初始玩家账号：C01-C04；初始密码：1234。")
+            st.caption("常规比赛初始账号为 C01-C04 / 1234；AI 训练账号数量与初始密码由管理员设置。")
         st.markdown('<div class="login-version">BUSINESS SIMULATION WEB · SECURE ACCESS</div>', unsafe_allow_html=True)
 
 
-def sidebar(role: str, company: sqlite3.Row | None = None) -> str:
+def sidebar(role: str, company: sqlite3.Row | None = None, app_mode: str = "manual") -> str:
     with st.sidebar:
         st.markdown("## 📊 商赛控制台")
         if role == "admin":
-            st.caption("管理员")
-            options = ["总览", "队伍管理", "决策管理", "KDS 设置", "回合控制", "赛后报表", "财富曲线", "备份与重置"]
+            if app_mode == "ai_training":
+                st.caption("AI 训练模式 · 管理员")
+                options = ["AI 总览", "AI 训练设置", "队伍管理", "决策管理", "KDS 设置", "自动回合", "赛后报表", "财富曲线", "备份与重置"]
+            else:
+                st.caption("常规比赛 · 管理员")
+                options = ["总览", "队伍管理", "决策管理", "KDS 设置", "回合控制", "赛后报表", "财富曲线", "备份与重置"]
         else:
             st.caption(f"{company['code']} · {company['name']}" if company else "玩家")
             options = ["概览", "本轮决策", "排行榜", "赛后报表", "财富曲线", "KDS"]
@@ -718,9 +1021,14 @@ def player_navigation(company: sqlite3.Row) -> str:
         round_value = "TEST ROUND -1" if int(round_row["round_no"]) < 0 else f"ROUND {round_row['round_no']}/{total_rounds}"
     else:
         round_value, time_label, time_value = "未开始", "回合状态", "等待管理员"
+    player_mode_label = (
+        "AI TRAINING PLAYER MODE"
+        if st.session_state.get("auth", {}).get("mode") == "ai_training"
+        else "PLAYER OPERATION SYSTEM"
+    )
     st.markdown(
         '<div class="app-wordmark"><div><span class="brand-mark"></span><span class="brand-word">ASIA</span> BUSINESS SIMULATION</div>'
-        '<div class="app-mode">PLAYER OPERATION SYSTEM</div></div>',
+        f'<div class="app-mode">{player_mode_label}</div></div>',
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1189,8 +1497,14 @@ def render_player_decision(company: sqlite3.Row) -> None:
         with connect() as conn:
             latest_round = current_round(conn)
             latest_end = parse_time(latest_round["ends_at"]) if latest_round else None
+            processing_round = get_setting(
+                conn, "ai_training_processing_round", 0, int
+            )
             if not latest_round or latest_round["status"] != "open" or int(latest_round["round_no"]) != round_no or (latest_end and datetime.now(timezone.utc) > latest_end):
                 st.error("回合状态已经变化，本次提交未保存。")
+                return
+            if int(processing_round) == round_no:
+                st.error("本轮已经进入核算阶段，本次提交未保存。")
                 return
             already_submitted = one(
                 conn,
@@ -1645,6 +1959,189 @@ def render_admin_overview() -> None:
     if ranking:
         st.subheader("最新排名")
         st.dataframe(ranking_table(ranking), hide_index=True, use_container_width=True, column_config={"净资产": st.column_config.NumberColumn(format="¥ %.0f"), "现金": st.column_config.NumberColumn(format="¥ %.0f"), "本轮利润": st.column_config.NumberColumn(format="¥ %.0f")})
+
+
+def render_ai_training_overview() -> None:
+    hero("AI 训练总览", "系统每分钟汇总一次提交；全员完成后先显示 The End，再分析、核对并发布结果。")
+    with connect() as conn:
+        round_row = current_round(conn)
+        setup = setup_status(conn)
+        mode = str(get_setting(conn, "operation_mode", "manual", str))
+        auto_enabled = bool(get_setting(conn, "ai_training_auto_enabled", 1, int))
+        counts = one(
+            conn,
+            "SELECT SUM(CASE WHEN is_bot=0 THEN 1 ELSE 0 END) AS players,"
+            "SUM(CASE WHEN is_bot=1 AND is_super_bot=0 THEN 1 ELSE 0 END) AS bots,"
+            "SUM(CASE WHEN is_super_bot=1 THEN 1 ELSE 0 END) AS super_bots FROM companies",
+        )
+        submission = (
+            submission_status(conn, int(round_row["round_no"]))
+            if round_row and str(round_row["status"]) in ("open", "paused")
+            else None
+        )
+        runtime = one(conn, "SELECT * FROM ai_training_runtime WHERE id=1")
+        ranking = rank_rows(conn)
+    round_banner(round_row)
+    metrics = st.columns(5)
+    metrics[0].metric("真人玩家", int(counts["players"] or 0) if counts else 0)
+    metrics[1].metric("普通 Bot", int(counts["bots"] or 0) if counts else 0)
+    metrics[2].metric("Super Bot", int(counts["super_bots"] or 0) if counts else 0)
+    metrics[3].metric("赛前就绪", f"{setup['ready']}/{setup['total']}")
+    metrics[4].metric(
+        "本轮提交",
+        f"{submission['submitted']}/{submission['total']}" if submission else "—",
+    )
+    if mode != "ai_training":
+        st.warning("当前比赛尚未切换到 AI 训练模式。请先进入“AI 训练设置”应用训练阵容。")
+    elif not auto_enabled:
+        st.warning("自动轮转已暂停；管理员仍可在“自动回合”中手动管理。")
+    else:
+        phase = (
+            str(runtime["lease_phase"] or runtime["last_action"] or "idle")
+            if runtime else "idle"
+        )
+        last_error = str(runtime["last_error"] or "") if runtime else ""
+        st.success(f"自动轮转运行中 · 当前阶段：{phase}")
+        if last_error:
+            st.warning(f"上一次自动任务：{last_error}")
+    if ranking:
+        st.subheader("最新排名")
+        st.dataframe(
+            ranking_table(ranking),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "净资产": st.column_config.NumberColumn(format="¥ %.0f"),
+                "现金": st.column_config.NumberColumn(format="¥ %.0f"),
+                "本轮利润": st.column_config.NumberColumn(format="¥ %.0f"),
+            },
+        )
+
+
+def render_ai_training_setup() -> None:
+    hero("AI 训练设置", "一次设置真人玩家、普通 Bot 与 Super Bot 数量；应用后只需等待玩家提交，系统会自动完成后续回合。")
+    with connect() as conn:
+        config = get_ai_training_config(conn)
+        round_row = current_round(conn)
+        total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
+        duration = max(1, get_setting(conn, "round_duration_minutes", 30, int))
+        use_test_round = bool(get_setting(conn, "test_round_enabled", 0, int))
+        auto_enabled = bool(get_setting(conn, "ai_training_auto_enabled", 1, int))
+        transition_seconds = max(3, get_setting(conn, "ai_training_transition_seconds", 5, int))
+    waiting = bool(round_row and int(round_row["round_no"]) == 1 and str(round_row["status"]) == "waiting")
+    current_cols = st.columns(4)
+    current_cols[0].metric("当前真人玩家", config["actual_player_count"])
+    current_cols[1].metric("当前普通 Bot", config["actual_bot_count"])
+    current_cols[2].metric("当前 Super Bot", config["actual_super_bot_count"])
+    current_cols[3].metric("运行模式", "AI 训练" if config["enabled"] else "常规比赛")
+    if not waiting:
+        st.info("比赛已经开始，阵容数量已锁定。需要改人数时，请先在“备份与重置”中重置比赛。")
+    st.markdown(
+        '<div class="danger">应用训练阵容会替换等待室中的全部现有队伍，并清除这些队伍尚未开始的决策数据；KDS 不会改变。</div>',
+        unsafe_allow_html=True,
+    )
+    with st.form("ai_training_setup_form"):
+        count_cols = st.columns(3)
+        player_count = count_cols[0].number_input(
+            "真人玩家数量",
+            min_value=0,
+            max_value=40,
+            value=int(config["player_count"]),
+            step=1,
+            disabled=not waiting,
+        )
+        bot_count = count_cols[1].number_input(
+            "普通 Bot 数量",
+            min_value=0,
+            max_value=60,
+            value=int(config["bot_count"]),
+            step=1,
+            disabled=not waiting,
+        )
+        super_bot_count = count_cols[2].number_input(
+            "Super Bot 数量",
+            min_value=0,
+            max_value=20,
+            value=int(config["super_bot_count"]),
+            step=1,
+            disabled=not waiting,
+        )
+        rule_cols = st.columns(3)
+        selected_rounds = rule_cols[0].number_input(
+            "训练总轮数", min_value=1, max_value=20, value=total_rounds, step=1,
+        )
+        selected_duration = rule_cols[1].number_input(
+            "每轮时长（分钟）", min_value=1, max_value=240, value=duration, step=1,
+        )
+        selected_transition = rule_cols[2].number_input(
+            "The End 展示秒数", min_value=3, max_value=60, value=transition_seconds, step=1,
+        )
+        option_cols = st.columns(2)
+        selected_test_round = option_cols[0].checkbox("先进行 -1 测试轮", value=use_test_round)
+        selected_auto = option_cols[1].checkbox("阵容就绪后自动开始并轮转", value=auto_enabled)
+        player_password = st.text_input(
+            "训练玩家统一初始密码",
+            value="1234",
+            type="password",
+            disabled=not waiting or int(player_count) == 0,
+            help="生成账号为 C01、C02……；玩家首次进入后选择主场和公司名称。",
+        )
+        confirm_replace = st.checkbox(
+            "我确认用以上数量替换当前等待室阵容",
+            disabled=not waiting,
+        )
+        apply_training = st.form_submit_button(
+            "应用阵容并启用 AI 训练模式",
+            type="primary",
+            use_container_width=True,
+            disabled=not waiting,
+        )
+    if apply_training:
+        if not confirm_replace:
+            st.error("请先勾选阵容替换确认。")
+        elif int(player_count) + int(bot_count) + int(super_bot_count) < 1:
+            st.error("至少需要一支真人玩家、普通 Bot 或 Super Bot 队伍。")
+        else:
+            try:
+                with connect() as conn:
+                    configure_ai_training_roster(
+                        conn,
+                        int(player_count),
+                        int(bot_count),
+                        int(super_bot_count),
+                        player_password or "1234",
+                    )
+                    set_setting(conn, "total_rounds", int(selected_rounds))
+                    set_setting(conn, "round_duration_minutes", int(selected_duration))
+                    set_setting(conn, "test_round_enabled", int(bool(selected_test_round)))
+                    set_setting(conn, "ai_training_auto_enabled", int(bool(selected_auto)))
+                    set_setting(conn, "ai_training_transition_seconds", int(selected_transition))
+                    set_setting(conn, "operation_mode", "ai_training")
+                    set_ai_training_enabled(conn, True)
+                player_note = (
+                    f"玩家账号 C01-C{int(player_count):02d}，初始密码为你刚才设置的统一密码。"
+                    if int(player_count) > 0 else "本场没有真人玩家。"
+                )
+                flash("success", f"AI 训练阵容已创建。{player_note}")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+    if waiting and config["enabled"]:
+        st.divider()
+        if st.button("切回常规比赛模式（保留当前阵容）", use_container_width=True):
+            with connect() as conn:
+                set_ai_training_enabled(conn, False)
+                set_setting(conn, "operation_mode", "manual")
+            st.session_state["auth"] = {
+                **dict(st.session_state.get("auth") or {}),
+                "mode": "manual",
+            }
+            flash("success", "已切回常规比赛模式，当前阵容和 KDS 保留。")
+            st.rerun()
+    st.caption(
+        "说明：系统每 60 秒汇总一次提交状态；进入核算后用轻量心跳连续完成 Super Bot 分析、"
+        "一致性核对和结果发布。任意一名 AI 玩家或 AI 管理员保持页面打开即可，无需管理员刷新。"
+    )
 
 
 def render_admin_companies() -> None:
@@ -2127,8 +2624,54 @@ def render_admin_kds() -> None:
             st.error(str(exc))
 
 
-def render_admin_rounds() -> None:
-    hero("回合控制", "设置比赛总轮数、控制计时与结算；必要时可随时中断并从第一轮重开。")
+def render_admin_rounds(ai_mode: bool = False) -> None:
+    if ai_mode:
+        hero("AI 自动回合", "每分钟汇总提交；全员完成后玩家端先锁定为 The End，再分析 Super Bot、核对、结算并推进。")
+        with connect() as conn:
+            operation_mode = str(get_setting(conn, "operation_mode", "manual", str))
+            ai_auto_enabled = bool(get_setting(conn, "ai_training_auto_enabled", 1, int))
+            ai_transition_seconds = max(3, get_setting(conn, "ai_training_transition_seconds", 5, int))
+            ai_runtime = one(conn, "SELECT * FROM ai_training_runtime WHERE id=1")
+        with st.form("ai_round_automation_settings"):
+            ai_cols = st.columns([2, 2, 1])
+            selected_ai_auto = ai_cols[0].toggle(
+                "自动轮转",
+                value=ai_auto_enabled,
+                help="关闭后不会自动分析、结算或开启下一轮，管理员可使用下方原有控制。",
+            )
+            selected_transition_seconds = ai_cols[1].number_input(
+                "The End 展示秒数",
+                min_value=3,
+                max_value=60,
+                value=ai_transition_seconds,
+                step=1,
+                help="结算后至少保留这段时间展示 The End，再开启下一轮的 3-2-1 动画。",
+            )
+            save_ai_round_settings = ai_cols[2].form_submit_button(
+                "保存",
+                type="primary",
+                use_container_width=True,
+            )
+        if save_ai_round_settings:
+            with connect() as conn:
+                set_setting(conn, "ai_training_auto_enabled", int(bool(selected_ai_auto)))
+                set_setting(conn, "ai_training_transition_seconds", int(selected_transition_seconds))
+            flash("success", "AI 自动回合设置已保存。")
+            st.rerun()
+        if operation_mode != "ai_training":
+            st.warning("当前不是 AI 训练比赛；请先在“AI 训练设置”中应用训练阵容。")
+        elif ai_runtime:
+            runtime_text = (
+                "阶段："
+                f"{ai_runtime['lease_phase'] or ai_runtime['last_action'] or 'idle'}"
+            )
+            if ai_runtime["last_error"]:
+                runtime_text += f" · 最近错误：{ai_runtime['last_error']}"
+            st.caption(runtime_text)
+        st.info("需要修改玩家或 Bot 决策时，请先关闭“自动轮转”；修改完成后再恢复，系统会继续等待全部正式提交。")
+        st.divider()
+    else:
+        hero("回合控制", "设置比赛总轮数、控制计时与结算；必要时可随时中断并从第一轮重开。")
     remote_config_error = ""
     try:
         compute_endpoints = _remote_super_bot_endpoints()
@@ -2614,17 +3157,36 @@ def main() -> None:
         render_login()
         return
     if auth.get("role") == "admin":
-        page = sidebar("admin")
-        {
-            "总览": render_admin_overview,
-            "队伍管理": render_admin_companies,
-            "决策管理": render_admin_decisions,
-            "KDS 设置": render_admin_kds,
-            "回合控制": render_admin_rounds,
-            "赛后报表": lambda: render_reports(None, admin=True),
-            "财富曲线": lambda: render_wealth(None, admin=True),
-            "备份与重置": render_backup_reset,
-        }[page]()
+        admin_mode = str(auth.get("mode") or "manual")
+        page = sidebar("admin", app_mode=admin_mode)
+        if admin_mode == "ai_training":
+            {
+                "AI 总览": render_ai_training_overview,
+                "AI 训练设置": render_ai_training_setup,
+                "队伍管理": render_admin_companies,
+                "决策管理": render_admin_decisions,
+                "KDS 设置": render_admin_kds,
+                "自动回合": lambda: render_admin_rounds(ai_mode=True),
+                "赛后报表": lambda: render_reports(None, admin=True),
+                "财富曲线": lambda: render_wealth(None, admin=True),
+                "备份与重置": render_backup_reset,
+            }[page]()
+            # Mount automation after page actions so a just-clicked pause or
+            # settings change always takes effect before the next controller
+            # tick is considered.
+            if not _running_under_app_test():
+                watch_ai_training_automation()
+        else:
+            {
+                "总览": render_admin_overview,
+                "队伍管理": render_admin_companies,
+                "决策管理": render_admin_decisions,
+                "KDS 设置": render_admin_kds,
+                "回合控制": render_admin_rounds,
+                "赛后报表": lambda: render_reports(None, admin=True),
+                "财富曲线": lambda: render_wealth(None, admin=True),
+                "备份与重置": render_backup_reset,
+            }[page]()
         return
 
     company_id = int(auth.get("company_id", 0))
@@ -2632,26 +3194,47 @@ def main() -> None:
         company = one(conn, "SELECT * FROM companies WHERE id=?", (company_id,))
         round_row = current_round(conn)
         final_release_round = get_setting(conn, "final_results_release_round", 0, int)
+        processing_round = get_setting(
+            conn, "ai_training_processing_round", 0, int
+        )
         total_rounds = max(1, get_setting(conn, "total_rounds", 5, int))
+        active_mode = str(get_setting(conn, "operation_mode", "manual", str))
     if not company:
         st.session_state.clear()
+        st.rerun()
+    if str(auth.get("mode") or "manual") != active_mode:
+        st.session_state.clear()
+        flash("warning", "比赛运行模式已经改变，请在登录页重新选择模式。")
         st.rerun()
     if not company["home_city"] or not company["setup_submitted_at"]:
         player_setup_header(company)
         render_setup(company)
+        if active_mode == "ai_training" and not _running_under_app_test():
+            watch_ai_training_automation()
         return
     if round_row:
         retain_player_decision_draft(company_id, int(round_row["round_no"]))
     if not _running_under_app_test():
-        watch_player_round(_round_state_token(round_row, final_release_round))
+        watch_player_round(
+            _round_state_token(
+                round_row,
+                final_release_round,
+                processing_round,
+            )
+        )
     final_results_released = bool(
         round_row
         and str(round_row["status"]) == "settled"
         and int(round_row["round_no"]) >= total_rounds
         and final_release_round == int(round_row["round_no"])
     )
+    processing_locked = show_ai_processing_lock(round_row, processing_round)
     show_round_end_lock(round_row, final_results_released)
-    countdown_running, countdown_id = show_round_start_countdown(round_row)
+    countdown_running, countdown_id = (
+        (False, "")
+        if processing_locked
+        else show_round_start_countdown(round_row)
+    )
     if countdown_running:
         wait_for_countdown_completion(countdown_id)
     animate_reveal = bool(st.session_state.pop("player_round_reveal_animation", False))
@@ -2663,6 +3246,10 @@ def main() -> None:
         "报表": lambda: render_reports(company),
         "规则": lambda: render_player_kds(company),
     }[page]()
+    # Render the player's current screen (including The End) before a page is
+    # allowed to own the potentially long calculation phase.
+    if active_mode == "ai_training" and not _running_under_app_test():
+        watch_ai_training_automation()
 
 
 if __name__ == "__main__":
